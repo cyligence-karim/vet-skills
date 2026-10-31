@@ -1,0 +1,57 @@
+{
+  "name": "vet-skills",
+  "version": "0.7.2",
+  "mcpName": "io.github.cyligence-karim/killerskills",
+  "description": "Vet agent skills and MCP servers before they run, and give your agent the verdicts as an MCP server. Verdicts from KillerSkills, policy from your org.",
+  "type": "module",
+  "bin": {
+    "vet-skills": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\" && node scripts/shebang.mjs",
+    "dev": "tsx src/index.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "pnpm build && node dist/index.js --version"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@killerskills/policy": "workspace:*",
+    "yaml": "^2.6.0",
+    "@types/node": "^20",
+    "tsx": "^4.19.0",
+    "typescript": "^5",
+    "esbuild": "^0.28.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "homepage": "https://killerskills.ai/docs/cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cyligence-karim/vet-skills.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cyligence-karim/vet-skills/issues"
+  },
+  "keywords": [
+    "agent-skills",
+    "ai-security",
+    "claude-code",
+    "cursor",
+    "mcp",
+    "mcp-server",
+    "modelcontextprotocol",
+    "security",
+    "skills",
+    "supply-chain"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
