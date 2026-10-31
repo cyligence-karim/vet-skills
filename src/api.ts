@@ -23,11 +23,11 @@ async function call<T>(path: string, init: RequestInit = {}, timeoutMs = 8000): 
   }
 }
 
-export function resolveSkill(q: string, registry?: string) {
+export function resolveSkill(q: string, registry?: string, surface?: "mcp") {
   const qs = new URLSearchParams({ q });
   if (registry) qs.set("registry", registry);
   // The agent token (when enrolled) lets resolve answer for the org's private registry.
-  return call<ResolveResponse>(`/api/v1/resolve?${qs}`, { headers: orgHeaders() });
+  return call<ResolveResponse>(`/api/v1/resolve?${qs}`, { headers: { ...orgHeaders(), ...(surface ? { "x-vs-surface": surface } : {}) } });
 }
 
 export function verdictByHash(hash: string, etag?: string) {

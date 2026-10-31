@@ -9,7 +9,7 @@
  * beyond the name being looked up.
  */
 import { createInterface } from "node:readline";
-import { API, VERSION } from "./state.js";
+import { API, VERSION, clientId } from "./state.js";
 import { resolveSkill } from "./api.js";
 
 type Req = { jsonrpc: "2.0"; id?: number | string; method: string; params?: Record<string, unknown> };
@@ -39,7 +39,7 @@ const TOOLS = [
 ];
 
 async function checkSkill(name: string, registry?: string): Promise<string> {
-  const r = await resolveSkill(name, registry);
+  const r = await resolveSkill(name, registry, "mcp");
   if (!r.ok) return r.status === 404 ? `No skill or MCP server named "${name}" is indexed by KillerSkills${registry ? ` in ${registry}` : ""}. Treat it as unvetted.` : `KillerSkills lookup failed (${r.error}). Treat "${name}" as unvetted.`;
   const d = r.data;
   const page = `${API}${d.skill.page}`;
@@ -62,7 +62,7 @@ async function checkSkill(name: string, registry?: string): Promise<string> {
 
 async function searchSkills(query: string): Promise<string> {
   try {
-    const res = await fetch(`${API}/api/v1/leaderboard?q=${encodeURIComponent(query)}`, { headers: { accept: "application/json", "user-agent": `vet-skills/${VERSION} mcp` }, signal: AbortSignal.timeout(10_000) });
+    const res = await fetch(`${API}/api/v1/leaderboard?q=${encodeURIComponent(query)}`, { headers: { accept: "application/json", "user-agent": `vet-skills/${VERSION} mcp`, "x-vs-surface": "mcp", "x-vs-client": clientId() }, signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return `Search failed (HTTP ${res.status}).`;
     const d = (await res.json()) as { total: number; rows: { skill: { name: string; publisher: string; registry: string; page: string }; install_count: number; latest_verdict: { score: number; label: string } }[] };
     if (!d.rows.length) return `Nothing in the KillerSkills index matches "${query}".`;
