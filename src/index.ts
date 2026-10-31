@@ -353,7 +353,7 @@ async function main(): Promise<number> {
         const r = await discoverReport(comps);
         if (r.ok) { if (!values.json) console.log(`\n${c.verified("✓")} ${r.data.components} component${r.data.components === 1 ? "" : "s"} reported to ${readOrg()!.slug} (names only) · ${API}${r.data.dashboard}`); }
         else { console.error(c.caution(`report failed: ${r.error}`)); return 1; }
-      } else if (!values.json && !values.quiet) console.log(c.muted("\nNot enrolled: nothing was sent. `vet-skills join <org> --token <t>` reports this to your team's Discovery page."));
+      } else if (!values.json && !values.quiet) console.log(c.muted("\nNot enrolled: only the names above were looked up for their verdicts; no inventory was reported. `vet-skills join <org> --token <t>` reports it to your team's Discovery page."));
       return 0;
     }
 

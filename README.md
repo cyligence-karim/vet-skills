@@ -74,7 +74,9 @@ vet-skills discover            # every MCP server, skill, plugin and hook on thi
 ```
 
 Reads Claude Code, Cursor, Windsurf, Claude Desktop, Gemini CLI and Codex configs
-locally. Only names leave the machine, and only when you are enrolled in an org.
+locally. Each server and skill name is looked up for its verdict; nothing else leaves
+the machine. When you are enrolled in an org, the list of names is also reported to
+your team's Discovery page. Environment values, arguments and file contents never are.
 
 ## What it does
 
@@ -84,7 +86,7 @@ an artifact hash, looked up, and evaluated against your policy before it runs:
 ```
 $ vet-skills check deploy-helper
 Resolving deploy-helper …
-vet-skills 0.7.3 · policy acme/default-strict
+vet-skills 0.7.4 · policy acme/default-strict
 
  BLOCKED  14/100 deploy-helper@2.3.1 · devtools-cloud · 4,210 installs
 
