@@ -8,7 +8,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { USER_CONFIG_FILES, USER_SKILL_DIRS, isAgentConfigPath, parseAgentConfig, type Component } from "@killerskills/policy";
+import { USER_CONFIG_FILES, USER_SKILL_DIRS, isAgentConfigPath, parseAgentConfig, type Component } from "./policy/index.js";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 

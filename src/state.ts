@@ -11,7 +11,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync, appendFileSync, chm
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { DEFAULT_POLICY, SOLO_POLICY, parsePolicyYaml, serializePolicyYaml, type Policy } from "@killerskills/policy";
+import { DEFAULT_POLICY, SOLO_POLICY, parsePolicyYaml, serializePolicyYaml, type Policy } from "./policy/index.js";
 
 export const VERSION = "0.7.2";
 export const HOME = process.env.VET_SKILLS_HOME ?? join(homedir(), ".vet-skills");

@@ -33,7 +33,7 @@ import { resolve, join, dirname, basename } from "node:path";
 import { hostname, platform, userInfo } from "node:os";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
-import { parsePolicyYaml, serializePolicyYaml } from "@killerskills/policy";
+import { parsePolicyYaml, serializePolicyYaml } from "./policy/index.js";
 import { check, renderCheck, renderOutcome } from "./check.js";
 import { enroll, report, detonate, publish, discoverReport, resolveSkill } from "./api.js";
 import { discoverLocal } from "./discover.js";
@@ -210,7 +210,7 @@ async function main(): Promise<number> {
     case "leave": {
       const org = readOrg();
       writeOrg(null); writeToken(null);
-      writePolicy(serializePolicyYaml((await import("@killerskills/policy")).SOLO_POLICY));
+      writePolicy(serializePolicyYaml((await import("./policy/index.js")).SOLO_POLICY));
       console.log(org ? `${c.verified("✓")} Left ${org.slug}. Back to the personal policy.` : c.muted("Not joined to any org."));
       return 0;
     }

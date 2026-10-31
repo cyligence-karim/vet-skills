@@ -3,7 +3,7 @@
  *   resolve → hash → cached verdict? → lookup → reachable? → evaluate (org: server, solo: local) → decision
  * Everything here is fail-open: an unreachable API never blocks an install unless the policy says so.
  */
-import { evaluate, flagsFromTrace, type Decision, type VerdictInput, type PublisherInput } from "@killerskills/policy";
+import { evaluate, flagsFromTrace, type Decision, type VerdictInput, type PublisherInput } from "./policy/index.js";
 import { sendTelemetry, resolveSkill, verdictByHash, evaluateRemote } from "./api.js";
 import { platform } from "node:os";
 import { VERSION, appendLog, cacheGet, cachePut, readOrg, readPolicy, telemetryEnabled, telemetryNoticePending, type ResolveResponse } from "./state.js";
