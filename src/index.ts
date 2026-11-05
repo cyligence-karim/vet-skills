@@ -4,7 +4,10 @@
  *
  *   vet-skills check <skill>              dry-run the decision
  *   vet-skills install <skill>            check, then `npx skills add`
- *   vet-skills detonate <path> [--publisher h] upload a local bundle to the sandbox and print its verdict
+ *   vet-skills try <pkg|pypi:name|owner/repo|path> fetch it, run it in the honeypot, print everything it did and what it costs the agent
+ *   vet-skills try <pkg|pypi:name|owner/repo|path>  fetch it, run it in the honeypot, print everything it did and what it costs the agent
+  vet-skills run [--deny t,glob*] [--net declared|hosts|off] -- <cmd…>  guard a stdio MCP server: deny tools, pin its network, log every call
+  vet-skills detonate <path> [--publisher h] upload a local bundle to the sandbox and print its verdict
   vet-skills publish <path>             detonate and publish to your organization's private registry
  *   vet-skills why <skill>                last decision and the rule behind it
  *   vet-skills join <org> --token <t> [--email you@co] [--ci]   enroll this machine (or a CI runner, seat-free) in an org
@@ -37,6 +40,8 @@ import { parsePolicyYaml, serializePolicyYaml } from "./policy/index.js";
 import { check, renderCheck, renderOutcome } from "./check.js";
 import { enroll, report, detonate, publish, discoverReport, resolveSkill } from "./api.js";
 import { discoverLocal } from "./discover.js";
+import { fetchTarget, tarDir } from "./try.js";
+import { guard, parseRunArgs } from "./run.js";
 import { serveMcp } from "./mcp.js";
 import { VERSION, API, readLog, readOrg, readPolicy, readToken, stateSummary, writeOrg, writePolicy, writeToken, appendLog, setTelemetry, telemetryEnabled } from "./state.js";
 import { hookEval, installClaudeCodeHook } from "./hook.js";
@@ -45,7 +50,10 @@ import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from 
 import { observe, pruneSessions, readDeviations } from "./runtime.js";
 import { c } from "./render.js";
 
+// `run` owns everything after it (its own flags, then `--` and the server command); the shared parser never sees them.
+const RUN_AT = process.argv.indexOf("run", 2);
 const { values, positionals } = parseArgs({
+  args: RUN_AT === 2 ? ["run"] : process.argv.slice(2),
   allowPositionals: true,
   options: {
     token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
@@ -68,6 +76,7 @@ Get started:
 
   vet-skills check <skill>              dry-run the decision
   vet-skills install <skill>            check, then \`npx skills add\`
+  vet-skills try <pkg|pypi:name|owner/repo|path>  fetch it, run it in the honeypot, print everything it did and what it costs the agent
   vet-skills detonate <path> [--publisher h] upload a local bundle to the sandbox and print its verdict
   vet-skills publish <path>             detonate and publish to your organization's private registry
   vet-skills why <skill>                last decision and the rule behind it
@@ -130,6 +139,57 @@ async function main(): Promise<number> {
         await report({ installed: [{ name: r.resolved?.skill.name ?? rest[0], semver: r.resolved?.version.semver ?? null, artifact_hash: r.resolved?.version.artifact_hash ?? null, restrictions: r.decision.restrictions ?? null }], removed: [], hook_version: VERSION });
       }
       return run.status ?? 1;
+    }
+
+    case "run": {
+      const parsed = parseRunArgs(process.argv.slice(RUN_AT + 1));
+      if ("error" in parsed) { console.error(parsed.error); return 1; }
+      return guard(parsed.cmd, parsed.opts);
+    }
+
+    case "try": {
+      if (!rest[0]) { usage(); return 1; }
+      process.stderr.write(`${c.muted("Fetching")} ${rest[0]} …\n`);
+      const got = fetchTarget(rest[0]);
+      if ("error" in got) { console.log(`${c.blocked("✗")} ${got.error}`); return 1; }
+      try {
+        const tgz = tarDir(got.dir);
+        if (!(tgz instanceof Uint8Array)) { console.log(`${c.blocked("✗")} ${tgz.error}`); return 1; }
+        process.stderr.write(`${c.muted("Running")} ${got.label} ${c.muted(`in the honeypot (${(tgz.length / 1024).toFixed(0)} KB; nothing runs on this machine)`)} …\n`);
+        const res = await detonate(tgz, { publisher: values.publisher });
+        if (!res.ok) { console.log(`${c.caution("!")} Run failed (${res.status ?? "offline"}): ${res.error}`); return 1; }
+        const d = res.data;
+        const paint = d.verdict.label === "verified" ? c.verified : d.verdict.label === "caution" ? c.caution : c.blocked;
+        console.log(`\n${paint(d.verdict.label.toUpperCase())} ${c.bold(String(d.verdict.score))} ${c.muted(`· ${d.skill.name}@${d.skill.semver} · engine ${d.verdict.engine_version} · ${d.verdict.duration_ms} ms`)}`);
+        if (d.verdict.overrides.length) console.log(`${c.blocked("overrides")} ${d.verdict.overrides.join(", ")}`);
+        if (values.json) { console.log(JSON.stringify(d, null, 2)); return d.verdict.label === "blocked" ? 2 : 0; }
+        const ev = (d.trace?.events ?? []).filter((e) => e.severity !== "none" || e.category === "network" || e.category === "filesystem" || e.category === "claimed");
+        if (ev.length) {
+          console.log(`\n${c.ink2("What it did")} ${c.muted("(t+ms · category · action)")}`);
+          for (const e of ev.slice(0, 60)) {
+            const tone = e.decoy_hit || e.severity === "critical" ? c.blocked : e.severity === "warn" ? c.caution : c.muted;
+            console.log(`  ${String(e.t_ms).padStart(6)}  ${tone(e.category.padEnd(10))} ${e.action.padEnd(9)} ${e.target}${e.detail ? c.muted(`  ${e.detail.slice(0, 110)}`) : ""}${e.decoy_hit ? c.blocked(`  ← decoy ${e.decoy_hit}`) : ""}`);
+          }
+          if (ev.length > 60) console.log(c.muted(`  … ${ev.length - 60} more events on the verdict page`));
+        }
+        if (d.trace) {
+          const undeclared = d.trace.egress_hosts.filter((h) => !h.declared).map((h) => h.host);
+          console.log(`\n${c.ink2("Reached")}   ${undeclared.length ? c.blocked(undeclared.join(", ")) + c.muted(" (undeclared)") : c.muted("no undeclared hosts")}`);
+          const cred = d.trace.files_read.filter((p) => /\.ssh|\.aws|\.npmrc|credentials|\.netrc|\.docker/.test(p));
+          console.log(`${c.ink2("Read")}      ${cred.length ? c.blocked(cred.join(", ")) : c.muted(`${d.trace.files_read.length} file${d.trace.files_read.length === 1 ? "" : "s"}, no credential paths`)}`);
+          if (d.trace.memory_writes.length) console.log(`${c.ink2("Wrote")}     ${c.blocked(d.trace.memory_writes.map((m) => m.file).join(", "))} ${c.muted("(agent memory / instruction files)")}`);
+        }
+        const b = d.benchmark;
+        if (b) {
+          console.log(`\n${c.ink2("Cost to your agent")}`);
+          console.log(`  instructions loaded   ≈${b.instruction_tokens.toLocaleString("en-US")} tokens ${c.muted(`(${b.instruction_files} file${b.instruction_files === 1 ? "" : "s"}, ${b.bundle_files} in bundle)`)}`);
+          if (b.mcp) console.log(`  tool list per prompt  ${b.mcp.tools ? `≈${b.mcp.context_tokens.toLocaleString("en-US")} tokens ${c.muted(`(${b.mcp.tools} tools, ${Math.round(b.mcp.context_tokens / Math.max(1, b.mcp.tools))} per tool${b.mcp.undocumented_tools ? `, ${b.mcp.undocumented_tools} undocumented` : ""})`)}` : c.muted("no tools/list reply")}\n  handshake             ${b.mcp.handshake_ms === null ? c.muted("no reply") : `${b.mcp.handshake_ms} ms`}`);
+        }
+        const crit = d.findings.filter((f) => f.severity === "critical" || f.severity === "high");
+        if (crit.length) { console.log(`\n${c.ink2("Findings")}`); for (const f of crit.slice(0, 8)) console.log(`  ${c.muted(f.rule_id)} ${f.severity.padEnd(8)} ${f.title}`); if (crit.length > 8) console.log(c.muted(`  … ${crit.length - 8} more`)); }
+        console.log(`\n${c.muted(`Full trace: ${API}${d.skill.page}`)}`);
+        return d.verdict.label === "blocked" ? 2 : 0;
+      } finally { got.cleanup(); }
     }
 
     case "detonate": {

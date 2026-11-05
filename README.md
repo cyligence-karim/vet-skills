@@ -67,6 +67,36 @@ Requires Node 20+. Index: 16,000+ skills and MCP servers from skills.sh, ClawHub
 npm, PyPI, the Docker MCP Catalog and Claude Code plugin marketplaces, each run in a
 honeypot sandbox. Browse them at [killerskills.ai](https://killerskills.ai/?utm_source=npm&utm_medium=readme&utm_campaign=cli).
 
+## Try it before you install it
+
+```
+vet-skills try @acme/crm-mcp            # npm package (or name@version)
+vet-skills try pypi:some-mcp-server     # PyPI package
+vet-skills try owner/repo               # GitHub repository
+vet-skills try ./my-skill               # local directory
+```
+
+Fetches the package into a temp directory (never installed), runs it in the
+KillerSkills honeypot, and prints what it did: every host it contacted, every
+credential path it touched, the tools it exposes, and what it costs your agent
+(instruction tokens; for MCP servers the handshake time and the prompt context of
+its tool list). Exit code 2 when the run is Blocked.
+
+## Run it with restrictions
+
+```
+claude mcp add crm -- npx -y vet-skills run --net declared --deny "delete_*" -- npx -y @acme/crm-mcp
+```
+
+`vet-skills run` sits between the agent and a stdio MCP server. Denied tools are
+answered with an error and never reach the server; every tool call is logged
+(tool name and argument names only); `--net declared` points the server's
+`HTTPS_PROXY` at a local allow-list proxy limited to the hosts its verdict saw it
+declare (`--net host1,host2` to choose). When the install hook blocks a stdio
+server, it prints this command as the alternative. Clients that ignore
+`HTTPS_PROXY` are not network-contained, and the guard says so at start; the
+filesystem is not restricted.
+
 ## See what is already configured
 
 ```
@@ -91,7 +121,7 @@ an artifact hash, looked up, and evaluated against your policy before it runs:
 ```
 $ vet-skills check deploy-helper
 Resolving deploy-helper …
-vet-skills 0.7.6 · policy acme/default-strict
+vet-skills 0.7.7 · policy acme/default-strict
 
  BLOCKED  14/100 deploy-helper@2.3.1 · devtools-cloud · 4,210 installs
 

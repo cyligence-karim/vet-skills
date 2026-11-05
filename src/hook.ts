@@ -139,6 +139,10 @@ export async function hookEval(stdin: string): Promise<number> {
       return 2;
     case "block":
       process.stderr.write(`vet-skills blocked this install by ${readOrg() ? "org" : "your"} policy.\n${renderCheck(r)}\n${out}\n`);
+      // A stdio MCP server can run with restrictions instead: network pinned to its declared hosts, every tool call logged, tools deniable.
+      { const tail = found.kind === "mcp" ? cmd.split(/\s--\s/)[1]?.trim() : null;
+        const name = cmd.match(/claude\s+mcp\s+add(?:-json)?\s+(\S+)/)?.[1];
+        if (tail && name && !readOrg()) process.stderr.write(`To run it with restrictions instead (network limited to the hosts its verdict declared, every tool call logged, tools deniable with --deny):\n  claude mcp add ${name} -- npx -y vet-skills run --net declared -- ${tail}\n`); }
       if (!readOrg() && hintOncePerDay("teams")) process.stderr.write("Running this for a team? One policy across every developer's agents, approvals and inventory: https://killerskills.ai/pricing\n");
       return 2;
   }
