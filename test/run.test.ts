@@ -57,3 +57,13 @@ test("run: allow-list proxy refuses CONNECT to other hosts", async () => {
   assert.match(res, /403/);
   assert.deepEqual(denied, ["evil.example.org"]);
 });
+
+test("run --contain: wraps in the OS sandbox when available, never breaks the command otherwise", async () => {
+  const { containWrap, CREDENTIAL_DIRS } = await import("../src/run.ts");
+  const w = containWrap(["node", "server.js"], 4321);
+  assert.ok(w.cmd.slice(-2).join(" ") === "node server.js", "the server command is preserved at the end");
+  assert.ok(CREDENTIAL_DIRS.includes(".ssh") && CREDENTIAL_DIRS.includes(".aws"));
+  if (process.platform === "linux" && w.cmd[0] === "bwrap") { assert.ok(w.cmd.includes("--ro-bind") && w.cmd.includes("--die-with-parent")); assert.match(w.note, /contained/); }
+  else if (process.platform === "darwin" && w.cmd[0] === "/usr/bin/sandbox-exec") { assert.match(w.cmd[2], /deny file-read\*[^\n]*\.ssh/); assert.match(w.cmd[2], /localhost:4321/); }
+  else assert.match(w.note, /unavailable|not available/);
+});

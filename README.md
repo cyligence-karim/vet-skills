@@ -106,8 +106,21 @@ answered with an error and never reach the server; every tool call is logged
 `HTTPS_PROXY` at a local allow-list proxy limited to the hosts its verdict saw it
 declare (`--net host1,host2` to choose). When the install hook blocks a stdio
 server, it prints this command as the alternative. Clients that ignore
-`HTTPS_PROXY` are not network-contained, and the guard says so at start; the
-filesystem is not restricted.
+`HTTPS_PROXY` are not network-contained, and the guard says so at start.
+
+Add `--contain` (0.7.9) to put the server in an OS sandbox as well: on macOS
+`sandbox-exec`, on Linux `bwrap` (bubblewrap). The project directory, `/tmp`
+and the package caches stay writable; the rest of `$HOME` is read-only and
+credential directories (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.kube`,
+`~/.docker`, keychains, agent config folders, …) are not readable at all. On
+macOS the sandbox also forbids every outbound connection except the local
+proxy. Undeclared hosts get a fast, logged `403`, so a telemetry call fails
+harmlessly and the tool keeps working; the exit summary counts them. Windows:
+use WSL. Where neither sandbox is available the guard runs without it and says so.
+
+```
+claude mcp add crm -- npx -y vet-skills run --contain --net declared -- npx -y @acme/crm-mcp
+```
 
 ## See what is already configured
 

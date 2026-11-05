@@ -15,7 +15,9 @@
  * This is "run with restrictions" for a package the policy would otherwise
  * block or sandbox. It is not a container: filesystem access is unchanged.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { homedir, platform } from "node:os";
+import { existsSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { connect } from "node:net";
 import { appendFileSync, mkdirSync } from "node:fs";
@@ -24,7 +26,7 @@ import { resolveSkill } from "./api.js";
 import { hiddenTextFindings, hiddenSummary } from "./policy/index.js";
 import { HOME } from "./state.js";
 
-export interface RunOptions { deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void }
+export interface RunOptions { deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void; /** Filesystem (and on macOS network) containment around the server process. */ contain?: boolean }
 
 const globToRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
 
@@ -61,6 +63,44 @@ export async function declaredHosts(query: string): Promise<string[]> {
   return r.data.trace_summary.egress_hosts.filter((h) => h.declared).map((h) => h.host);
 }
 
+/** Paths a contained server must never read: where credentials live. */
+export const CREDENTIAL_DIRS = [".ssh", ".aws", ".config/gh", ".config/gcloud", ".azure", ".kube", ".gnupg", ".docker", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".vet-skills", "Library/Keychains", "Library/Application Support/Claude", ".claude", ".cursor", ".codeium", ".config/Code"];
+
+/**
+ * Wrap the server command in the OS sandbox when one is available.
+ *   macOS: sandbox-exec. Reads everywhere except credential paths; writes only in the project, temp and cache dirs;
+ *          outbound network only to the allow-list proxy on localhost (so a client that ignores HTTPS_PROXY gets
+ *          nothing, not a leak).
+ *   Linux: bubblewrap. Same filesystem rules; the network stays in the host namespace and is shaped by the proxy only.
+ *   Elsewhere, or when the tool is missing, the command runs as is and the log says so.
+ */
+export function containWrap(cmd: string[], proxyPort: number | null): { cmd: string[]; note: string } {
+  const home = homedir();
+  const project = process.cwd();
+  const writable = [project, "/tmp", "/private/tmp", process.env.TMPDIR ?? "/tmp", join(home, ".cache"), join(home, ".npm"), join(home, "Library/Caches"), join(home, ".local/share/uv"), join(home, ".local/share/pnpm")];
+  const creds = CREDENTIAL_DIRS.map((d) => join(home, d));
+  if (platform() === "darwin" && existsSync("/usr/bin/sandbox-exec")) {
+    const q = (s: string) => `"${s.replace(/"/g, '\\"')}"`;
+    const profile = [
+      "(version 1)", "(allow default)",
+      `(deny file-read* ${creds.map((p) => `(subpath ${q(p)})`).join(" ")})`,
+      `(deny file-write* (subpath ${q(home)}))`,
+      `(allow file-write* ${writable.map((p) => `(subpath ${q(p)})`).join(" ")})`,
+      "(deny network-outbound)",
+      ...(proxyPort ? [`(allow network-outbound (remote ip "localhost:${proxyPort}") (remote unix-socket))`] : ["(allow network-outbound (remote unix-socket))"]),
+    ].join("\n");
+    return { cmd: ["/usr/bin/sandbox-exec", "-p", profile, ...cmd], note: `contained (macOS sandbox: credential paths unreadable, writes limited to the project and caches, network only through the guard${proxyPort ? "" : "; no proxy, so no network at all"})` };
+  }
+  if (platform() === "linux" && spawnSync("bwrap", ["--version"], { stdio: "ignore" }).status === 0) {
+    const args = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"];
+    for (const p of writable) if (existsSync(p) && !p.startsWith("/tmp") && !p.startsWith("/private")) args.push("--bind", p, p);
+    for (const p of creds) if (existsSync(p)) args.push("--tmpfs", p);
+    args.push("--die-with-parent", "--");
+    return { cmd: ["bwrap", ...args, ...cmd], note: "contained (bubblewrap: credential paths empty, writes limited to the project and caches; network shaped by the guard proxy only)" };
+  }
+  return { cmd, note: platform() === "linux" ? "containment unavailable: install bubblewrap (apt install bubblewrap) for filesystem containment; running with the guard only" : platform() === "win32" ? "containment is not available on Windows (use WSL); running with the guard only" : "containment unavailable on this machine; running with the guard only" };
+}
+
 const RUNTIME = join(HOME, "runtime");
 function record(label: string, tool: string, keys: string[], denied: boolean) {
   try { mkdirSync(RUNTIME, { recursive: true }); appendFileSync(join(RUNTIME, "guard.jsonl"), JSON.stringify({ at: new Date().toISOString(), server: label, tool, args: keys, denied }) + "\n"); } catch { /* best effort */ }
@@ -72,14 +112,17 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   const deny = opts.deny.map(globToRe);
   let proxy: { url: string; close: () => void } | null = null;
   let hosts: string[] = [];
+  const blockedHosts = new Map<string, number>();
   if (opts.net !== "off") {
     hosts = opts.net === "declared" ? await declaredHosts(opts.query ?? opts.label) : opts.net;
     if (opts.net === "declared" && !hosts.length) log(`no declared hosts on record for ${opts.query ?? opts.label}; network stays open (use --net host1,host2 to pin it)`);
-    else proxy = await startAllowlistProxy(hosts, (h) => log(`blocked connection to ${h}`));
+    else proxy = await startAllowlistProxy(hosts, (h) => { blockedHosts.set(h, (blockedHosts.get(h) ?? 0) + 1); if (blockedHosts.get(h) === 1) log(`blocked connection to ${h} (answered 403; the server keeps running)`); });
   }
   const env = { ...process.env, ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: "127.0.0.1,localhost", ALL_PROXY: proxy.url } : {}) };
   log(`guarding ${opts.label}${deny.length ? ` · denying ${opts.deny.join(", ")}` : ""}${proxy ? ` · network limited to ${hosts.join(", ")} (clients that ignore HTTPS_PROXY are not contained)` : ""}`);
-  const child = spawn(cmd[0], cmd.slice(1), { stdio: ["pipe", "pipe", "inherit"], env });
+  let launch = cmd;
+  if (opts.contain) { const w = containWrap(cmd, proxy ? Number(new URL(proxy.url).port) : null); launch = w.cmd; log(w.note); }
+  const child = spawn(launch[0], launch.slice(1), { stdio: ["pipe", "pipe", "inherit"], env });
   const pending = new Map<number | string, string>();
   let calls = 0, deniedCalls = 0;
   // agent → server
@@ -140,14 +183,14 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   });
   return new Promise((resolve) => {
     // Resolve only once everything the server wrote has been relayed and flushed: the process exits right after.
-    child.on("close", (code) => { proxy?.close(); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied`); process.stdout.write("", () => resolve(code ?? 1)); });
+    child.on("close", (code) => { proxy?.close(); const nb = [...blockedHosts.values()].reduce((a, b) => a + b, 0); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied${nb ? ` · ${nb} connection${nb === 1 ? "" : "s"} blocked (${[...blockedHosts.keys()].slice(0, 5).join(", ")})` : ""}`); process.stdout.write("", () => resolve(code ?? 1)); });
     child.on("error", (e) => { proxy?.close(); log(`could not start ${cmd[0]}: ${e.message}`); resolve(1); });
   });
 }
 
 /** Parse `run [--deny a,b] [--net …] [--label x] [--query q] -- cmd…` from the raw argv after "run". */
 export function parseRunArgs(argv: string[]): { opts: RunOptions; cmd: string[] } | { error: string } {
-  const opts: RunOptions = { deny: [], net: "off", label: "" };
+  const opts: RunOptions = { deny: [], net: "off", label: "", contain: false };
   let i = 0;
   while (i < argv.length && argv[i] !== "--") {
     const a = argv[i];
@@ -155,6 +198,7 @@ export function parseRunArgs(argv: string[]): { opts: RunOptions; cmd: string[] 
     try {
       if (a === "--deny") opts.deny.push(...val().split(",").map((s) => s.trim()).filter(Boolean));
       else if (a === "--net") { const v = val(); opts.net = v === "off" ? "off" : v === "declared" ? "declared" : v.split(",").map((s) => s.trim()).filter(Boolean); }
+      else if (a === "--contain") opts.contain = true;
       else if (a === "--label") opts.label = val();
       else if (a === "--query") opts.query = val();
       else return { error: `unknown option ${a}` };
@@ -162,7 +206,7 @@ export function parseRunArgs(argv: string[]): { opts: RunOptions; cmd: string[] 
     i++;
   }
   const cmd = argv.slice(i + 1);
-  if (argv[i] !== "--" || !cmd.length) return { error: "usage: vet-skills run [--deny tool,glob*] [--net declared|host1,host2|off] -- <command…>" };
+  if (argv[i] !== "--" || !cmd.length) return { error: "usage: vet-skills run [--contain] [--deny tool,glob*] [--net declared|host1,host2|off] -- <command…>" };
   if (!opts.label) {
     // "npx -y @scope/pkg" → "@scope/pkg"; "uvx pkg" → "pkg"; else the binary.
     const pkg = cmd.find((x, k) => k > 0 && !x.startsWith("-") && /^(npx|uvx|pipx|bunx)$/.test(cmd[0])) ?? cmd[0];
