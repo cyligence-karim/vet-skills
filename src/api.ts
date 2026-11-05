@@ -107,6 +107,11 @@ export function sendTelemetry(body: Record<string, unknown>) {
   return call<{ ok: boolean }>("/api/v1/telemetry", { method: "POST", body: JSON.stringify(body) }, 1500);
 }
 
+/** Fire-and-forget anonymous field signal (runtime deviation kind per skill/version/tool); never detail text. */
+export function sendFieldSignal(events: { skill: string; semver: string | null; kind: string; tool: string | null; agent_kind: string; hook_version: string; os: string }[]) {
+  return call<{ ok: boolean }>("/api/v1/telemetry/field", { method: "POST", body: JSON.stringify({ events }) }, 1500);
+}
+
 /** What `vet-skills discover` found on this machine (names only; enrolled machines only). */
 export function discoverReport(components: unknown[]) {
   const org = readOrg();

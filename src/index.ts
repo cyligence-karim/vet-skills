@@ -17,7 +17,7 @@
  *   vet-skills status                     org, policy version, last report, cache size
  *   vet-skills discover [--project] [--json] every MCP server, skill, plugin and hook configured on this machine
  *   vet-skills mcp                        run as an MCP server so agents can check skills themselves
-  vet-skills telemetry on|off|status    anonymous usage telemetry (off for enrolled machines; VET_SKILLS_TELEMETRY=0 also works)
+  vet-skills telemetry on|off|status    anonymous usage + field signals (off for enrolled machines; VET_SKILLS_TELEMETRY=0 also works)
   vet-skills bug                        report a bug (opens the form with your CLI version and last decision filled in)
  *   vet-skills sync                       pull the org policy and apply pending removals
  *   vet-skills verify <skill|path>        check the signed verdict against what is on disk
@@ -43,7 +43,7 @@ import { discoverLocal } from "./discover.js";
 import { fetchTarget, tarDir } from "./try.js";
 import { guard, parseRunArgs } from "./run.js";
 import { serveMcp } from "./mcp.js";
-import { VERSION, API, readLog, readOrg, readPolicy, readToken, stateSummary, writeOrg, writePolicy, writeToken, appendLog, setTelemetry, telemetryEnabled } from "./state.js";
+import { VERSION, API, HOME, readLog, readOrg, readPolicy, readToken, stateSummary, writeOrg, writePolicy, writeToken, appendLog, setTelemetry, telemetryEnabled } from "./state.js";
 import { hookEval, installClaudeCodeHook } from "./hook.js";
 import { applyRemovals, sync } from "./sync.js";
 import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from "./attest.js";
@@ -98,6 +98,14 @@ Get started:
 Docs: https://killerskills.ai/docs/cli
 `;
 function usage() { process.stderr.write(USAGE); }
+
+/** One question, once, on a TTY: whether this machine sends anonymous field signals. Non-interactive installs keep the default (on, opt-out). */
+async function askTelemetry(): Promise<boolean | null> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY || existsSync(join(HOME, "telemetry"))) return null;
+  process.stdout.write("Send anonymous signals when a skill misbehaves (name, version, kind, tool; never content)? [Y/n] ");
+  const answer = await new Promise<string>((res) => { const onData = (b: Buffer) => { process.stdin.off("data", onData); process.stdin.pause(); res(b.toString("utf8").trim()); }; process.stdin.resume(); process.stdin.once("data", onData); setTimeout(() => { process.stdin.off("data", onData); process.stdin.pause(); res(""); }, 30_000).unref(); });
+  return !/^n/i.test(answer);
+}
 
 async function main(): Promise<number> {
   if (values.version) { console.log(VERSION); return 0; }
@@ -466,6 +474,13 @@ async function main(): Promise<number> {
         const r = installClaudeCodeHook();
         console.log(r.changed ? `${c.verified("✓")} Claude Code hook installed in ${r.path}` : c.muted(`Hook already present in ${r.path}`));
         console.log(c.muted("Every `skills add`, `claude plugin install`, and `claude mcp add` is now checked before it runs, and what skills do in sessions is compared with their sandbox trace (vet-skills runtime)."));
+        if (!readOrg()) {
+          const choice = await askTelemetry();
+          if (choice !== null) setTelemetry(choice);
+          console.log(c.muted(telemetryEnabled()
+            ? "Anonymous signals on: when the hook sees a skill misbehave, it sends the skill name, version, kind of deviation and tool name (never content, hosts, paths or prompts) so the package is re-run in the honeypot for everyone. Schema: https://killerskills.ai/docs/cli#telemetry · off: vet-skills telemetry off"
+            : "Anonymous signals off. Turn on: vet-skills telemetry on"));
+        }
         return 0;
       }
       usage(); return 1;
