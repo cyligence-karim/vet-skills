@@ -112,3 +112,9 @@ export function discoverReport(components: unknown[]) {
   if (!org) return Promise.resolve<ApiResult<{ ok: true; components: number; dashboard: string }>>({ ok: false, error: "not joined", offline: false });
   return call<{ ok: true; components: number; dashboard: string }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/discover`, { method: "POST", body: JSON.stringify({ components }), headers: orgHeaders() }, 15000);
 }
+
+/** The public repo scan, for installs that point straight at GitHub (no registry verdict exists for those). */
+export type RepoScan = { ok: true; repo: string; page: string; headline: string; installer_lure: boolean; lure_reasons: string[]; summary: { total: number; high: number; credentials: number; unvetted: number } };
+export function scanGithubRepo(owner: string, repo: string) {
+  return call<RepoScan>(`/api/v1/scan/github/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {}, 25000);
+}

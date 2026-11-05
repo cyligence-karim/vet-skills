@@ -11,7 +11,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { applyRemovals } from "./sync.js";
 import { check, renderOutcome, renderCheck } from "./check.js";
-import { report } from "./api.js";
+import { report, scanGithubRepo } from "./api.js";
+import { API } from "./state.js";
 import { hintOncePerDay, readOrg } from "./state.js";
 
 export const INSTALL_PATTERNS: { re: RegExp; kind: "skill" | "plugin" | "mcp" }[] = [
@@ -58,6 +59,15 @@ export function extractStdioPackage(command: string): { q: string; registry: "np
   return null;
 }
 
+/** `owner/repo`, a github.com URL, or `git clone …github.com/owner/repo` → the repository, when the install points at GitHub. */
+export function extractGithubRepo(target: string, command: string): { owner: string; repo: string } | null {
+  const m = target.match(/^(?:https?:\/\/|git@)?github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:[/#?].*)?$/i) ?? command.match(/git\s+clone\s+(?:--[^\s]+\s+)*(?:https?:\/\/|git@)?github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:\s|$)/i);
+  if (m) return { owner: m[1], repo: m[2] };
+  // skills.sh accepts owner/repo as a GitHub shorthand; treat two plain segments as that when no registry is named.
+  const s = target.match(/^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([\w.-]{1,100})$/);
+  return s ? { owner: s[1], repo: s[2] } : null;
+}
+
 export function extractInstall(command: string): { q: string; kind: "skill" | "plugin" | "mcp"; registry?: string } | null {
   for (const p of INSTALL_PATTERNS) {
     const m = command.match(p.re);
@@ -82,6 +92,24 @@ export async function hookEval(stdin: string): Promise<number> {
   const cmd = payload.tool_input.command;
   if (/^\s*vet-skills\s+(check|why|status|sync|policy|detonate|hook|join|leave|block|publish)\b/.test(cmd)) return 0;
   const found = extractInstall(cmd);
+  const cloned = found ? null : (cmd.match(/\bgit\s+clone\b/) ? extractGithubRepo("", cmd) : null);
+  if (!found && !cloned) return 0;
+
+  // Installs straight from GitHub (npx skills add owner/repo, a github.com URL, git clone) have no registry verdict.
+  // Ask the public repo scan instead; an installer lure is blocked outright, anything else is reported and allowed.
+  const gh = cloned ?? (found && found.kind === "skill" && !found.registry ? extractGithubRepo(found.q, cmd) : null);
+  if (gh) {
+    const scan = await scanGithubRepo(gh.owner, gh.repo);
+    if (scan.ok && scan.data.installer_lure) {
+      process.stderr.write(`vet-skills blocked this: ${gh.owner}/${gh.repo} looks like an installer lure (malware delivery pattern).\n${scan.data.lure_reasons.slice(0, 3).map((x) => `  ✕ ${x}`).join("\n")}\nReal skills and MCP servers install from source, never from a committed ZIP. Do not download or run anything from this repository.\nReport: ${API}${scan.data.page}\n`);
+      return 2;
+    }
+    if (cloned) return 0;
+    if (scan.ok && !scan.data.installer_lure) {
+      const s = scan.data.summary;
+      if (s.high || s.credentials) process.stderr.write(`vet-skills · ${gh.owner}/${gh.repo}: ${scan.data.headline} ${API}${scan.data.page}\n`);
+    }
+  }
   if (!found) return 0;
 
   const r = await check(found.q, { quiet: true, agentKind: "claude_code", registry: found.registry });

@@ -86,7 +86,7 @@ an artifact hash, looked up, and evaluated against your policy before it runs:
 ```
 $ vet-skills check deploy-helper
 Resolving deploy-helper …
-vet-skills 0.7.4 · policy acme/default-strict
+vet-skills 0.7.5 · policy acme/default-strict
 
  BLOCKED  14/100 deploy-helper@2.3.1 · devtools-cloud · 4,210 installs
 
