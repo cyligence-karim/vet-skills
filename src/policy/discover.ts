@@ -249,6 +249,8 @@ export interface BlastInput {
   /** From the component's verdict, when it resolved to one. */
   verdict?: { label: "verified" | "caution" | "blocked"; score: number } | null;
   trace?: { egressHosts: string[]; credentialPathsRead: string[]; memoryWrites: number } | null;
+  /** Known vulnerabilities (OSV) in the package's latest version. */
+  vulns?: { count: number; worst: string } | null;
 }
 
 export interface BlastRadius {
@@ -264,7 +266,7 @@ export interface BlastRadius {
  * hooks) run as the developer, so they start at medium; credentials handed to
  * them, a non-Verified verdict, or behaviour seen in the honeypot raise it.
  */
-export function blastRadius({ component: c, verdict, trace }: BlastInput): BlastRadius {
+export function blastRadius({ component: c, verdict, trace, vulns }: BlastInput): BlastRadius {
   const reasons: string[] = [];
   const credentials = [...c.envKeys, ...c.headerKeys].map((name) => ({ name, class: classifyCredential(name) })).filter((x): x is { name: string; class: CredentialClass } => !!x.class);
   const hosts = new Set<string>();
@@ -285,6 +287,7 @@ export function blastRadius({ component: c, verdict, trace }: BlastInput): Blast
   else if (verdict?.label === "caution") { score += 1; reasons.push(`its verdict is Caution (${verdict.score}/100)`); }
   if (trace?.credentialPathsRead.length) { score += 3; reasons.unshift(`read ${trace.credentialPathsRead.slice(0, 2).join(", ")} in the honeypot`); }
   if (trace?.memoryWrites) { score += 2; reasons.push("wrote to the agent's memory or instruction files in the honeypot"); }
+  if (vulns?.count) { const bad = vulns.worst === "critical" || vulns.worst === "high"; score += bad ? 2 : 1; reasons.push(`has ${vulns.count} known vulnerabilit${vulns.count === 1 ? "y" : "ies"} (OSV, worst ${vulns.worst})`); }
   if (c.kind === "instructions") reasons.push("is read by the agent as instructions on every session");
   if (!verdict && c.kind !== "instructions" && c.kind !== "hook") { score += 1; reasons.push(c.package || c.kind !== "mcp_server" ? "has no KillerSkills verdict yet" : "is not a registry package, so there is no verdict to check"); }
   const level = score >= 5 ? "high" : score >= 3 ? "medium" : "low";
