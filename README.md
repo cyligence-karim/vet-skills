@@ -63,7 +63,7 @@ args = ["-y", "vet-skills", "mcp"]
 ```
 
 Then ask your agent: *"Before you add that MCP server, check it with KillerSkills."*
-Requires Node 20+. Index: 16,000+ skills and MCP servers from skills.sh, ClawHub,
+Requires Node 20+. Index: 24,000+ skills and MCP servers from skills.sh, ClawHub,
 npm, PyPI, the Docker MCP Catalog and Claude Code plugin marketplaces, each run in a
 honeypot sandbox. Browse them at [killerskills.ai](https://killerskills.ai/?utm_source=npm&utm_medium=readme&utm_campaign=cli).
 
