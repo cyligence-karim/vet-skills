@@ -1,0 +1,97 @@
+name: "KillerSkills vet-skills"
+description: "Check the agent skills and MCP servers a repository uses against KillerSkills verdicts and your org policy before they reach CI or developers."
+author: "Cyligence, LLC"
+branding:
+  icon: shield
+  color: green
+inputs:
+  skills:
+    description: "Skills or MCP servers to check, one per line (name, name@version, or registry URL). Discovered automatically from .claude/skills, skills/ and .mcp.json when empty."
+    required: false
+    default: ""
+  fail-on:
+    description: "Lowest decision that fails the job: block, approval_required or sandbox."
+    required: false
+    default: "block"
+  org:
+    description: "Org slug to evaluate against (needs org-token). Without it the CLI uses its default policy."
+    required: false
+    default: ""
+  org-token:
+    description: "KillerSkills org enroll token (store it as a secret)."
+    required: false
+    default: ""
+  version:
+    description: "vet-skills npm version to run."
+    required: false
+    default: "latest"
+outputs:
+  blocked:
+    description: "Newline-separated list of skills that were blocked."
+    value: ${{ steps.vet.outputs.blocked }}
+  report:
+    description: "Path to the JSON report."
+    value: ${{ steps.vet.outputs.report }}
+runs:
+  using: composite
+  steps:
+    - name: Vet skills
+      id: vet
+      shell: bash
+      env:
+        KS_SKILLS: ${{ inputs.skills }}
+        KS_FAIL_ON: ${{ inputs.fail-on }}
+        KS_ORG: ${{ inputs.org }}
+        KS_ORG_TOKEN: ${{ inputs.org-token }}
+        KS_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        export VET_SKILLS_HOME="${RUNNER_TEMP}/vet-skills"
+        mkdir -p "$VET_SKILLS_HOME"
+        if [ -n "$KS_ORG" ] && [ -n "$KS_ORG_TOKEN" ]; then
+          npx -y "vet-skills@${KS_VERSION}" join "$KS_ORG" --token "$KS_ORG_TOKEN" --email "ci@${GITHUB_REPOSITORY_OWNER}.github" --ci >/dev/null 2>&1 || echo "::warning::could not join org $KS_ORG; evaluating with the default policy"
+        fi
+
+        # Collect targets: explicit list, then auto-discovery.
+        targets=()
+        while IFS= read -r line; do line="${line#"${line%%[![:space:]]*}"}"; [ -n "$line" ] && targets+=("$line"); done <<< "$KS_SKILLS"
+        if [ ${#targets[@]} -eq 0 ]; then
+          for d in .claude/skills/*/ skills/*/; do [ -f "${d}SKILL.md" ] && targets+=("$(basename "$d")"); done
+          if [ -f .mcp.json ]; then
+            while IFS= read -r u; do [ -n "$u" ] && targets+=("$u"); done < <(node -e 'const m=JSON.parse(require("fs").readFileSync(".mcp.json","utf8"));for(const s of Object.values(m.mcpServers||{}))if(s.url)console.log(s.url)')
+          fi
+        fi
+        if [ ${#targets[@]} -eq 0 ]; then echo "::notice::vet-skills: nothing to check (no skills input, .claude/skills, skills/ or .mcp.json)"; echo "blocked=" >> "$GITHUB_OUTPUT"; exit 0; fi
+
+        rank() { case "$1" in block) echo 3;; approval_required) echo 2;; sandbox) echo 1;; *) echo 0;; esac; }
+        threshold=$(rank "$KS_FAIL_ON")
+        report="${RUNNER_TEMP}/vet-skills-report.json"; echo "[" > "$report"; first=1
+        failed=(); blocked=()
+        {
+          echo "## KillerSkills verdicts"; echo; echo "| Skill | Decision | Score | Reason |"; echo "|---|---|---|---|"
+        } >> "$GITHUB_STEP_SUMMARY"
+        for t in "${targets[@]}"; do
+          out=$(npx -y "vet-skills@${KS_VERSION}" check "$t" --json 2>/dev/null || true)
+          if [ -z "$out" ]; then
+            echo "| \`$t\` | unresolved | | not found on any registry we index |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=vet-skills::$t could not be resolved"; continue
+          fi
+          decision=$(node -e 'const r=JSON.parse(process.argv[1]);console.log(r.decision.decision)' "$out")
+          reason=$(node -e 'const r=JSON.parse(process.argv[1]);console.log((r.decision.reason||"").replace(/\|/g,"/"))' "$out")
+          score=$(node -e 'const r=JSON.parse(process.argv[1]);console.log(r.resolved&&r.resolved.verdict?r.resolved.verdict.score:"")' "$out")
+          page=$(node -e 'const r=JSON.parse(process.argv[1]);console.log(r.resolved?"https://killerskills.ai"+r.resolved.skill.page+"/"+r.resolved.version.semver:"")' "$out")
+          [ $first -eq 1 ] || echo "," >> "$report"; first=0; echo "$out" >> "$report"
+          link=${page:+[verdict]($page)}
+          echo "| \`$t\` | $decision | $score | $reason $link |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$(rank "$decision")" -ge "$threshold" ] && [ "$threshold" -gt 0 ]; then
+            failed+=("$t"); echo "::error title=vet-skills $decision::$t: $reason ${page}"
+          elif [ "$decision" != "allow" ] && [ "$decision" != "observe" ]; then
+            echo "::warning title=vet-skills $decision::$t: $reason ${page}"
+          fi
+          [ "$decision" = "block" ] && blocked+=("$t")
+        done
+        echo "]" >> "$report"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        { echo "blocked<<EOF"; printf '%s\n' "${blocked[@]:-}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+        if [ ${#failed[@]} -gt 0 ]; then echo "vet-skills: ${#failed[@]} target(s) at or above '$KS_FAIL_ON': ${failed[*]}"; exit 1; fi
+        echo "vet-skills: ${#targets[@]} target(s) checked, none at or above '$KS_FAIL_ON'"
