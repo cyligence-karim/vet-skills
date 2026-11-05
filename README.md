@@ -82,6 +82,18 @@ credential path it touched, the tools it exposes, and what it costs your agent
 (instruction tokens; for MCP servers the handshake time and the prompt context of
 its tool list). Exit code 2 when the run is Blocked.
 
+## Injection in what comes back
+
+The same hook that observes tool calls reads what `WebFetch`, `WebSearch`, `Read`,
+`Bash`, `Grep` and every MCP tool return. When the content carries instructions
+aimed at the agent ("ignore previous instructions", "do not tell the user", a hidden
+HTML comment, invisible Unicode tag characters, a script piped to a shell), the hook
+tells the agent before its next step, logs it, and reports the kind of finding to
+your org when enrolled. Nothing from the content leaves the machine. `vet-skills
+discover` applies the same rules to CLAUDE.md, AGENTS.md, MEMORY.md and every
+installed SKILL.md; `vet-skills run` applies them to a live server's tool list and
+results.
+
 ## Run it with restrictions
 
 ```
@@ -96,14 +108,6 @@ declare (`--net host1,host2` to choose). When the install hook blocks a stdio
 server, it prints this command as the alternative. Clients that ignore
 `HTTPS_PROXY` are not network-contained, and the guard says so at start; the
 filesystem is not restricted.
-
-## In your editor
-
-The `vscode/` directory holds the KillerSkills extension for VS Code, Cursor and
-Windsurf: verdicts inline next to each MCP server and skill in `.mcp.json`, Cursor and
-Claude Desktop configs, with known vulnerabilities and tool-context cost, and pasted
-credential values flagged by kind and line. Build it with `cd vscode && npm install &&
-npm run package`, or install the `.vsix` from the releases page.
 
 ## See what is already configured
 
@@ -129,7 +133,7 @@ an artifact hash, looked up, and evaluated against your policy before it runs:
 ```
 $ vet-skills check deploy-helper
 Resolving deploy-helper …
-vet-skills 0.7.7 · policy acme/default-strict
+vet-skills 0.7.8 · policy acme/default-strict
 
  BLOCKED  14/100 deploy-helper@2.3.1 · devtools-cloud · 4,210 installs
 

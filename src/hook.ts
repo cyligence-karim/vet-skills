@@ -162,7 +162,10 @@ export function installClaudeCodeHook(): { path: string; changed: boolean } {
   let changed = false;
   if (!pre.some((h) => h.hooks?.some((x) => /vet-skills hook eval/.test(x.command)))) { pre.push({ matcher: "Bash", hooks: [{ type: "command", command: "vet-skills hook eval" }] }); changed = true; }
   // Runtime observation: every tool call after the fact, attributed to the active skill or MCP server and compared with its sandbox trace.
-  if (!post.some((h) => h.hooks?.some((x) => /vet-skills hook observe/.test(x.command)))) { post.push({ matcher: "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|WebFetch|Skill|mcp__.*", hooks: [{ type: "command", command: "vet-skills hook observe" }] }); changed = true; }
+  const OBSERVE_MATCHER = "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|Grep|Skill|mcp__.*";
+  const existing = post.find((h) => h.hooks?.some((x) => /vet-skills hook observe/.test(x.command)));
+  if (existing && existing.matcher !== OBSERVE_MATCHER && /^Bash\|Read\|Write/.test(existing.matcher ?? "")) { existing.matcher = OBSERVE_MATCHER; changed = true; }
+  if (!existing) { post.push({ matcher: OBSERVE_MATCHER, hooks: [{ type: "command", command: "vet-skills hook observe" }] }); changed = true; }
   if (changed) writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
   return { path, changed };
 }

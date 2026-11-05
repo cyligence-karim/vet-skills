@@ -395,7 +395,11 @@ async function main(): Promise<number> {
           const v = r.ok ? r.data.verdict : null;
           verdicts.set(`${x.kind}|${x.name}`, v?.label ? `${v.label} ${v.score ?? ""}`.trim() : "not vetted");
         }));
-        const lures = comps.filter((x) => x.kind === "lure"), secrets = comps.filter((x) => x.kind === "secret");
+        const lures = comps.filter((x) => x.kind === "lure"), secrets = comps.filter((x) => x.kind === "secret"), hidden = comps.filter((x) => x.kind === "instructions" && / \(hidden text\)$/.test(x.name));
+        if (hidden.length) {
+          console.log(`\n${c.blocked("✗ Hidden instructions")} in ${hidden.length} file${hidden.length === 1 ? "" : "s"} the agent reads (text you would not see, but the model does):`);
+          for (const x of hidden) console.log(`  ${c.caution(x.path)}\n    ${c.muted((x.detail ?? "").split("; ").join("\n    "))}`);
+        }
         if (lures.length) {
           console.log(`\n${c.blocked("✗ Installer lure")} in ${lures.length} installed skill folder${lures.length === 1 ? "" : "s"}. Do not run anything from these; remove the folder and, if you ran an installer from it, treat the machine as compromised.`);
           for (const x of lures) console.log(`  ${c.blocked(x.path)}\n    ${c.muted((x.detail ?? "").split("; ").join("\n    "))}`);

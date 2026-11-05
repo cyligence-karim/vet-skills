@@ -327,3 +327,4 @@ export function flagsFromTrace(t: {
 export * from "./discover.js";
 export * from "./secrets.js";
 export * from "./lure-lite.js";
+export * from "./hidden.js";

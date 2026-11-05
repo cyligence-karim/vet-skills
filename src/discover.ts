@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { USER_CONFIG_FILES, USER_SKILL_DIRS, findSecrets, isAgentConfigPath, localLureFindings, parseAgentConfig, type Component, type LocalFile } from "./policy/index.js";
+import { USER_CONFIG_FILES, USER_SKILL_DIRS, findSecrets, hiddenTextFindings, isAgentConfigPath, localLureFindings, parseAgentConfig, type Component, type LocalFile } from "./policy/index.js";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 
@@ -23,24 +23,33 @@ export function discoverLocal(opts: { home?: string; project?: string } = {}): C
   const out: Component[] = [];
   for (const f of USER_CONFIG_FILES) {
     const text = read(join(home, f.path));
-    if (text !== null) { out.push(...parseAgentConfig(f.path, text, "user")); out.push(...secretComponent(f.path, text, "user")); }
+    if (text !== null) { out.push(...parseAgentConfig(f.path, text, "user")); out.push(...secretComponent(f.path, text, "user")); out.push(...hiddenComponent(f.path, text, "user")); }
   }
+  for (const rel of [".claude/MEMORY.md", ".claude/projects"]) { /* MEMORY.md lives under ~/.claude; project memories are per-folder and scanned with --project */ const text = read(join(home, rel)); if (text !== null) out.push(...hiddenComponent(rel, text, "user")); }
   for (const dir of USER_SKILL_DIRS) {
     const abs = join(home, dir);
     if (!existsSync(abs)) continue;
     for (const name of safeList(abs)) {
       const rel = `${dir}/${name}/SKILL.md`;
       const text = read(join(home, rel));
-      if (text !== null) out.push(...parseAgentConfig(rel, text, "user"));
+      if (text !== null) { out.push(...parseAgentConfig(rel, text, "user")); out.push(...hiddenComponent(rel, text, "user")); }
       out.push(...lureComponent(join(home, dir, name), `${dir}/${name}`, "user"));
     }
   }
   if (opts.project) {
-    for (const rel of walk(opts.project, "", 0)) { const text = read(join(opts.project, rel)); if (text !== null) { out.push(...parseAgentConfig(rel, text, "project")); out.push(...secretComponent(rel, text, "project")); } }
+    for (const rel of walk(opts.project, "", 0)) { const text = read(join(opts.project, rel)); if (text !== null) { out.push(...parseAgentConfig(rel, text, "project")); out.push(...secretComponent(rel, text, "project")); out.push(...hiddenComponent(rel, text, "project")); } }
     for (const dir of [".claude/skills", "skills"]) for (const name of safeList(join(opts.project, dir))) out.push(...lureComponent(join(opts.project, dir, name), `${dir}/${name}`, "project"));
   }
   const seen = new Set<string>();
   return out.filter((c) => { const k = `${c.kind}|${c.name}|${c.path}`; if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
+/** Hidden instructions in a file the agent reads (invisible Unicode, hidden HTML, imperative comments). Titles and lines only. */
+function hiddenComponent(rel: string, text: string, scope: "user" | "project"): Component[] {
+  if (!/\.(md|mdx|markdown|txt|cursorrules|clinerules|windsurfrules)$|(^|\/)\.(cursorrules|clinerules|windsurfrules)$/i.test(rel)) return [];
+  const found = hiddenTextFindings(text).filter((f) => f.severity !== "medium").slice(0, 8);
+  if (!found.length) return [];
+  return [{ kind: "instructions", name: `${rel.split("/").pop()} (hidden text)`, path: rel, scope, agent: "any", envKeys: [], headerKeys: [], detail: found.map((f) => `${f.title} (line ${f.line})`).join("; ") }];
 }
 
 /** A credential value pasted into a config file: kind, key and line only; the value never leaves this function. */
