@@ -25,7 +25,7 @@
  *   vet-skills verify --lock              offline: installed skills still match the lock and signatures verify
  *   vet-skills hook install claude-code   register the Claude Code PreToolUse hook
  *   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
-  vet-skills runtime                    what installed skills did in real sessions that the sandbox never saw
+  vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
  *   vet-skills hook observe               (called by the agent after each tool call) compare behavior with the sandbox trace
  *   vet-skills runtime                    deviations observed in real sessions this week
  */
@@ -47,7 +47,7 @@ import { VERSION, API, HOME, readLog, readOrg, readPolicy, readToken, stateSumma
 import { hookEval, installClaudeCodeHook } from "./hook.js";
 import { applyRemovals, sync } from "./sync.js";
 import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from "./attest.js";
-import { observe, pruneSessions, readDeviations } from "./runtime.js";
+import { observe, pruneSessions, readDeviations, readAllows, recordPrompt, revokeAllow } from "./runtime.js";
 import { c } from "./render.js";
 
 // `run` owns everything after it (its own flags, then `--` and the server command); the shared parser never sees them.
@@ -93,7 +93,7 @@ Get started:
   vet-skills verify --lock              offline: installed skills still match the lock and signatures verify
   vet-skills hook install claude-code   register the Claude Code PreToolUse hook
   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
-  vet-skills runtime                    what installed skills did in real sessions that the sandbox never saw
+  vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
 
 Docs: https://killerskills.ai/docs/cli
 `;
@@ -378,6 +378,14 @@ async function main(): Promise<number> {
     }
 
     case "runtime": {
+      if (rest[0] === "allows" || rest[0] === "revoke") {
+        if (rest[0] === "revoke") { const ok = rest[1] ? revokeAllow(rest[1]) : false; console.log(ok ? `${c.verified("✓")} allow ${rest[1]} revoked` : `no allow matches ${rest[1] ?? "(missing id)"}`); return ok ? 0 : 1; }
+        const now = Date.now(); const all = readAllows().filter((a) => Date.parse(a.at) > now - 7 * 86_400_000);
+        if (!all.length) { console.log(c.muted("No scoped allows in the last 7 days. A sensitive action is allowed only when your own actions this session explain it; each allow is scoped to (session, skill, resource) for 30 minutes.")); return 0; }
+        for (const a of all) { const state = a.revoked ? c.muted("revoked") : Date.parse(a.expires) > now ? c.verified("active") : c.muted("expired"); console.log(`${c.ink2(a.id)}  ${a.at.slice(0, 16).replace("T", " ")}  ${state}  ${a.skill}  ${a.kind.replace(/_/g, " ")}  ${a.resource}  ${c.muted(a.reason)}`); }
+        if (values.json) console.log(JSON.stringify(all, null, 2));
+        return 0;
+      }
       const ds = readDeviations(7);
       if (!ds.length) { console.log(c.muted("No deviations in the last 7 days: installed skills behaved the way the sandbox saw them (or no skill ran).")); return 0; }
       const by = new Map<string, typeof ds>();
@@ -467,6 +475,12 @@ async function main(): Promise<number> {
           if (Math.random() < 0.02) pruneSessions();
           return r.code;
         } catch { return 0; } // observation never breaks the agent
+      }
+      if (sub === "prompt") {
+        const chunks: Buffer[] = [];
+        for await (const ch of process.stdin) chunks.push(ch as Buffer);
+        try { recordPrompt(Buffer.concat(chunks).toString("utf8")); } catch { /* never breaks the agent */ }
+        return 0;
       }
       if (sub === "install") {
         const target = rest[1] ?? "claude-code";

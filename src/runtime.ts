@@ -16,13 +16,24 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveSkill, runtimeReport, sendFieldSignal } from "./api.js";
-import { HOME, VERSION, readOrg, telemetryEnabled, type ResolveResponse } from "./state.js";
+import { HOME, VERSION, readOrg, readPolicy, telemetryEnabled, type ResolveResponse } from "./state.js";
 import { hiddenTextFindings, hiddenSummary } from "./policy/index.js";
 
 export type DeviationKind = "egress_unexpected" | "credential_read" | "memory_write" | "outside_project_write" | "instruction_in_result";
-export interface Deviation { kind: DeviationKind; skill: string; semver: string | null; detail: string; tool: string; at: string; session: string | null; page: string | null }
+export interface Deviation { kind: DeviationKind; skill: string; semver: string | null; detail: string; tool: string; at: string; session: string | null; page: string | null; /** Set when the session context explained the action and policy allowed it (scoped allow). */ allowed?: boolean; context?: string | null }
 
-interface Session { active: { skill: string; since: number } | null; verdicts: Record<string, { at: number; r: ResolveResponse | null }>; reported: string[] }
+/**
+ * Session intent record: hosts and paths the user's own work touched this session (named in a prompt, or used by a
+ * tool call that no skill was driving), each with the time. Never the prompt text. A skill's sensitive action that
+ * matches a recent entry is "explained by the user" and, under policy `context: allow_when_user_touched`, allowed
+ * with a notice as a scoped allow (session, skill, resource, 30 minutes) instead of held.
+ */
+export interface Intent { hosts: Record<string, number>; paths: Record<string, number>; prompts: number }
+export interface ScopedAllow { id: string; session: string | null; skill: string; kind: DeviationKind; resource: string; reason: string; at: string; expires: string; revoked?: string }
+export const INTENT_WINDOW_MS = 30 * 60_000;
+export const ALLOW_TTL_MS = 30 * 60_000;
+
+interface Session { active: { skill: string; since: number } | null; verdicts: Record<string, { at: number; r: ResolveResponse | null }>; reported: string[]; intent?: Intent }
 
 const ACTIVE_MS = 30 * 60_000;
 const CRED = /(^|\/)(\.ssh|\.aws|\.npmrc|\.netrc|\.config\/gh|\.docker\/config\.json|\.kube\/config|\.gnupg|credentials|\.env(\.|$)|id_(rsa|ed25519|ecdsa)|keychain)/i;
@@ -30,7 +41,70 @@ const MEMORY = /(^|\/)(MEMORY\.md|CLAUDE\.md|AGENTS\.md|\.cursorrules|\.clinerul
 const DIR = join(HOME, "runtime");
 
 function sessionFile(id: string) { return join(DIR, `${id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80)}.json`); }
-function readSession(id: string): Session { try { return JSON.parse(readFileSync(sessionFile(id), "utf8")) as Session; } catch { return { active: null, verdicts: {}, reported: [] }; } }
+function readSession(id: string): Session { try { const s = JSON.parse(readFileSync(sessionFile(id), "utf8")) as Session; s.intent ??= { hosts: {}, paths: {}, prompts: 0 }; return s; } catch { return { active: null, verdicts: {}, reported: [], intent: { hosts: {}, paths: {}, prompts: 0 } }; } }
+
+/** Hosts and paths mentioned in free text (a prompt): URLs, bare domains, ~/… and /… paths. */
+export function mentionsIn(text: string): { hosts: string[]; paths: string[] } {
+  const hosts = new Set<string>(hostsIn(text));
+  for (const m of text.matchAll(/(?:^|[\s("'`])((?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|sh|cloud|run|xyz|me|info|us|uk|de|fr|jp|edu|gov))(?=[\s)"'`:/,.]|$)/gi)) hosts.add(m[1].toLowerCase());
+  const paths = new Set<string>();
+  for (const m of text.matchAll(/(?:^|[\s("'`=])((?:~|\$HOME|\/(?:home|Users|etc|var|opt|tmp))\/[^\s"'`)]*)/g)) paths.add(m[1].replace(/^\$HOME/, "~").replace(/[.,;:]+$/, ""));
+  for (const m of text.matchAll(/(?:^|[\s("'`])(\.(?:ssh|aws|npmrc|netrc|kube|docker|gnupg|config\/gh|env)(?:\/[^\s"'`)]*)?)(?=[\s)"'`,.]|$)/g)) paths.add(`~/${m[1]}`);
+  return { hosts: [...hosts], paths: [...paths] };
+}
+
+/** `vet-skills hook prompt` (UserPromptSubmit): record what the user named; the prompt itself is never stored. */
+export function recordPrompt(stdin: string): void {
+  let payload: { session_id?: string; prompt?: string } = {};
+  try { payload = JSON.parse(stdin); } catch { return; }
+  if (typeof payload.prompt !== "string") return;
+  const sid = payload.session_id ?? "default";
+  const session = readSession(sid);
+  const m = mentionsIn(payload.prompt); const now = Date.now();
+  for (const h of m.hosts) session.intent!.hosts[h] = now;
+  for (const p of m.paths) session.intent!.paths[p] = now;
+  session.intent!.prompts += 1;
+  writeSession(sid, session);
+}
+
+function recordTouch(session: Session, o: Observed) {
+  const now = Date.now(); const it = session.intent!;
+  for (const h of o.hosts) it.hosts[h] = now;
+  for (const p of [...o.read, ...o.written]) it.paths[p] = now;
+}
+
+/** The resource a deviation is about (host or path), from its detail line. */
+export function resourceOf(d: Deviation): string | null {
+  const m = d.detail.match(/^(?:contacted|read|wrote) (\S+?)[;,]/);
+  return m ? m[1] : null;
+}
+
+/** Why the user's own actions explain this deviation, or null. A path matches itself or a parent the user touched; a host matches exactly. */
+export function explainedBy(intent: Intent | undefined, d: Deviation): string | null {
+  if (!intent) return null;
+  const res = resourceOf(d); if (!res) return null;
+  const now = Date.now(); const ago = (t: number) => { const m = Math.max(1, Math.round((now - t) / 60_000)); return `${m} min ago`; };
+  if (d.kind === "egress_unexpected") { const t = intent.hosts[res.toLowerCase()]; return t && now - t < INTENT_WINDOW_MS ? `you named ${res} yourself ${ago(t)}` : null; }
+  const norm = (p: string) => p.replace(/\/+$/, "");
+  const r = norm(res);
+  let best: { p: string; t: number } | null = null;
+  for (const [p, t] of Object.entries(intent.paths)) { const q = norm(p); if ((r === q || r.startsWith(q + "/")) && now - t < INTENT_WINDOW_MS && (!best || t > best.t)) best = { p: q, t }; }
+  return best ? `you ${best.p === r ? "used" : "worked in"} ${best.p} yourself ${ago(best.t)}` : null;
+}
+
+const ALLOWS = () => join(DIR, "allows.jsonl");
+export function readAllows(): ScopedAllow[] { try { return readFileSync(ALLOWS(), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as ScopedAllow); } catch { return []; } }
+export function appendAllow(a: ScopedAllow) { if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true }); writeFileSync(ALLOWS(), JSON.stringify(a) + "\n", { flag: "a" }); }
+export function revokeAllow(id: string): boolean {
+  const all = readAllows(); const hit = all.find((a) => a.id === id || a.id.startsWith(id));
+  if (!hit) return false;
+  writeFileSync(ALLOWS(), all.map((a) => JSON.stringify(a === hit ? { ...a, revoked: new Date().toISOString() } : a)).join("\n") + "\n");
+  return true;
+}
+export function activeAllow(session: string | null, skill: string, kind: DeviationKind, resource: string): ScopedAllow | null {
+  const now = Date.now();
+  return readAllows().find((a) => !a.revoked && a.session === session && a.skill === skill && a.kind === kind && a.resource === resource && Date.parse(a.expires) > now) ?? null;
+}
 function writeSession(id: string, s: Session) { if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true }); writeFileSync(sessionFile(id), JSON.stringify(s)); }
 
 /** Hosts a shell command talks to: URLs plus curl/wget/ssh/scp/nc/telnet targets. */
@@ -139,16 +213,34 @@ export async function observe(stdin: string): Promise<{ code: number; lines: str
   const o = parseToolEvent(tool, input);
   if (o.kind === "Skill") { if (o.skillInvoked) session.active = { skill: o.skillInvoked, since: Date.now() }; writeSession(sid, session); return { code: 0, lines: [] }; }
   const skill = attributed(session, tool);
-  if (!skill || (!o.hosts.length && !o.read.length && !o.written.length)) return { code: 0, lines: [] };
+  if (!skill) {
+    // No skill is driving this call: it is the user's own work. Remember what it touched so a skill's later use of the same thing is explained.
+    if (o.hosts.length || o.read.length || o.written.length) { recordTouch(session, o); writeSession(sid, session); }
+    return { code: 0, lines: [] };
+  }
+  if (!o.hosts.length && !o.read.length && !o.written.length) return { code: 0, lines: [] };
   const r = await verdictFor(session, skill);
   const ds = deviations(skill, r, o, tool, payload.session_id ?? null).filter((d) => { const k = `${d.skill}|${d.kind}|${d.detail.split(";")[0]}`; if (session.reported.includes(k)) return false; session.reported.push(k); return true; });
+  // Context clause: a sensitive action the user's own actions explain is allowed with a notice, scoped to (session, skill, resource, 30 min).
+  const policy = readPolicy().policy;
+  for (const d of ds) {
+    if (d.kind === "instruction_in_result") continue;
+    const res = resourceOf(d);
+    const prior = res ? activeAllow(d.session, d.skill, d.kind, res) : null;
+    const why = prior ? `allowed ${prior.at.slice(11, 16)} UTC (${prior.reason})` : explainedBy(session.intent, d);
+    if (!why || !res || policy.context[d.kind] !== "allow_when_user_touched") continue;
+    d.allowed = true; d.context = why;
+    if (!prior) appendAllow({ id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, session: d.session, skill: d.skill, kind: d.kind, resource: res, reason: why, at: d.at, expires: new Date(Date.now() + ALLOW_TTL_MS).toISOString() });
+  }
   writeSession(sid, session);
   if (!ds.length) return { code: 0, lines: [] };
   appendDeviations(ds);
-  if (readOrg()) await runtimeReport({ events: ds.map((d) => ({ skill: d.skill, semver: d.semver, kind: d.kind, detail: d.detail, tool: d.tool, at: d.at, session: d.session })) }).catch(() => null);
-  await fieldSignal(ds, r);
-  const lines = ds.map((d) => `vet-skills ⚠ ${d.skill}${d.semver ? `@${d.semver}` : ""} ${d.detail}. Not what its verdict is based on${d.page ? `: https://killerskills.ai${d.page}` : ""}`);
-  const serious = ds.some((d) => d.kind === "egress_unexpected" || d.kind === "credential_read");
+  if (readOrg()) await runtimeReport({ events: ds.map((d) => ({ skill: d.skill, semver: d.semver, kind: d.kind, detail: d.detail, tool: d.tool, at: d.at, session: d.session, allowed: d.allowed ?? false, context: d.context ?? null })) }).catch(() => null);
+  await fieldSignal(ds.filter((d) => !d.allowed), r);
+  const lines = ds.map((d) => d.allowed
+    ? `vet-skills ◦ allowed because you asked for it: ${d.skill}${d.semver ? `@${d.semver}` : ""} ${d.detail.split(";")[0]} (${d.context}). Scoped to this session for 30 min; vet-skills runtime allows · revoke <id>`
+    : `vet-skills ⚠ ${d.skill}${d.semver ? `@${d.semver}` : ""} ${d.detail}. Not what its verdict is based on${d.page ? `: https://killerskills.ai${d.page}` : ""}${d.kind === "egress_unexpected" || d.kind === "credential_read" ? ". Nothing you did this session explains it: ask the user before continuing" : ""}`);
+  const serious = ds.some((d) => !d.allowed && (d.kind === "egress_unexpected" || d.kind === "credential_read"));
   return { code: serious ? 2 : 0, lines };
 }
 

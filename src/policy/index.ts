@@ -31,7 +31,18 @@ export interface Policy {
   publishers: { allow: string[]; block: string[]; blockYoungerThanDays: number };
   agents: AgentKind[];
   approvals: { ttlDays: number; blockedExceptionApprovers: number };
+  /**
+   * Runtime context clause: what the hook does when a skill's sensitive action is explained by the user's own actions
+   * this session (they named the host or path in a prompt, or touched it themselves in the last 30 minutes).
+   * allow_when_user_touched → allowed with a one-line notice, recorded as a scoped allow (session, skill, resource, 30 min).
+   * hold → held and the agent told to ask, as if there were no context. Actions with no supporting context are always held.
+   */
+  context: Record<ContextKind, ContextAction>;
 }
+export type ContextKind = "credential_read" | "egress_unexpected" | "memory_write" | "outside_project_write";
+export type ContextAction = "allow_when_user_touched" | "hold";
+export const CONTEXT_KINDS: readonly ContextKind[] = ["credential_read", "egress_unexpected", "memory_write", "outside_project_write"];
+export const DEFAULT_CONTEXT: Record<ContextKind, ContextAction> = { credential_read: "allow_when_user_touched", egress_unexpected: "allow_when_user_touched", memory_write: "allow_when_user_touched", outside_project_write: "allow_when_user_touched" };
 
 export interface VerdictInput {
   id: string;
@@ -108,6 +119,7 @@ export const DEFAULT_POLICY: Policy = {
   publishers: { allow: ["anthropic", "github", "stripe", "vercel-labs"], block: [], blockYoungerThanDays: 30 },
   agents: ["claude_code", "cursor", "codex", "copilot", "gemini_cli", "other"],
   approvals: { ttlDays: 90, blockedExceptionApprovers: 2 },
+  context: DEFAULT_CONTEXT,
 };
 
 /** The permissive personal policy the CLI uses before anyone configures one. */
@@ -142,6 +154,9 @@ export function parsePolicyYaml(text: string): Policy {
   const a = (y.approvals ?? {}) as Record<string, unknown>;
   const behavior = { ...DEFAULT_POLICY.behavior };
   for (const f of FLAGS) behavior[f] = str(b[f], ["block", "approval", "warn"] as const, DEFAULT_POLICY.behavior[f]);
+  const cx = (y.context ?? {}) as Record<string, unknown>;
+  const context = { ...DEFAULT_CONTEXT };
+  for (const k of CONTEXT_KINDS) context[k] = str(cx[k], ["allow_when_user_touched", "hold"] as const, DEFAULT_CONTEXT[k]);
   return {
     name: typeof y.name === "string" ? y.name : DEFAULT_POLICY.name,
     version: num(y.version, 1),
@@ -160,6 +175,7 @@ export function parsePolicyYaml(text: string): Policy {
       ttlDays: num(a.ttl_days, DEFAULT_POLICY.approvals.ttlDays),
       blockedExceptionApprovers: num(a.blocked_exception_approvers, DEFAULT_POLICY.approvals.blockedExceptionApprovers),
     },
+    context,
   };
 }
 
@@ -175,6 +191,7 @@ export function serializePolicyYaml(p: Policy): string {
     publishers: { allow: p.publishers.allow, block: p.publishers.block, block_younger_than_days: p.publishers.blockYoungerThanDays },
     agents: p.agents,
     approvals: { ttl_days: p.approvals.ttlDays, blocked_exception_approvers: p.approvals.blockedExceptionApprovers },
+    context: p.context ?? DEFAULT_CONTEXT,
   });
 }
 

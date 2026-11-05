@@ -40,3 +40,34 @@ test("mcp tool names attribute to the server; Skill invocations set the active s
   assert.equal(parseToolEvent("Skill", { skill: "deploy-helper" }).skillInvoked, "deploy-helper");
   assert.equal(parseToolEvent("mcp__github-mcp__create_pr", { title: "x" }).kind, "mcp");
 });
+
+test("session intent: a sensitive action the user's own actions explain becomes a scoped allow; one with no context is held", async () => {
+  const { mkdtempSync } = await import("node:fs"); const { tmpdir } = await import("node:os"); const { join } = await import("node:path");
+  process.env.VET_SKILLS_HOME = mkdtempSync(join(tmpdir(), "vs-intent-"));
+  process.env.VET_SKILLS_TELEMETRY = "0";
+  const { explainedBy, mentionsIn, observe, readAllows, recordPrompt } = await import(`../src/runtime.ts?intent=${Date.now()}`);
+  const m = mentionsIn("please check my ~/.aws/credentials and ping api.internal.example.com, then look at .ssh/config");
+  assert.ok(m.paths.includes("~/.aws/credentials") && m.paths.includes("~/.ssh/config"));
+  assert.ok(m.hosts.includes("api.internal.example.com"));
+  const d = (kind: "credential_read" | "egress_unexpected", detail: string) => ({ kind, skill: "s", semver: null, detail, tool: "Bash", at: new Date().toISOString(), session: "s1", page: null });
+  const intent = { hosts: { "api.internal.example.com": Date.now() }, paths: { "~/.aws": Date.now() - 60_000 }, prompts: 1 };
+  assert.match(explainedBy(intent, d("credential_read", "read ~/.aws/credentials; the sandbox never saw a credential path read")) ?? "", /worked in ~\/\.aws yourself/);
+  assert.match(explainedBy(intent, d("egress_unexpected", "contacted api.internal.example.com; the sandbox saw nothing")) ?? "", /named api\.internal\.example\.com yourself/);
+  assert.equal(explainedBy(intent, d("egress_unexpected", "contacted telemetry-cdn.xyz; the sandbox saw nothing")), null);
+  assert.equal(explainedBy({ hosts: {}, paths: { "~/.aws": Date.now() - 40 * 60_000 }, prompts: 0 }, d("credential_read", "read ~/.aws/credentials; x")), null, "older than the 30-minute window");
+  // End to end through the hook: the user names a host in a prompt, then an MCP server's tool contacts it.
+  const sid = `sess-${Date.now().toString(36)}`;
+  recordPrompt(JSON.stringify({ session_id: sid, prompt: "deploy to build.example.com" }));
+  const ev = { session_id: sid, tool_name: "Bash", tool_input: { command: "curl https://build.example.com/x" } };
+  // A Bash call with no skill driving it is the user's own work: recorded, never a deviation.
+  const own = await observe(JSON.stringify(ev)); assert.equal(own.code, 0); assert.equal(own.lines.length, 0);
+  // A skill drives the next one: the host is explained, so it is allowed with a notice instead of held.
+  await observe(JSON.stringify({ session_id: sid, tool_name: "Skill", tool_input: { skill: "deploy-helper" } }));
+  const r = await observe(JSON.stringify(ev));
+  assert.equal(r.code, 0, r.lines.join("\n"));
+  assert.match(r.lines[0] ?? "", /allowed because you asked for it/);
+  assert.ok(readAllows().some((a) => a.session === sid && a.resource === "build.example.com"));
+  // Unexplained host from the same skill: held, and the agent told to ask.
+  const held = await observe(JSON.stringify({ session_id: sid, tool_name: "Bash", tool_input: { command: "curl https://telemetry-cdn.xyz/collect" } }));
+  assert.equal(held.code, 2); assert.match(held.lines[0], /ask the user before continuing/);
+});

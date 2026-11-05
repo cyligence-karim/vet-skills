@@ -166,6 +166,9 @@ export function installClaudeCodeHook(): { path: string; changed: boolean } {
   const existing = post.find((h) => h.hooks?.some((x) => /vet-skills hook observe/.test(x.command)));
   if (existing && existing.matcher !== OBSERVE_MATCHER && /^Bash\|Read\|Write/.test(existing.matcher ?? "")) { existing.matcher = OBSERVE_MATCHER; changed = true; }
   if (!existing) { post.push({ matcher: OBSERVE_MATCHER, hooks: [{ type: "command", command: "vet-skills hook observe" }] }); changed = true; }
+  // Session intent: hosts and paths the user names in a prompt (the prompt itself is never stored) explain a skill's later use of them.
+  const prompt = (hooks.UserPromptSubmit ??= []) as { hooks?: { type: string; command: string }[] }[];
+  if (!prompt.some((h) => h.hooks?.some((x) => /vet-skills hook prompt/.test(x.command)))) { prompt.push({ hooks: [{ type: "command", command: "vet-skills hook prompt" }] }); changed = true; }
   if (changed) writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
   return { path, changed };
 }

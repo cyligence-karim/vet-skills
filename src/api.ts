@@ -65,7 +65,7 @@ export function report(body: Record<string, unknown>) {
 }
 
 /** Runtime deviations observed in a session (enrolled machines only). */
-export function runtimeReport(body: { events: { skill: string; semver: string | null; kind: string; detail: string; tool: string; at: string; session: string | null }[] }) {
+export function runtimeReport(body: { events: { skill: string; semver: string | null; kind: string; detail: string; tool: string; at: string; session: string | null; allowed?: boolean; context?: string | null }[] }) {
   const org = readOrg();
   if (!org) return Promise.resolve<ApiResult<{ ok: true }>>({ ok: false, error: "not joined", offline: false });
   return call<{ ok: true }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/runtime`, { method: "POST", body: JSON.stringify(body), headers: orgHeaders() }, 6000);

@@ -122,6 +122,24 @@ use WSL. Where neither sandbox is available the guard runs without it and says s
 claude mcp add crm -- npx -y vet-skills run --contain --net declared -- npx -y @acme/crm-mcp
 ```
 
+## Allowed because you asked for it
+
+Not every credential read is an attack. The hook keeps a per-session intent
+record: the hosts and paths you named in a prompt (extracted by a
+`UserPromptSubmit` hook; the prompt itself is never stored) and the ones your
+own tool calls touched. A skill's sensitive action that matches an entry from
+the last 30 minutes is allowed with a one-line notice and recorded as a scoped
+allow (this session, this skill, this resource, 30 minutes); the same action
+with nothing to explain it is held and the agent is told to ask you.
+
+```
+vet-skills runtime allows        # scoped allows this week, with the reason
+vet-skills runtime revoke <id>   # revoke one now
+```
+
+Policy `context:` turns this off per kind (`credential_read: hold`). No model
+judges intent: the rule is the match, and it is printed.
+
 ## See what is already configured
 
 ```
