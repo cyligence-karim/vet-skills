@@ -97,6 +97,14 @@ server, it prints this command as the alternative. Clients that ignore
 `HTTPS_PROXY` are not network-contained, and the guard says so at start; the
 filesystem is not restricted.
 
+## In your editor
+
+The `vscode/` directory holds the KillerSkills extension for VS Code, Cursor and
+Windsurf: verdicts inline next to each MCP server and skill in `.mcp.json`, Cursor and
+Claude Desktop configs, with known vulnerabilities and tool-context cost, and pasted
+credential values flagged by kind and line. Build it with `cd vscode && npm install &&
+npm run package`, or install the `.vsix` from the releases page.
+
 ## See what is already configured
 
 ```

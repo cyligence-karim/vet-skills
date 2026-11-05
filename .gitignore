@@ -3,3 +3,6 @@ dist/
 *.log
 .env
 .env.*
+vscode/node_modules/
+vscode/dist/
+vscode/*.vsix
