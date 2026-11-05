@@ -78,6 +78,11 @@ locally. Each server and skill name is looked up for its verdict; nothing else l
 the machine. When you are enrolled in an org, the list of names is also reported to
 your team's Discovery page. Environment values, arguments and file contents never are.
 
+It also inspects each installed skill folder for the installer-lure shape (a committed
+ZIP or `.bat`, a LuaJIT runtime, Lua saved as `.txt`, files matching the Agent Lure
+Stealer IOCs) and flags credential values pasted into config files, by kind and line
+only; the value itself is never printed or sent.
+
 ## What it does
 
 Every `skills add`, `claude plugin install`, and `claude mcp add` is resolved to
@@ -86,7 +91,7 @@ an artifact hash, looked up, and evaluated against your policy before it runs:
 ```
 $ vet-skills check deploy-helper
 Resolving deploy-helper …
-vet-skills 0.7.5 · policy acme/default-strict
+vet-skills 0.7.6 · policy acme/default-strict
 
  BLOCKED  14/100 deploy-helper@2.3.1 · devtools-cloud · 4,210 installs
 

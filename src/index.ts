@@ -335,6 +335,15 @@ async function main(): Promise<number> {
           const v = r.ok ? r.data.verdict : null;
           verdicts.set(`${x.kind}|${x.name}`, v?.label ? `${v.label} ${v.score ?? ""}`.trim() : "not vetted");
         }));
+        const lures = comps.filter((x) => x.kind === "lure"), secrets = comps.filter((x) => x.kind === "secret");
+        if (lures.length) {
+          console.log(`\n${c.blocked("✗ Installer lure")} in ${lures.length} installed skill folder${lures.length === 1 ? "" : "s"}. Do not run anything from these; remove the folder and, if you ran an installer from it, treat the machine as compromised.`);
+          for (const x of lures) console.log(`  ${c.blocked(x.path)}\n    ${c.muted((x.detail ?? "").split("; ").join("\n    "))}`);
+        }
+        if (secrets.length) {
+          console.log(`\n${c.blocked("✗ Credential values")} pasted into ${secrets.length} config file${secrets.length === 1 ? "" : "s"} (rotate them, then use an environment reference such as \${GITHUB_TOKEN}):`);
+          for (const x of secrets) console.log(`  ${c.caution(x.path)}  ${c.muted(x.detail ?? "")}`);
+        }
         const kinds: [string, string][] = [["mcp_server", "MCP servers"], ["skill", "Skills"], ["plugin", "Plugins"], ["hook", "Hooks"], ["instructions", "Instruction files"]];
         for (const [k, label] of kinds) {
           const list = comps.filter((x) => x.kind === k);

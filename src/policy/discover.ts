@@ -10,7 +10,7 @@
  * caller can store a secret by accident.
  */
 
-export type ComponentKind = "mcp_server" | "skill" | "plugin" | "hook" | "instructions" | "lure";
+export type ComponentKind = "mcp_server" | "skill" | "plugin" | "hook" | "instructions" | "lure" | "secret";
 
 export interface Component {
   kind: ComponentKind;
