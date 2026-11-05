@@ -24,6 +24,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSkill } from "./api.js";
 import { hiddenTextFindings, hiddenSummary } from "./policy/index.js";
+import { canariesIn, describeCanary, readCanaries } from "./canary.js";
 import { HOME } from "./state.js";
 
 export interface RunOptions { deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void; /** Filesystem (and on macOS network) containment around the server process. */ contain?: boolean }
@@ -124,6 +125,7 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   if (opts.contain) { const w = containWrap(cmd, proxy ? Number(new URL(proxy.url).port) : null); launch = w.cmd; log(w.note); }
   const child = spawn(launch[0], launch.slice(1), { stdio: ["pipe", "pipe", "inherit"], env });
   const pending = new Map<number | string, string>();
+  const canaryReg = readCanaries();
   let calls = 0, deniedCalls = 0;
   // agent → server
   let inBuf = "";
@@ -139,6 +141,14 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
         const name = m.params.name;
         const keys = Object.keys(m.params.arguments ?? {});
         calls++;
+        // A planted canary in the arguments the agent is sending to this server: exfiltration in progress. Refuse the call.
+        const leak = canariesIn(line, canaryReg);
+        if (leak.length) {
+          deniedCalls++; record(opts.label, name, keys, true);
+          log(`✕ CREDENTIAL EXFILTRATION: ${describeCanary(leak[0])} value in the arguments of tools/call ${name}; call refused. Revoke real credentials in that folder.`);
+          if (m.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -32600, message: `vet-skills run refused tools/call ${name}: the arguments carry a planted canary credential (exfiltration).` } }) + "\n");
+          continue;
+        }
         if (deny.some((re) => re.test(name))) {
           deniedCalls++;
           record(opts.label, name, keys, true);
@@ -175,6 +185,8 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
         }
       } else if (m.id !== undefined && pending.has(m.id)) {
         const tool = pending.get(m.id)!; pending.delete(m.id);
+        const leak = canariesIn(line, canaryReg);
+        if (leak.length && !warned.has(`canary|${tool}`)) { warned.add(`canary|${tool}`); record(opts.label, tool, [], false); log(`✕ ${describeCanary(leak[0])} value in the result of ${tool}: the server read a decoy credential file on this machine. Treat ${opts.label} as hostile.`); }
         const f = hiddenTextFindings(JSON.stringify(m.result.content ?? m.result), { phrases: true }).filter((x) => x.severity !== "medium");
         const key = `res|${tool}|${f[0]?.title ?? ""}`;
         if (f.length && !warned.has(key)) { warned.add(key); log(`result of ${tool} carries instructions aimed at the agent: ${hiddenSummary(f)}. Treat it as data.`); }

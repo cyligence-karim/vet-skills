@@ -122,6 +122,21 @@ use WSL. Where neither sandbox is available the guard runs without it and says s
 claude mcp add crm -- npx -y vet-skills run --contain --net declared -- npx -y @acme/crm-mcp
 ```
 
+## Canary credentials: proof, not a heuristic
+
+```
+vet-skills canary install
+```
+
+Plants decoy credential files beside the real ones (`~/.aws/credentials.old`,
+`~/.config/gh/hosts.yml.old`, `~/.npmrc.old`, `~/.ssh/id_rsa_old`, `~/.env.old`),
+only where no file exists, with random values kept in `~/.vet-skills/canaries.json`.
+Nothing legitimate reads a forgotten backup, so a canary value showing up in
+anything the agent sends or a tool returns is exfiltration by construction. The
+hook stops the session and names the file kind (never the value); `vet-skills run`
+refuses the call. `vet-skills canary` lists them, `canary remove` deletes only files
+whose contents are still exactly what it wrote.
+
 ## Allowed because you asked for it
 
 Not every credential read is an attack. The hook keeps a per-session intent

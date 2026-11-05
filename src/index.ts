@@ -26,6 +26,7 @@
  *   vet-skills hook install claude-code   register the Claude Code PreToolUse hook
  *   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
   vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
+  vet-skills canary [install|remove]    decoy credential files on this machine; any sighting in a session is proof of exfiltration
  *   vet-skills hook observe               (called by the agent after each tool call) compare behavior with the sandbox trace
  *   vet-skills runtime                    deviations observed in real sessions this week
  */
@@ -48,6 +49,8 @@ import { hookEval, installClaudeCodeHook } from "./hook.js";
 import { applyRemovals, sync } from "./sync.js";
 import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from "./attest.js";
 import { observe, pruneSessions, readDeviations, readAllows, recordPrompt, revokeAllow } from "./runtime.js";
+import { plantCanaries, readCanaries, removeCanaries } from "./canary.js";
+import { homedir } from "node:os";
 import { c } from "./render.js";
 
 // `run` owns everything after it (its own flags, then `--` and the server command); the shared parser never sees them.
@@ -94,17 +97,23 @@ Get started:
   vet-skills hook install claude-code   register the Claude Code PreToolUse hook
   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
   vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
+  vet-skills canary [install|remove]    decoy credential files on this machine; any sighting in a session is proof of exfiltration
 
 Docs: https://killerskills.ai/docs/cli
 `;
 function usage() { process.stderr.write(USAGE); }
 
-/** One question, once, on a TTY: whether this machine sends anonymous field signals. Non-interactive installs keep the default (on, opt-out). */
-async function askTelemetry(): Promise<boolean | null> {
-  if (!process.stdin.isTTY || !process.stdout.isTTY || existsSync(join(HOME, "telemetry"))) return null;
-  process.stdout.write("Send anonymous signals when a skill misbehaves (name, version, kind, tool; never content)? [Y/n] ");
+/** A yes/no question on a TTY (default yes; 30 s timeout = yes). Null when there is no terminal to ask. */
+async function askYesNo(prompt: string): Promise<boolean | null> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
+  process.stdout.write(prompt);
   const answer = await new Promise<string>((res) => { const onData = (b: Buffer) => { process.stdin.off("data", onData); process.stdin.pause(); res(b.toString("utf8").trim()); }; process.stdin.resume(); process.stdin.once("data", onData); setTimeout(() => { process.stdin.off("data", onData); process.stdin.pause(); res(""); }, 30_000).unref(); });
   return !/^n/i.test(answer);
+}
+/** One question, once: whether this machine sends anonymous field signals. Non-interactive installs keep the default (on, opt-out). */
+async function askTelemetry(): Promise<boolean | null> {
+  if (existsSync(join(HOME, "telemetry"))) return null;
+  return askYesNo("Send anonymous signals when a skill misbehaves (name, version, kind, tool; never content)? [Y/n] ");
 }
 
 async function main(): Promise<number> {
@@ -377,6 +386,25 @@ async function main(): Promise<number> {
       return 0;
     }
 
+    case "canary": {
+      const sub = rest[0] ?? "status";
+      if (sub === "install" || sub === "plant") {
+        const r = plantCanaries();
+        for (const x of r.planted) console.log(`  ${x.path.replace(homedir(), "~")}  ${c.muted(x.kind.replace(/_/g, " "))}`);
+        console.log(r.planted.length ? `${c.verified("✓")} ${r.planted.length} canary credential${r.planted.length === 1 ? "" : "s"} planted. They look like forgotten backups; nothing real reads them. If one ever shows up in what a skill sends or returns, the hook stops the session and tells you.` : c.muted("Nothing new to plant: every canary path already exists."));
+        if (r.skipped.length) console.log(c.muted(`skipped (path already exists): ${r.skipped.map((p) => p.replace(homedir(), "~")).join(", ")}`));
+        return 0;
+      }
+      if (sub === "remove") { const r = removeCanaries(); console.log(`${c.verified("✓")} ${r.removed} canary file${r.removed === 1 ? "" : "s"} removed`); return 0; }
+      const reg = readCanaries();
+      if (!reg?.canaries.length) { console.log(c.muted("No canary credentials on this machine. vet-skills canary install plants decoy credential files that only a thief would read; the hook turns any sighting into proof of exfiltration.")); return 0; }
+      for (const x of reg.canaries) console.log(`${existsSync(x.path) ? c.verified("✓") : c.caution("!")} ${x.path.replace(homedir(), "~")}  ${c.muted(`${x.kind.replace(/_/g, " ")} · planted ${x.plantedAt.slice(0, 10)}${existsSync(x.path) ? "" : " · file missing"}`)}`);
+      const hits = readDeviations(30).filter((d) => d.kind === "canary_exfil");
+      console.log(hits.length ? `${c.blocked("✕")} ${hits.length} sighting${hits.length === 1 ? "" : "s"} in 30 days: ${hits.slice(-3).map((d) => `${d.at.slice(0, 16).replace("T", " ")} ${d.skill} ${d.detail}`).join("; ")}` : c.muted("No sighting in 30 days."));
+      if (values.json) console.log(JSON.stringify({ canaries: reg.canaries.map((x) => ({ path: x.path, kind: x.kind, plantedAt: x.plantedAt, present: existsSync(x.path) })), sightings: hits }, null, 2));
+      return 0;
+    }
+
     case "runtime": {
       if (rest[0] === "allows" || rest[0] === "revoke") {
         if (rest[0] === "revoke") { const ok = rest[1] ? revokeAllow(rest[1]) : false; console.log(ok ? `${c.verified("✓")} allow ${rest[1]} revoked` : `no allow matches ${rest[1] ?? "(missing id)"}`); return ok ? 0 : 1; }
@@ -488,6 +516,11 @@ async function main(): Promise<number> {
         const r = installClaudeCodeHook();
         console.log(r.changed ? `${c.verified("✓")} Claude Code hook installed in ${r.path}` : c.muted(`Hook already present in ${r.path}`));
         console.log(c.muted("Every `skills add`, `claude plugin install`, and `claude mcp add` is now checked before it runs, and what skills do in sessions is compared with their sandbox trace (vet-skills runtime)."));
+        if (!readCanaries()?.canaries.length) {
+          const yes = await askYesNo("Plant decoy credential files so the hook can prove exfiltration (vet-skills canary)? [Y/n] ");
+          if (yes) { const r = plantCanaries(); console.log(c.muted(`${r.planted.length} canary credential${r.planted.length === 1 ? "" : "s"} planted (vet-skills canary to list or remove).`)); }
+          else if (yes === false) console.log(c.muted("Skipped. Later: vet-skills canary install"));
+        }
         if (!readOrg()) {
           const choice = await askTelemetry();
           if (choice !== null) setTelemetry(choice);

@@ -18,8 +18,9 @@ import { join } from "node:path";
 import { resolveSkill, runtimeReport, sendFieldSignal } from "./api.js";
 import { HOME, VERSION, readOrg, readPolicy, telemetryEnabled, type ResolveResponse } from "./state.js";
 import { hiddenTextFindings, hiddenSummary } from "./policy/index.js";
+import { canariesIn, describeCanary, readCanaries } from "./canary.js";
 
-export type DeviationKind = "egress_unexpected" | "credential_read" | "memory_write" | "outside_project_write" | "instruction_in_result";
+export type DeviationKind = "egress_unexpected" | "credential_read" | "memory_write" | "outside_project_write" | "instruction_in_result" | "canary_exfil";
 export interface Deviation { kind: DeviationKind; skill: string; semver: string | null; detail: string; tool: string; at: string; session: string | null; page: string | null; /** Set when the session context explained the action and policy allowed it (scoped allow). */ allowed?: boolean; context?: string | null }
 
 /**
@@ -196,6 +197,27 @@ export async function observe(stdin: string): Promise<{ code: number; lines: str
   const tool = payload.tool_name ?? ""; const input = payload.tool_input ?? {};
   const sid = payload.session_id ?? "default";
   const session = readSession(sid);
+  // A planted canary credential in anything the agent sent (arguments, a shell command, a URL) or anything a tool returned
+  // is proof of exfiltration: nothing legitimate reads the decoy file, let alone moves its contents.
+  const reg = readCanaries();
+  if (reg?.canaries.length) {
+    const sent = canariesIn(JSON.stringify(input), reg);
+    const got = sent.length ? [] : canariesIn(resultText(payload.tool_response, 2_000_000), reg);
+    const hit = sent[0] ?? got[0];
+    if (hit) {
+      const key = `canary|${tool}|${hit.kind}`;
+      if (!session.reported.includes(key)) {
+        session.reported.push(key); writeSession(sid, session);
+        const skill = attributed(session, tool) ?? (tool.startsWith("mcp__") ? tool.split("__")[1] ?? tool : tool);
+        const where = sent.length ? `in what ${tool} sent` : `in what ${tool} returned`;
+        const d: Deviation = { kind: "canary_exfil", skill, semver: null, detail: `${describeCanary(hit)} value appeared ${where}`, tool, at: new Date().toISOString(), session: payload.session_id ?? null, page: null };
+        appendDeviations([d]);
+        if (readOrg()) await runtimeReport({ events: [{ skill: d.skill, semver: null, kind: d.kind, detail: d.detail, tool, at: d.at, session: d.session }] }).catch(() => null);
+        await fieldSignal([d]);
+        return { code: 2, lines: [`vet-skills ✕ CREDENTIAL EXFILTRATION: a decoy ${describeCanary(hit)} planted on this machine appeared ${where}. Nothing legitimate reads that file. Stop: do not run anything else from ${skill}, do not retry, and tell the user to revoke real credentials in the same folder and run vet-skills runtime.`] };
+      }
+    }
+  }
   // Injection in what came back: a fetched page, a file, a command's output or an MCP result that carries instructions aimed at the agent.
   const inj = injectionInResult(tool, input, payload.tool_response);
   if (inj) {
