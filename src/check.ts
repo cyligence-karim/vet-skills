@@ -136,6 +136,10 @@ export function renderCheck(r: CheckResult): string {
   }
   const tone = v.label;
   lines.push(`${c.pill(v.label.toUpperCase(), tone)} ${c.score(v.score, tone)}${c.faint("/100")} ${c.muted(head)}`);
+  const inc = resolved.incident;
+  if (inc?.source === "field") lines.push(inc.status === "open"
+    ? `${c.caution("!")} ${c.ink2("Open incident:")} ${c.muted(`a hook on ${inc.machines} machine${inc.machines === 1 ? "" : "s"} reported ${inc.kinds.map((k) => k.replace(/_/g, " ")).join(", ")}; honeypot re-run pending (killerskills.ai${inc.page})`)}`
+    : `${c.blocked("✕")} ${c.ink2("Confirmed incident:")} ${c.muted(`reported from the field, then observed in the honeypot${inc.note ? `: ${inc.note}` : ""} (killerskills.ai${inc.page})`)}`);
   lines.push("");
 
   // Observed in sandbox

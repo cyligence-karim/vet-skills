@@ -31,6 +31,8 @@ export type ResolveResponse = {
   trace_summary: { egress_hosts: { host: string; declared: boolean }[]; files_read: string[]; files_written: string[]; memory_writes: unknown[]; tool_shadowing: { tool: string; server: string }[] } | null;
   findings: { rule_id: string; severity: string; title: string; detail: string }[];
   last_safe_version: { semver: string; score: number } | null;
+  /** Open or confirmed incident: a hook elsewhere saw this package misbehave (open = honeypot re-run pending; confirmed = observed). */
+  incident?: { status: "open" | "confirmed"; source: "field" | "sandbox"; opened_at: string; kinds: string[]; machines: number; note: string | null; page: string } | null;
 };
 
 export type OrgState = { slug: string; agentId: string; policyVersion: number; enforcement: "observe" | "enforce"; joinedAt: string };
