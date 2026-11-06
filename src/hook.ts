@@ -6,6 +6,7 @@
  * `claude plugin install …`, `claude mcp add …`), runs the check, and exits 2 with
  * the reason to block, 0 to allow (with a notice on stderr for sandbox/observe).
  */
+import type { AgentKind } from "./policy/index.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -85,7 +86,7 @@ export function extractInstall(command: string): { q: string; kind: "skill" | "p
   return null;
 }
 
-export async function hookEval(stdin: string): Promise<number> {
+export async function hookEval(stdin: string, agentKind: AgentKind = "claude_code"): Promise<number> {
   let payload: { tool_name?: string; tool_input?: { command?: string } } = {};
   try { payload = JSON.parse(stdin); } catch { return 0; }
   if (payload.tool_name !== "Bash" || !payload.tool_input?.command) return 0;
@@ -112,7 +113,7 @@ export async function hookEval(stdin: string): Promise<number> {
   }
   if (!found) return 0;
 
-  const r = await check(found.q, { quiet: true, agentKind: "claude_code", registry: found.registry });
+  const r = await check(found.q, { quiet: true, agentKind, registry: found.registry });
   const out = renderOutcome(r);
   const remote = found.kind === "mcp" ? extractRemoteMcp(cmd) : null;
   // Report the remote MCP server (if any) and apply anything the org asked of this machine, quietly.
@@ -149,6 +150,58 @@ export async function hookEval(stdin: string): Promise<number> {
   return 0;
 }
 
+/** Run a hook function while capturing what it writes to stderr (Cursor wants the text in JSON, not on stderr). */
+export async function captureStderr<T>(fn: () => Promise<T>): Promise<{ result: T; text: string }> {
+  const orig = process.stderr.write.bind(process.stderr); let text = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => { text += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"); return true; }) as typeof process.stderr.write;
+  try { const result = await fn(); return { result, text }; } finally { process.stderr.write = orig; }
+}
+
+const OBSERVE_MATCHER = "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|Grep|Skill|mcp__.*";
+
+/**
+ * Codex CLI hooks use the same shape as Claude Code's (PreToolUse / PostToolUse / UserPromptSubmit, JSON on stdin,
+ * exit 2 blocks), read from ~/.codex/hooks.json. The same three vet-skills commands serve both agents.
+ */
+export function installCodexHook(): { path: string; changed: boolean } {
+  const dir = join(homedir(), ".codex");
+  const path = join(dir, "hooks.json");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  let file: Record<string, unknown> = {};
+  if (existsSync(path)) { try { file = JSON.parse(readFileSync(path, "utf8")); } catch { file = {}; } }
+  const hooks = (file.hooks ??= {}) as Record<string, { matcher?: string; hooks?: { type: string; command: string; timeout?: number }[] }[]>;
+  let changed = false;
+  const add = (event: string, matcher: string | undefined, command: string) => {
+    const list = (hooks[event] ??= []);
+    if (list.some((h) => h.hooks?.some((x) => x.command.includes(command)))) return;
+    list.push({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, timeout: 60 }] }); changed = true;
+  };
+  add("PreToolUse", "^Bash$", "vet-skills hook eval --agent codex");
+  add("PostToolUse", OBSERVE_MATCHER, "vet-skills hook observe --agent codex");
+  add("UserPromptSubmit", undefined, "vet-skills hook prompt");
+  if (changed) writeFileSync(path, JSON.stringify(file, null, 2) + "\n");
+  return { path, changed };
+}
+
+/** Cursor hooks (~/.cursor/hooks.json, version 1): one command handles every event and answers in Cursor's JSON. */
+export function installCursorHook(): { path: string; changed: boolean } {
+  const dir = join(homedir(), ".cursor");
+  const path = join(dir, "hooks.json");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  let file: { version?: number; hooks?: Record<string, { command: string }[]> } = {};
+  if (existsSync(path)) { try { file = JSON.parse(readFileSync(path, "utf8")); } catch { file = {}; } }
+  file.version ??= 1;
+  const hooks = (file.hooks ??= {});
+  let changed = false;
+  for (const ev of ["beforeSubmitPrompt", "beforeShellExecution", "beforeMCPExecution", "afterMCPExecution", "beforeReadFile"]) {
+    const list = (hooks[ev] ??= []);
+    if (list.some((h) => /vet-skills hook cursor/.test(h.command))) continue;
+    list.push({ command: "vet-skills hook cursor" }); changed = true;
+  }
+  if (changed) writeFileSync(path, JSON.stringify(file, null, 2) + "\n");
+  return { path, changed };
+}
+
 /** Writes the Claude Code hook into ~/.claude/settings.json (merging, idempotent). */
 export function installClaudeCodeHook(): { path: string; changed: boolean } {
   const dir = join(homedir(), ".claude");
@@ -162,7 +215,6 @@ export function installClaudeCodeHook(): { path: string; changed: boolean } {
   let changed = false;
   if (!pre.some((h) => h.hooks?.some((x) => /vet-skills hook eval/.test(x.command)))) { pre.push({ matcher: "Bash", hooks: [{ type: "command", command: "vet-skills hook eval" }] }); changed = true; }
   // Runtime observation: every tool call after the fact, attributed to the active skill or MCP server and compared with its sandbox trace.
-  const OBSERVE_MATCHER = "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|Grep|Skill|mcp__.*";
   const existing = post.find((h) => h.hooks?.some((x) => /vet-skills hook observe/.test(x.command)));
   if (existing && existing.matcher !== OBSERVE_MATCHER && /^Bash\|Read\|Write/.test(existing.matcher ?? "")) { existing.matcher = OBSERVE_MATCHER; changed = true; }
   if (!existing) { post.push({ matcher: OBSERVE_MATCHER, hooks: [{ type: "command", command: "vet-skills hook observe" }] }); changed = true; }
