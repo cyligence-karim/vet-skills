@@ -5,7 +5,7 @@ Check agent skills and MCP servers before they run. Verdicts come from
 
 ```
 npm i -g vet-skills                          # the CLI (Node 20+)
-vet-skills hook install all                  # Claude Code, Cursor and Codex: install check, runtime observation, canaries
+vet-skills hook install all                  # Claude Code, Cursor, Codex, Windsurf, Gemini CLI: install check, runtime observation, canaries
 vet-skills check <skill>                     # or just ask before you add one
 vet-skills publish ./my-skill                # org members: detonate + list in the private registry
 ```
@@ -231,7 +231,8 @@ prompts, environment variables, or file contents. `vet-skills leave` reverts.
 | `status` | Org, policy version, cache, pending approvals; syncs policy. |
 | `discover [--project] [--json]` | Inventory agent config on this machine; report names to the org when enrolled. |
 | `mcp` | Run as an MCP server over stdio (`check_skill`, `search_skills`). |
-| `hook install [claude-code \| cursor \| codex \| all]` | Registers the hooks for that agent (`~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/hooks.json`). |
+| `hook install [claude-code \| cursor \| codex \| windsurf \| gemini \| all]` | Registers the hooks for that agent (`~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/hooks.json`, `~/.codeium/windsurf/hooks.json`, `~/.gemini/settings.json`). |
+| `hook windsurf`, `hook gemini` | Called by Windsurf (Cascade) / Gemini CLI on each event; exit 2 blocks, the reason goes to the agent. |
 | `hook eval` | Called by the agent; reads hook JSON on stdin. |
 
 Environment: `KILLERSKILLS_API` (default `https://killerskills.ai`),
