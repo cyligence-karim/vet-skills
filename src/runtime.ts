@@ -251,7 +251,7 @@ export async function observe(stdin: string, opts: { agent?: AgentKind } = {}): 
     const res = resourceOf(d);
     const prior = res ? activeAllow(d.session, d.skill, d.kind, res) : null;
     const why = prior ? `allowed ${prior.at.slice(11, 16)} UTC (${prior.reason})` : explainedBy(session.intent, d);
-    if (!why || !res || policy.context[d.kind] !== "allow_when_user_touched") continue;
+    if (!why || !res || d.kind === "canary_exfil" || policy.context[d.kind] !== "allow_when_user_touched") continue;
     d.allowed = true; d.context = why;
     if (!prior) appendAllow({ id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, session: d.session, skill: d.skill, kind: d.kind, resource: res, reason: why, at: d.at, expires: new Date(Date.now() + ALLOW_TTL_MS).toISOString() });
   }

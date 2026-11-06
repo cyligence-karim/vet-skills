@@ -1,5 +1,5 @@
 /**
- * `vet-skills run [--deny a,b] [--net declared|host1,host2|off] -- <command…>`
+ * `vet-skills run [--deny a,b] [--net declared|host1,host2|off] [--secrets NAME=host,…] -- <command…>`
  *
  * A guard between the agent and a stdio MCP server. The server runs as the
  * command given; the agent talks to this process. In between:
@@ -10,7 +10,9 @@
  *   - with --net, the server's HTTP(S)_PROXY points at an in-process allow-list
  *     proxy: "declared" takes the hosts the KillerSkills verdict saw as declared,
  *     or give a list. Clients that do not honor proxies are not contained, and
- *     the guard says so once at start.
+ *     the guard says so once at start;
+ *   - with --secrets, named environment variables are replaced by placeholders in the server's environment and the
+ *     real values are put into its requests to the bound host only (TLS terminated with a per-run CA; broker.ts).
  *
  * This is "run with restrictions" for a package the policy would otherwise
  * block or sandbox. It is not a container: filesystem access is unchanged.
@@ -18,8 +20,11 @@
 import { spawn, spawnSync } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { existsSync } from "node:fs";
-import { createServer, type Server } from "node:http";
+import { createServer, request as httpRequest, type Server } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { connect } from "node:net";
+import { TLSSocket, createSecureContext } from "node:tls";
+import { brokerEnv, parseSecrets, substitute, RunCA, type SecretBinding } from "./broker.js";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSkill } from "./api.js";
@@ -27,19 +32,27 @@ import { hiddenTextFindings, hiddenSummary } from "./policy/index.js";
 import { canariesIn, describeCanary, readCanaries } from "./canary.js";
 import { HOME } from "./state.js";
 
-export interface RunOptions { deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void; /** Filesystem (and on macOS network) containment around the server process. */ contain?: boolean }
+export interface RunOptions { deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void; /** Filesystem (and on macOS network) containment around the server process. */ contain?: boolean; /** `NAME=host,…`: secrets the guard holds and injects only into requests to that host (see broker.ts). */ secrets?: string }
+
+/** The broker side of the proxy: bound hosts are TLS-terminated and their requests rewritten. */
+export interface BrokerHooks { ca: RunCA; bindings: SecretBinding[]; onBroker: (host: string, used: SecretBinding[], refused: SecretBinding[]) => void }
 
 const globToRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
 
-/** A tiny CONNECT/GET proxy that only forwards to allowed hosts (exact or suffix match). */
-export function startAllowlistProxy(hosts: string[], onDeny: (host: string) => void): Promise<{ url: string; close: () => void }> {
+/** A tiny CONNECT/GET proxy that only forwards to allowed hosts (exact or suffix match). With a broker, bound hosts are
+ *  terminated and rewritten (see broker.ts). */
+export function startAllowlistProxy(hosts: string[], onDeny: (host: string) => void, broker?: BrokerHooks): Promise<{ url: string; close: () => void }> {
   const allowed = (h: string) => hosts.some((a) => h === a || h.endsWith(`.${a}`));
+  // With a broker every allowed host is terminated, not only the bound ones: that is how a placeholder sent to the
+  // wrong host becomes visible. Clients that pin certificates will refuse the run's CA; use --net without --secrets then.
+  const bound = (_h: string) => broker !== undefined;
   const srv: Server = createServer((req, res) => {
     // Plain HTTP: forward only to allowed hosts.
     let host = "";
     try { host = new URL(req.url ?? "").hostname; } catch { /* absolute-form expected */ }
     if (!host || !allowed(host)) { onDeny(host || "?"); res.writeHead(403, { "content-type": "text/plain" }); res.end(`vet-skills run: ${host} is not an allowed host\n`); return; }
     const u = new URL(req.url!);
+    if (broker && bound(host)) { relayRewritten(req, res, { host, port: Number(u.port || 80), tls: false, path: `${u.pathname}${u.search}` }, broker); return; }
     const up = connect(Number(u.port || 80), u.hostname, () => {
       up.write(`${req.method} ${u.pathname}${u.search} HTTP/1.1\r\n`);
       for (const [k, v] of Object.entries(req.headers)) if (k !== "proxy-connection") up.write(`${k}: ${Array.isArray(v) ? v.join(", ") : v}\r\n`);
@@ -48,13 +61,54 @@ export function startAllowlistProxy(hosts: string[], onDeny: (host: string) => v
     });
     up.on("error", () => { try { res.writeHead(502); res.end(); } catch { /* closed */ } });
   });
+  // Requests arriving on a terminated TLS tunnel land here, already decrypted; the socket remembers its host.
+  const mitm: Server = createServer((req, res) => {
+    const sock = req.socket as TLSSocket & { brokerHost?: string; brokerPort?: number };
+    relayRewritten(req, res, { host: sock.brokerHost ?? "", port: sock.brokerPort ?? 443, tls: true, path: req.url ?? "/" }, broker!);
+  });
   srv.on("connect", (req, socket, head) => {
     const [host, port] = (req.url ?? "").split(":");
     if (!host || !allowed(host)) { onDeny(host || "?"); socket.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
+    if (broker && bound(host)) {
+      let leaf: { key: string; cert: string };
+      try { leaf = broker.ca.leaf(host); } catch { socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n"); return; }
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      const tls = new TLSSocket(socket, { isServer: true, secureContext: createSecureContext({ key: leaf.key, cert: leaf.cert }), ALPNProtocols: ["http/1.1"] }) as TLSSocket & { brokerHost?: string; brokerPort?: number };
+      tls.brokerHost = host; tls.brokerPort = Number(port || 443);
+      tls.on("error", () => socket.destroy());
+      if (head.length) tls.unshift(head);
+      mitm.emit("connection", tls);
+      return;
+    }
     const up = connect(Number(port || 443), host, () => { socket.write("HTTP/1.1 200 Connection Established\r\n\r\n"); if (head.length) up.write(head); socket.pipe(up); up.pipe(socket); });
     up.on("error", () => socket.end()); socket.on("error", () => up.end());
   });
-  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => { const a = srv.address() as { port: number }; resolve({ url: `http://127.0.0.1:${a.port}`, close: () => srv.close() }); }));
+  return new Promise((resolve) => srv.listen(0, "127.0.0.1", () => { const a = srv.address() as { port: number }; resolve({ url: `http://127.0.0.1:${a.port}`, close: () => { srv.closeAllConnections(); srv.close(); mitm.closeAllConnections(); mitm.close(); } }); }));
+}
+
+const MAX_REWRITE_BODY = 4 * 1024 * 1024;
+
+/** Forward one decrypted request to its real host with the bound secrets substituted into headers, path and body. */
+function relayRewritten(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse, to: { host: string; port: number; tls: boolean; path: string }, broker: BrokerHooks) {
+  const chunks: Buffer[] = []; let size = 0;
+  req.on("data", (c: Buffer) => { chunks.push(c); size += c.length; });
+  req.on("end", () => {
+    const used: SecretBinding[] = []; const refused: SecretBinding[] = [];
+    const take = (r: { used: SecretBinding[]; refused: SecretBinding[] }) => { used.push(...r.used); refused.push(...r.refused); };
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (k === "proxy-connection" || k === "proxy-authorization") continue;
+      const r = substitute(Array.isArray(v) ? v.join(", ") : String(v ?? ""), to.host, broker.bindings); take(r); headers[k] = r.text;
+    }
+    const pathR = substitute(to.path, to.host, broker.bindings); take(pathR);
+    let body: Buffer | string = Buffer.concat(chunks);
+    if (size <= MAX_REWRITE_BODY && size > 0) { const text = body.toString("latin1"); const r = substitute(text, to.host, broker.bindings); if (r.used.length || r.refused.length) { take(r); body = Buffer.from(r.text, "latin1"); headers["content-length"] = String(body.length); delete headers["transfer-encoding"]; } }
+    broker.onBroker(to.host, [...new Set(used)], [...new Set(refused)]);
+    const mk = to.tls ? httpsRequest : httpRequest;
+    const up = mk({ host: to.host, port: to.port, method: req.method, path: pathR.text, headers, servername: to.host }, (r) => { res.writeHead(r.statusCode ?? 502, r.headers); r.pipe(res); });
+    up.on("error", () => { try { res.writeHead(502); res.end(); } catch { /* closed */ } });
+    up.end(body);
+  });
 }
 
 /** Hosts the verdict's sandbox run saw and the package declared, for --net declared. */
@@ -114,13 +168,32 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   let proxy: { url: string; close: () => void } | null = null;
   let hosts: string[] = [];
   const blockedHosts = new Map<string, number>();
-  if (opts.net !== "off") {
-    hosts = opts.net === "declared" ? await declaredHosts(opts.query ?? opts.label) : opts.net;
-    if (opts.net === "declared" && !hosts.length) log(`no declared hosts on record for ${opts.query ?? opts.label}; network stays open (use --net host1,host2 to pin it)`);
-    else proxy = await startAllowlistProxy(hosts, (h) => { blockedHosts.set(h, (blockedHosts.get(h) ?? 0) + 1); if (blockedHosts.get(h) === 1) log(`blocked connection to ${h} (answered 403; the server keeps running)`); });
+  // Credential broker: the server gets placeholders; the proxy puts the real values into requests to the bound hosts.
+  let broker: BrokerHooks | null = null; let ca: RunCA | null = null;
+  const brokered = new Set<string>();
+  if (opts.secrets) {
+    const p = parseSecrets(opts.secrets);
+    if (p.error) { log(p.error); return 2; }
+    for (const n of p.missing) log(`--secrets: ${n} is not set in the environment; nothing to broker for it`);
+    if (p.bindings.length) {
+      try { ca = RunCA.create(); } catch (e) { log((e as Error).message); return 2; }
+      broker = { ca, bindings: p.bindings, onBroker: (host, used, refused) => {
+        for (const b of used) { const k = `${b.name}→${host}`; if (!brokered.has(k)) { brokered.add(k); log(`brokered ${b.name} into a request to ${host}`); } }
+        for (const b of refused) { const k = `!${b.name}→${host}`; if (!brokered.has(k)) { brokered.add(k); record(opts.label, `secret:${b.name}`, [host], true); log(`✕ ${opts.label} sent the ${b.name} placeholder to ${host}, which it is not bound to (bound: ${b.host}). The real value never left this process; treat the server as hostile.`); } }
+      } };
+    }
   }
-  const env = { ...process.env, ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: "127.0.0.1,localhost", ALL_PROXY: proxy.url } : {}) };
-  log(`guarding ${opts.label}${deny.length ? ` · denying ${opts.deny.join(", ")}` : ""}${proxy ? ` · network limited to ${hosts.join(", ")} (clients that ignore HTTPS_PROXY are not contained)` : ""}`);
+  if (opts.net !== "off" || broker) {
+    hosts = opts.net === "declared" ? await declaredHosts(opts.query ?? opts.label) : opts.net === "off" ? [] : opts.net;
+    if (opts.net === "declared" && !hosts.length && !broker) log(`no declared hosts on record for ${opts.query ?? opts.label}; network stays open (use --net host1,host2 to pin it)`);
+    else {
+      for (const b of broker?.bindings ?? []) if (!hosts.includes(b.host)) hosts.push(b.host);
+      if (opts.net === "off" && broker) log(`--secrets implies a network pin: only ${hosts.join(", ")} reachable (add --net to widen it)`);
+      proxy = await startAllowlistProxy(hosts, (h) => { blockedHosts.set(h, (blockedHosts.get(h) ?? 0) + 1); if (blockedHosts.get(h) === 1) log(`blocked connection to ${h} (answered 403; the server keeps running)`); }, broker ?? undefined);
+    }
+  }
+  const env = { ...process.env, ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: "127.0.0.1,localhost", ALL_PROXY: proxy.url } : {}), ...(broker && ca ? brokerEnv(broker.bindings, ca.caBundle, ca.caPem) : {}) };
+  log(`guarding ${opts.label}${deny.length ? ` · denying ${opts.deny.join(", ")}` : ""}${proxy ? ` · network limited to ${hosts.join(", ")} (clients that ignore HTTPS_PROXY are not contained)` : ""}${broker ? ` · holding ${broker.bindings.map((b) => `${b.name} for ${b.host}`).join(", ")} (the server sees placeholders)` : ""}`);
   let launch = cmd;
   if (opts.contain) { const w = containWrap(cmd, proxy ? Number(new URL(proxy.url).port) : null); launch = w.cmd; log(w.note); }
   const child = spawn(launch[0], launch.slice(1), { stdio: ["pipe", "pipe", "inherit"], env });
@@ -195,8 +268,8 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   });
   return new Promise((resolve) => {
     // Resolve only once everything the server wrote has been relayed and flushed: the process exits right after.
-    child.on("close", (code) => { proxy?.close(); const nb = [...blockedHosts.values()].reduce((a, b) => a + b, 0); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied${nb ? ` · ${nb} connection${nb === 1 ? "" : "s"} blocked (${[...blockedHosts.keys()].slice(0, 5).join(", ")})` : ""}`); process.stdout.write("", () => resolve(code ?? 1)); });
-    child.on("error", (e) => { proxy?.close(); log(`could not start ${cmd[0]}: ${e.message}`); resolve(1); });
+    child.on("close", (code) => { proxy?.close(); ca?.wipe(); const nb = [...blockedHosts.values()].reduce((a, b) => a + b, 0); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied${nb ? ` · ${nb} connection${nb === 1 ? "" : "s"} blocked (${[...blockedHosts.keys()].slice(0, 5).join(", ")})` : ""}`); process.stdout.write("", () => resolve(code ?? 1)); });
+    child.on("error", (e) => { proxy?.close(); ca?.wipe(); log(`could not start ${cmd[0]}: ${e.message}`); resolve(1); });
   });
 }
 
@@ -211,6 +284,7 @@ export function parseRunArgs(argv: string[]): { opts: RunOptions; cmd: string[] 
       if (a === "--deny") opts.deny.push(...val().split(",").map((s) => s.trim()).filter(Boolean));
       else if (a === "--net") { const v = val(); opts.net = v === "off" ? "off" : v === "declared" ? "declared" : v.split(",").map((s) => s.trim()).filter(Boolean); }
       else if (a === "--contain") opts.contain = true;
+      else if (a === "--secrets") opts.secrets = val();
       else if (a === "--label") opts.label = val();
       else if (a === "--query") opts.query = val();
       else return { error: `unknown option ${a}` };
@@ -218,7 +292,7 @@ export function parseRunArgs(argv: string[]): { opts: RunOptions; cmd: string[] 
     i++;
   }
   const cmd = argv.slice(i + 1);
-  if (argv[i] !== "--" || !cmd.length) return { error: "usage: vet-skills run [--contain] [--deny tool,glob*] [--net declared|host1,host2|off] -- <command…>" };
+  if (argv[i] !== "--" || !cmd.length) return { error: "usage: vet-skills run [--contain] [--deny tool,glob*] [--net declared|host1,host2|off] [--secrets NAME=host,…] -- <command…>" };
   if (!opts.label) {
     // "npx -y @scope/pkg" → "@scope/pkg"; "uvx pkg" → "pkg"; else the binary.
     const pkg = cmd.find((x, k) => k > 0 && !x.startsWith("-") && /^(npx|uvx|pipx|bunx)$/.test(cmd[0])) ?? cmd[0];

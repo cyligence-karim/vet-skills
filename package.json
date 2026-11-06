@@ -1,6 +1,6 @@
 {
   "name": "vet-skills",
-  "version": "0.7.12",
+  "version": "0.7.13",
   "mcpName": "io.github.cyligence-karim/killerskills",
   "description": "Vet agent skills and MCP servers before they run, and give your agent the verdicts as an MCP server. Verdicts from KillerSkills, policy from your org.",
   "type": "module",

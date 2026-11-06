@@ -6,7 +6,7 @@
  *   vet-skills install <skill>            check, then `npx skills add`
  *   vet-skills try <pkg|pypi:name|owner/repo|path> fetch it, run it in the honeypot, print everything it did and what it costs the agent
  *   vet-skills try <pkg|pypi:name|owner/repo|path>  fetch it, run it in the honeypot, print everything it did and what it costs the agent
-  vet-skills run [--deny t,glob*] [--net declared|hosts|off] -- <cmd…>  guard a stdio MCP server: deny tools, pin its network, log every call
+  vet-skills run [--contain] [--deny t,glob*] [--net declared|hosts|off] [--secrets NAME=host,…] -- <cmd…>  guard a stdio MCP server: deny tools, pin its network, broker its secrets, log every call
   vet-skills detonate <path> [--publisher h] upload a local bundle to the sandbox and print its verdict
   vet-skills publish <path>             detonate and publish to your organization's private registry
  *   vet-skills why <skill>                last decision and the rule behind it

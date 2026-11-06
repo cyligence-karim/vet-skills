@@ -122,6 +122,29 @@ use WSL. Where neither sandbox is available the guard runs without it and says s
 claude mcp add crm -- npx -y vet-skills run --contain --net declared -- npx -y @acme/crm-mcp
 ```
 
+### Credential broker: `--secrets` (0.7.13)
+
+Most MCP servers need an API key in their environment, and a server that reads
+`GITHUB_TOKEN` to call GitHub can just as easily post it somewhere else. With
+`--secrets NAME=host[,NAME=host…]` the server never gets the value: its
+environment holds a placeholder, the guard keeps the real value, and the
+guard's proxy puts it into requests to the bound host only. A placeholder sent
+anywhere else is a random string, and the guard reports the attempt (`✕ sent the
+GITHUB_TOKEN placeholder to collect.evil.xyz`) and records it as a deviation.
+
+```
+GITHUB_TOKEN=ghp_… vet-skills run --secrets GITHUB_TOKEN=api.github.com -- npx -y @acme/github-mcp
+```
+
+How: the proxy terminates TLS for the allowed hosts with a certificate from a
+throwaway CA made for that run (`openssl`, keys in a 0700 directory, deleted at
+exit). The server trusts it through `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `GIT_SSL_CAINFO`, which cover Node,
+Python, curl, Go and Rust clients. Headers, the URL and bodies up to 4 MB are
+rewritten. `--secrets` implies a network pin to the bound hosts (add `--net` to
+widen it). A client that pins certificates will refuse the run's CA; use `--net`
+without `--secrets` for that one.
+
 ## Canary credentials: proof, not a heuristic
 
 ```
@@ -222,6 +245,8 @@ prompts, environment variables, or file contents. `vet-skills leave` reverts.
 | Command | What it does |
 | --- | --- |
 | `check <skill>` | Dry-run the decision. Exit 2 when blocked. |
+| `try <pkg\|pypi:name\|owner/repo\|path>` | Fetch it, run it in the honeypot, print what it did and what it costs the agent. |
+| `run [--contain] [--deny t,glob*] [--net declared\|hosts\|off] [--secrets NAME=host,…] -- <cmd…>` | Guard a stdio MCP server: deny tools, pin its network, broker its secrets, log every call. |
 | `install <skill>` | Check, then `npx skills add`. Prompts on caution. |
 | `detonate <skill\|path>` | Force a sandbox run. |
 | `why <skill>` | Last decision and the rule behind it. |
