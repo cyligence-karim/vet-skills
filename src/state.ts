@@ -20,6 +20,8 @@ export const API = (process.env.KILLERSKILLS_API ?? "https://killerskills.ai").r
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const CACHE_MAX = 10_000;
 
+export type CredentialSurface = { env: { name: string; kind: "credential" | "config"; files: string[] }[]; flags: string[]; files: string[]; hosts: { host: string; own: boolean; files: string[] }[]; scanned: number };
+
 export type CachedVerdict = { fetchedAt: number; etag?: string; data: ResolveResponse };
 
 export type ResolveResponse = {
@@ -31,6 +33,8 @@ export type ResolveResponse = {
   trace_summary: { egress_hosts: { host: string; declared: boolean; implied?: string }[]; files_read: string[]; files_written: string[]; memory_writes: unknown[]; tool_shadowing: { tool: string; server: string }[]; coverage?: { level: "full" | "startup_only" | "install_failed" | "install_only"; summary: string; tested: string[]; untested: string[]; needs: string[] } | null } | null;
   findings: { rule_id: string; severity: string; title: string; detail: string; file?: string | null; line?: number | null; evidence?: string | null }[];
   last_safe_version: { semver: string; score: number } | null;
+  /** What the code asks for and where it talks to (engine ≥ 1.8); null until the version has been run under it. */
+  credentials?: CredentialSurface | null;
   /** Open or confirmed incident: a hook elsewhere saw this package misbehave (open = honeypot re-run pending; confirmed = observed). */
   incident?: { status: "open" | "confirmed"; source: "field" | "sandbox"; opened_at: string; kinds: string[]; machines: number; note: string | null; page: string } | null;
 };

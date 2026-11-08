@@ -237,7 +237,7 @@ Findings  15 static matches; each shows the line that tripped it and what would 
       resolves informational for an MCP server: it speaks HTTP by design
 
 Recommendation  Install with a scoped credential, under the guard.
-  vet-skills run --secrets SUPABASE_ACCESS_TOKEN=api.supabase.com -- <the server's command>
+  vet-skills run --secrets SUPABASE_ACCESS_TOKEN=supabase.com -- <the server's command>
 ```
 
 Coverage levels: **full** (the server answered `tools/list`, or an agent task

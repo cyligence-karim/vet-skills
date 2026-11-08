@@ -21,6 +21,8 @@ export interface Evidence {
   findings: Finding[];
   /** Hosts the package's identity implies (publisher domain); used to suggest a network pin. */
   impliedHosts?: string[];
+  /** What the code asks for and where it talks to, when the verdict carries it. */
+  credentials?: { env: { name: string; kind: "credential" | "config"; files: string[] }[]; flags: string[]; files: string[]; hosts: { host: string; own: boolean; files: string[] }[] } | null;
   name: string;
 }
 
@@ -58,9 +60,10 @@ export function recommendation(e: Evidence): { verdict: string; detail: string[]
   const implied = e.egress.filter((h) => h.implied);
   const cred = e.filesRead.filter((p) => /\.ssh|\.aws|credentials|\.config\/gh|\.netrc|\.npmrc|\.docker/.test(p));
   const crit = e.findings.filter((f) => f.severity === "critical");
-  const needs = e.coverage?.needs.filter((n) => /^[A-Z]/.test(n)) ?? [];
-  const pinHosts = [...new Set([...implied.map((h) => h.implied!), ...(e.impliedHosts ?? [])])];
-  const secretsFlag = needs.length && pinHosts.length ? `--secrets ${needs.map((n) => `${n}=${pinHosts[0].startsWith("api.") ? pinHosts[0] : `api.${pinHosts[0]}`}`).join(",")}` : "";
+  const needs = [...new Set([...(e.credentials?.env.filter((x) => x.kind === "credential").map((x) => x.name) ?? []), ...(e.coverage?.needs.filter((n) => /^[A-Z]/.test(n)) ?? [])])];
+  const pinHosts = [...new Set([...implied.map((h) => h.implied!), ...(e.impliedHosts ?? []), ...(e.credentials?.hosts.filter((h) => h.own).map((h) => h.host) ?? [])])];
+  // The broker binds a registrable domain and its subdomains, so `supabase.com` covers api.supabase.com too.
+  const secretsFlag = needs.length && pinHosts.length ? `--secrets ${needs.map((n) => `${n}=${pinHosts[0]}`).join(",")}` : "";
   const runLine = `vet-skills run${secretsFlag ? ` ${secretsFlag}` : " --net declared"} -- <the server's command>`;
 
   if (e.label === "blocked") return { verdict: "Do not install.", detail: [e.findings.some((f) => /lure|installer/i.test(f.title)) ? "The bundle has the installer-lure shape: a README that sends the reader to a committed archive. That is malware delivery whatever the honeypot saw." : undeclared.length || cred.length ? `The honeypot observed it ${[cred.length ? `read ${cred.join(", ")}` : "", undeclared.length ? `contact ${undeclared.map((h) => h.host).join(", ")}, which it never declared` : ""].filter(Boolean).join(" and ")}.` : "A critical finding or an override blocked it; the evidence is on the verdict page."] };
@@ -70,7 +73,7 @@ export function recommendation(e: Evidence): { verdict: string; detail: string[]
   if (e.coverage?.level === "startup_only") {
     const d = [`The honeypot ran it to startup${needs.length ? ` and it asked for ${needs.join(", ")}` : ""}; nothing it does with a real credential was observed. Static analysis found ${crit.length ? `${crit.length} critical finding${crit.length === 1 ? "" : "s"}` : "nothing critical"}${implied.length ? `, and it reached only ${implied.map((h) => h.host).join(", ")}, its publisher's own host` : ""}.`];
     d.push(needs.length
-      ? `Reasonable to install with a scoped ${needs.join("/")}. Give the credential to the guard, not the server: ${c.ink2(runLine)} keeps the value out of the server's environment, injects it only into requests to ${pinHosts[0] ? pinHosts[0] : "the host you name"}, and refuses every other host. Never paste the credential into a chat, a ticket or a report.`
+      ? `Reasonable to install with a scoped ${needs.join("/")}. Give the credential to the guard, not the server: ${c.ink2(runLine)} keeps the value out of the server's environment, injects it only into requests to ${pinHosts[0] ? `${pinHosts[0]} and its subdomains` : "the host you name"}, and refuses every other host. Never paste the credential into a chat, a ticket or a report.`
       : `Reasonable to install under the guard: ${c.ink2(runLine)} pins the network to what the honeypot saw and logs every call.`);
     return { verdict: needs.length ? "Install with a scoped credential, under the guard." : "Install under the guard.", detail: d };
   }
@@ -92,6 +95,16 @@ export function renderEvidence(e: Evidence, opts: { maxFindings?: number } = {})
     if (cov.needs.length) lines.push(`  ${pad("needs", 11)} ${c.muted(`${cov.needs.join(", ")} — give it to the guard with --secrets, never to a chat or a report`)}`);
   } else {
     lines.push(`${c.ink2("Coverage")}  ${c.caution("Static only; nothing was run.")} ${c.muted("The label rests on the code, the instruction files and the publisher. The honeypot run is queued for the next crawl cycle (within two hours); `vet-skills try` runs it now.")}`);
+  }
+  // What the code asks for and where it talks to, before the findings: it is the question the person came with.
+  if (e.credentials) {
+    const cr = e.credentials.env.filter((x) => x.kind === "credential");
+    const own = e.credentials.hosts.filter((h) => h.own), third = e.credentials.hosts.filter((h) => !h.own);
+    lines.push("");
+    lines.push(`${c.ink2("Before you give it your token")}`);
+    lines.push(`  ${pad("asks for", 11)} ${cr.length ? cr.map((x) => c.ink2(x.name)).join(", ") + (e.credentials.flags.length ? c.muted(` (or ${e.credentials.flags.join(" / ")})`) : "") : c.muted("no credential variables in the code")}`);
+    lines.push(`  ${pad("talks to", 11)} ${own.length ? `${own.map((h) => h.host).join(", ")} ${c.muted("(its own)")}` : c.muted("no vendor host named")}${third.length ? ` ${c.caution(`· also ${third.map((h) => h.host).join(", ")} — not the publisher's`)}` : ""}`);
+    if (e.credentials.files.length) lines.push(`  ${pad("names files", 11)} ${c.caution(e.credentials.files.join(", "))}`);
   }
   // Findings with what triggered them.
   const fs = [...e.findings].filter((f) => f.severity !== "info").sort((a, b) => SEV.indexOf(a.severity) - SEV.indexOf(b.severity));

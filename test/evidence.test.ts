@@ -20,7 +20,7 @@ test("evidence: a startup-only Verified is qualified, lists tested/untested/need
   assert.match(out, /resolves pin the package to an exact version/);
   const r = recommendation(e);
   assert.equal(r.verdict, "Install with a scoped credential, under the guard.");
-  assert.match(strip(r.detail.join(" ")), /vet-skills run --secrets SUPABASE_ACCESS_TOKEN=api\.supabase\.com -- <the server's command>/);
+  assert.match(strip(r.detail.join(" ")), /vet-skills run --secrets SUPABASE_ACCESS_TOKEN=supabase\.com -- <the server's command>/);
   assert.match(strip(r.detail.join(" ")), /reached only api\.supabase\.com, its publisher's own host/);
   assert.doesNotMatch(out, /paste (your|the) token here|enter your token/i);
 });

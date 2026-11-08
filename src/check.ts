@@ -140,7 +140,7 @@ export function renderCheck(r: CheckResult): string {
   const tone = v.label;
   const cov = resolved.trace_summary?.coverage ?? null;
   // The label is qualified on the same line it is printed: a Verified that only covers startup says so before anything else.
-  const qualifier = !resolved.trace_summary ? "static only" : cov && cov.level !== "full" ? cov.summary.replace(/\.$/, "").split(";")[0].toLowerCase() : "";
+  const qualifier = !resolved.trace_summary ? "static only" : cov && cov.level !== "full" ? ({ startup_only: "startup only", install_failed: "not started", install_only: "install only" } as Record<string, string>)[cov.level] ?? cov.level : "";
   lines.push(`${c.pill(v.label.toUpperCase(), tone)} ${c.score(v.score, tone)}${c.faint("/100")}${qualifier ? ` ${c.caution(`· ${qualifier}`)}` : ""} ${c.muted(head)}`);
   const inc = resolved.incident;
   if (inc?.source === "field") lines.push(inc.status === "open"
@@ -169,7 +169,7 @@ export function renderCheck(r: CheckResult): string {
   }
 
   // Coverage, findings with their triggers, and a recommendation that follows from the evidence.
-  lines.push(...renderEvidence({ label: v.label, score: v.score, coverage: cov, egress: t?.egress_hosts ?? [], filesRead: t?.files_read ?? [], memoryWrites: t?.memory_writes.length ?? 0, findings: resolved.findings, name: resolved.skill.name }, { maxFindings: 6 }));
+  lines.push(...renderEvidence({ label: v.label, score: v.score, coverage: cov, egress: t?.egress_hosts ?? [], filesRead: t?.files_read ?? [], memoryWrites: t?.memory_writes.length ?? 0, findings: resolved.findings, credentials: resolved.credentials ?? null, name: resolved.skill.name }, { maxFindings: 6 }));
   lines.push("");
 
   // Policy

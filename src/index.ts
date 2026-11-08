@@ -184,7 +184,7 @@ async function main(): Promise<number> {
         // --json: stdout is the JSON document and nothing else, so it can be piped.
         if (values.json) { console.log(JSON.stringify(d, null, 2)); return d.verdict.label === "blocked" ? 2 : 0; }
         const cov = d.trace?.coverage ?? null;
-        const qualifier = !d.trace ? "static only" : cov && cov.level !== "full" ? cov.summary.replace(/\.$/, "").split(";")[0].toLowerCase() : "";
+        const qualifier = !d.trace ? "static only" : cov && cov.level !== "full" ? ({ startup_only: "startup only", install_failed: "not started", install_only: "install only" } as Record<string, string>)[cov.level] ?? cov.level : "";
         console.log(`\n${paint(d.verdict.label.toUpperCase())} ${c.bold(String(d.verdict.score))}${qualifier ? ` ${c.caution(`· ${qualifier}`)}` : ""} ${c.muted(`· ${d.skill.name}@${d.skill.semver} · engine ${d.verdict.engine_version} · ${d.verdict.duration_ms} ms`)}`);
         if (d.verdict.overrides.length) console.log(`${c.blocked("overrides")} ${d.verdict.overrides.join(", ")}`);
         // The registry verdict for the same package, when there is one: the two can differ, and the reasons are printed.
@@ -221,7 +221,7 @@ async function main(): Promise<number> {
           if (b.mcp) console.log(`  tool list per prompt  ${b.mcp.tools ? `≈${b.mcp.context_tokens.toLocaleString("en-US")} tokens ${c.muted(`(${b.mcp.tools} tools, ${Math.round(b.mcp.context_tokens / Math.max(1, b.mcp.tools))} per tool${b.mcp.undocumented_tools ? `, ${b.mcp.undocumented_tools} undocumented` : ""})`)}` : c.muted("no tools/list reply")}\n  handshake             ${b.mcp.handshake_ms === null ? c.muted("no reply") : `${b.mcp.handshake_ms} ms`}`);
         }
         console.log("");
-        for (const l of renderEvidence({ label: d.verdict.label, score: d.verdict.score, coverage: cov, egress: d.trace?.egress_hosts ?? [], filesRead: d.trace?.files_read ?? [], memoryWrites: d.trace?.memory_writes.length ?? 0, findings: d.findings, name: d.skill.name })) console.log(l);
+        for (const l of renderEvidence({ label: d.verdict.label, score: d.verdict.score, coverage: cov, egress: d.trace?.egress_hosts ?? [], filesRead: d.trace?.files_read ?? [], memoryWrites: d.trace?.memory_writes.length ?? 0, findings: d.findings, credentials: d.credentials ?? null, name: d.skill.name })) console.log(l);
         console.log(`\n${c.muted(`Full trace: ${API}${d.skill.page}${d.skill.report ? ` · JSON: ${API}${d.skill.report}` : ""}`)}`);
         return d.verdict.label === "blocked" ? 2 : 0;
       } finally { got.cleanup(); }
