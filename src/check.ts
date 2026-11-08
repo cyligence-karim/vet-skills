@@ -8,6 +8,7 @@ import { sendTelemetry, resolveSkill, verdictByHash, evaluateRemote } from "./ap
 import { platform } from "node:os";
 import { VERSION, appendLog, cacheGet, cachePut, readOrg, readPolicy, telemetryEnabled, telemetryNoticePending, type ResolveResponse } from "./state.js";
 import { c, fmtInstalls, pad } from "./render.js";
+import { renderEvidence } from "./evidence.js";
 import { readLock } from "./attest.js";
 
 export type CheckResult = {
@@ -30,6 +31,8 @@ export function toVerdictInput(r: ResolveResponse): VerdictInput | null {
     egress: r.trace_summary?.egress_hosts,
     declaredNetwork: r.version.declared_permissions.network,
     lastSafeVersion: r.last_safe_version,
+    // Static-only verdicts (no trace) and partial runs are what the policy's partial_coverage clause is about.
+    coverage: !r.trace_summary ? "static_only" : r.trace_summary.coverage?.level ?? (r.verdict.scenarios_run > 0 ? undefined : "static_only"),
   };
 }
 
@@ -135,7 +138,10 @@ export function renderCheck(r: CheckResult): string {
     return lines.join("\n") + "\n";
   }
   const tone = v.label;
-  lines.push(`${c.pill(v.label.toUpperCase(), tone)} ${c.score(v.score, tone)}${c.faint("/100")} ${c.muted(head)}`);
+  const cov = resolved.trace_summary?.coverage ?? null;
+  // The label is qualified on the same line it is printed: a Verified that only covers startup says so before anything else.
+  const qualifier = !resolved.trace_summary ? "static only" : cov && cov.level !== "full" ? cov.summary.replace(/\.$/, "").split(";")[0].toLowerCase() : "";
+  lines.push(`${c.pill(v.label.toUpperCase(), tone)} ${c.score(v.score, tone)}${c.faint("/100")}${qualifier ? ` ${c.caution(`· ${qualifier}`)}` : ""} ${c.muted(head)}`);
   const inc = resolved.incident;
   if (inc?.source === "field") lines.push(inc.status === "open"
     ? `${c.caution("!")} ${c.ink2("Open incident:")} ${c.muted(`a hook on ${inc.machines} machine${inc.machines === 1 ? "" : "s"} reported ${inc.kinds.map((k) => k.replace(/_/g, " ")).join(", ")}; honeypot re-run pending (killerskills.ai${inc.page})`)}`
@@ -162,6 +168,10 @@ export function renderCheck(r: CheckResult): string {
     lines.push("");
   }
 
+  // Coverage, findings with their triggers, and a recommendation that follows from the evidence.
+  lines.push(...renderEvidence({ label: v.label, score: v.score, coverage: cov, egress: t?.egress_hosts ?? [], filesRead: t?.files_read ?? [], memoryWrites: t?.memory_writes.length ?? 0, findings: resolved.findings, name: resolved.skill.name }, { maxFindings: 6 }));
+  lines.push("");
+
   // Policy
   lines.push(`${c.ink2("Policy")} ${r.policyLabel}:`);
   for (const rule of decision.rules.filter((x) => x.outcome !== "pass" || x.rule === "min_score")) {
@@ -180,7 +190,7 @@ export function renderOutcome(r: CheckResult, chosen?: string): string {
     case "sandbox": return `${c.verified("✓")} Installed ${name} ${c.muted(`sandboxed · ${restrictionText(d.restrictions)}`)}`;
     case "approval_required": return `${c.caution("!")} ${name} needs approval ${c.muted(`· ${d.reason}`)}${r.remote?.approvalRequestId ? c.muted(` · request ${r.remote.approvalRequestId}`) : ""}\n${c.muted("You can keep working; the install completes when it's approved.")}`;
     case "block": return `${c.blocked("✕")} Blocked ${name} ${c.muted(`· ${d.reason}`)}${d.lastSafeVersion ? `\n${c.muted("Pin instead:")} ${c.ink2(`${name.split("@")[0]}@${d.lastSafeVersion.semver}`)} ${c.muted(`(score ${d.lastSafeVersion.score})`)}` : ""}${r.resolved ? `\n${c.muted("Full report:")} killerskills.ai${r.resolved.skill.page}/${r.resolved.version.semver}` : ""}`;
-    case "defer": return `${c.caution("◐")} ${name} is unscored; policy says detonate first ${c.muted("(usually 30–60s)")}\n${c.muted("Run")} vet-skills detonate ${name} ${c.muted("to watch the trace, or re-run the install in a minute.")}`;
+    case "defer": return `${c.caution("◐")} ${name} is unscored; policy says run it in the honeypot first ${c.muted("(usually 30–60s)")}\n${c.muted("Run")} vet-skills try ${name} ${c.muted("to watch the trace, or re-run the install in a minute.")}`;
     case "observe": return `${c.muted("◦")} Observe mode: would have been ${c.ink2(d.wouldBe)} ${c.muted(`· ${d.reason}`)} — proceeding.`;
   }
   void chosen;

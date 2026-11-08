@@ -47,6 +47,7 @@ import { serveMcp } from "./mcp.js";
 import { VERSION, API, HOME, readLog, readOrg, readPolicy, readToken, stateSummary, writeOrg, writePolicy, writeToken, appendLog, setTelemetry, telemetryEnabled } from "./state.js";
 import { hookEval, installClaudeCodeHook, installCodexHook, installCursorHook } from "./hook.js";
 import { cursorHook } from "./cursor.js";
+import { renderEvidence } from "./evidence.js";
 import { geminiHook, installGeminiHook, installWindsurfHook, windsurfHook } from "./agents.js";
 import type { AgentKind } from "./policy/index.js";
 import { applyRemovals, sync } from "./sync.js";
@@ -180,9 +181,22 @@ async function main(): Promise<number> {
         if (!res.ok) { console.log(`${c.caution("!")} Run failed (${res.status ?? "offline"}): ${res.error}`); return 1; }
         const d = res.data;
         const paint = d.verdict.label === "verified" ? c.verified : d.verdict.label === "caution" ? c.caution : c.blocked;
-        console.log(`\n${paint(d.verdict.label.toUpperCase())} ${c.bold(String(d.verdict.score))} ${c.muted(`· ${d.skill.name}@${d.skill.semver} · engine ${d.verdict.engine_version} · ${d.verdict.duration_ms} ms`)}`);
+        const cov = d.trace?.coverage ?? null;
+        const qualifier = !d.trace ? "static only" : cov && cov.level !== "full" ? cov.summary.replace(/\.$/, "").split(";")[0].toLowerCase() : "";
+        console.log(`\n${paint(d.verdict.label.toUpperCase())} ${c.bold(String(d.verdict.score))}${qualifier ? ` ${c.caution(`· ${qualifier}`)}` : ""} ${c.muted(`· ${d.skill.name}@${d.skill.semver} · engine ${d.verdict.engine_version} · ${d.verdict.duration_ms} ms`)}`);
         if (d.verdict.overrides.length) console.log(`${c.blocked("overrides")} ${d.verdict.overrides.join(", ")}`);
         if (values.json) { console.log(JSON.stringify(d, null, 2)); return d.verdict.label === "blocked" ? 2 : 0; }
+        // The registry verdict for the same package, when there is one: the two can differ, and the reasons are printed.
+        if (got.registry === "npm" || got.registry === "pypi") {
+          const q = got.label.replace(/^@/, "").replace(/^([^/]+)\//, "$1/");
+          const reg = await resolveSkill(q, got.registry).catch(() => null);
+          const rv = reg && reg.ok ? reg.data : null;
+          if (rv?.verdict && rv.version.semver === d.skill.semver) {
+            const same = rv.verdict.label === d.verdict.label && Math.abs(rv.verdict.score - d.verdict.score) <= 2;
+            const tint = rv.verdict.label === "verified" ? c.verified : rv.verdict.label === "caution" ? c.caution : c.blocked;
+            console.log(`${c.ink2("Registry verdict")} ${same ? c.muted(`${rv.verdict.label.toUpperCase()} ${rv.verdict.score} · the same (killerskills.ai${rv.skill.page})`) : `${tint(rv.verdict.label.toUpperCase())} ${c.bold(String(rv.verdict.score))} ${c.muted(`· killerskills.ai${rv.skill.page} · differs from this run: the registry verdict scores the publisher (${rv.publisher.handle}: ${rv.publisher.verified ? "verified" : "unverified"}) where this run uses the neutral 50, and its honeypot run may predate this engine (${rv.verdict.scenarios_run} scenarios${rv.trace_summary?.coverage ? `, ${rv.trace_summary.coverage.level.replace(/_/g, " ")}` : ""}); the crawler re-runs the package under the current engine, most installed first`)}`}`);
+          } else if (rv?.verdict) console.log(`${c.ink2("Registry verdict")} ${c.muted(`${rv.verdict.label.toUpperCase()} ${rv.verdict.score} for ${rv.version.semver} (this run: ${d.skill.semver}) · killerskills.ai${rv.skill.page}`)}`);
+        }
         const ev = (d.trace?.events ?? []).filter((e) => e.severity !== "none" || e.category === "network" || e.category === "filesystem" || e.category === "claimed");
         if (ev.length) {
           console.log(`\n${c.ink2("What it did")} ${c.muted("(t+ms · category · action)")}`);
@@ -205,8 +219,8 @@ async function main(): Promise<number> {
           console.log(`  instructions loaded   ≈${b.instruction_tokens.toLocaleString("en-US")} tokens ${c.muted(`(${b.instruction_files} file${b.instruction_files === 1 ? "" : "s"}, ${b.bundle_files} in bundle)`)}`);
           if (b.mcp) console.log(`  tool list per prompt  ${b.mcp.tools ? `≈${b.mcp.context_tokens.toLocaleString("en-US")} tokens ${c.muted(`(${b.mcp.tools} tools, ${Math.round(b.mcp.context_tokens / Math.max(1, b.mcp.tools))} per tool${b.mcp.undocumented_tools ? `, ${b.mcp.undocumented_tools} undocumented` : ""})`)}` : c.muted("no tools/list reply")}\n  handshake             ${b.mcp.handshake_ms === null ? c.muted("no reply") : `${b.mcp.handshake_ms} ms`}`);
         }
-        const crit = d.findings.filter((f) => f.severity === "critical" || f.severity === "high");
-        if (crit.length) { console.log(`\n${c.ink2("Findings")}`); for (const f of crit.slice(0, 8)) console.log(`  ${c.muted(f.rule_id)} ${f.severity.padEnd(8)} ${f.title}`); if (crit.length > 8) console.log(c.muted(`  … ${crit.length - 8} more`)); }
+        console.log("");
+        for (const l of renderEvidence({ label: d.verdict.label, score: d.verdict.score, coverage: cov, egress: d.trace?.egress_hosts ?? [], filesRead: d.trace?.files_read ?? [], memoryWrites: d.trace?.memory_writes.length ?? 0, findings: d.findings, name: d.skill.name })) console.log(l);
         console.log(`\n${c.muted(`Full trace: ${API}${d.skill.page}`)}`);
         return d.verdict.label === "blocked" ? 2 : 0;
       } finally { got.cleanup(); }
@@ -433,7 +447,17 @@ async function main(): Promise<number> {
       const comps = discoverLocal({ project: values.project ? process.cwd() : undefined });
       if (values.json) { console.log(JSON.stringify(comps, null, 2)); }
       else if (!values.quiet) {
-        if (!comps.length) console.log(c.muted("No agent configuration found in the usual places (~/.claude.json, ~/.cursor/mcp.json, Claude Desktop, Windsurf, Gemini CLI, Codex, ~/.claude/skills)."));
+        if (!comps.length) {
+          // Nothing configured is a fine state. The next step is the package the person already means to install, not a demo package.
+          console.log(`${c.verified("✓")} Nothing is configured yet: no MCP servers, skills, plugins or hooks in the usual places ${c.muted("(~/.claude.json, ~/.cursor/mcp.json, Claude Desktop, Windsurf, Gemini CLI, Codex, ~/.claude/skills)")}.`);
+          console.log(`
+${c.ink2("Before you install one")}`);
+          console.log(`  ${c.ink2("vet-skills check <name>")}        ${c.muted("the registry verdict: what the honeypot saw, what it did not test, and a recommendation")}`);
+          console.log(`  ${c.ink2("vet-skills try <name>")}          ${c.muted("run that exact version in the honeypot now (nothing runs on this machine)")}`);
+          console.log(`  ${c.ink2("vet-skills hook install")}        ${c.muted("check every install your agent makes from now on, automatically")}`);
+          console.log(c.muted("\n<name> is the package as you would install it: @scope/pkg, pkg@1.2.3, pypi:name, or owner/repo."));
+          return 0;
+        }
         const runnable = comps.filter((x) => x.kind === "mcp_server" || x.kind === "skill");
         const verdicts = new Map<string, string>();
         await Promise.all(runnable.slice(0, 40).map(async (x) => {
@@ -473,7 +497,7 @@ async function main(): Promise<number> {
         const r = await discoverReport(comps);
         if (r.ok) { if (!values.json) console.log(`\n${c.verified("✓")} ${r.data.components} component${r.data.components === 1 ? "" : "s"} reported to ${readOrg()!.slug} (names only) · ${API}${r.data.dashboard}`); }
         else { console.error(c.caution(`report failed: ${r.error}`)); return 1; }
-      } else if (!values.json && !values.quiet) console.log(c.muted("\nNot enrolled: only the names above were looked up for their verdicts; no inventory was reported. `vet-skills join <org> --token <t>` reports it to your team's Discovery page."));
+      } else if (!values.json && !values.quiet) console.log(c.muted("\nVerdicts were looked up by name; nothing about this machine was sent anywhere. A team that wants this inventory on its dashboard enrolls the machine with `vet-skills join <org> --token <t>`."));
       return 0;
     }
 

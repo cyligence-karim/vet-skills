@@ -97,3 +97,28 @@ test("flags are derived from a trace summary", () => {
   assert.equal(f.fs_outside_project, true);
   assert.equal(f.unpinned_deps, true);
 });
+
+test("partial_coverage clause: a startup-only Verified stands by default, is handled as Caution / approval / block when the policy says so; full coverage is untouched", () => {
+  const partial: VerdictInput = { ...verified, coverage: "startup_only" };
+  const asLabelled = evaluate({ policy: DEFAULT_POLICY, verdict: partial, publisher: docforge });
+  assert.equal(asLabelled.decision, "allow");
+  assert.ok(asLabelled.rules.some((r) => r.rule === "partial_coverage" && r.outcome === "pass" && /label stands/.test(r.detail)));
+  const asCaution = evaluate({ policy: { ...DEFAULT_POLICY, partialCoverage: "caution" }, verdict: partial, publisher: docforge });
+  assert.equal(asCaution.decision, "sandbox", JSON.stringify(asCaution));
+  assert.ok(asCaution.rules.some((r) => r.rule === "partial_coverage" && r.outcome === "warn"));
+  assert.equal(evaluate({ policy: { ...DEFAULT_POLICY, partialCoverage: "approval" }, verdict: partial, publisher: docforge }).decision, "approval_required");
+  assert.equal(evaluate({ policy: { ...DEFAULT_POLICY, partialCoverage: "block" }, verdict: partial, publisher: docforge }).decision, "block");
+  assert.equal(evaluate({ policy: { ...DEFAULT_POLICY, partialCoverage: "block" }, verdict: { ...verified, coverage: "full" }, publisher: docforge }).decision, "allow");
+  // Allow-listed publishers bypass it like the other thresholds; the YAML round-trips.
+  assert.equal(evaluate({ policy: { ...DEFAULT_POLICY, partialCoverage: "block", publishers: { ...DEFAULT_POLICY.publishers, allow: ["docforge"] } }, verdict: partial, publisher: docforge }).decision, "allow");
+  const y = serializePolicyYaml({ ...DEFAULT_POLICY, partialCoverage: "approval" });
+  assert.match(y, /partial_coverage: approval/);
+  assert.equal(parsePolicyYaml(y).partialCoverage, "approval");
+  assert.equal(parsePolicyYaml("name: x\nversion: 1\n").partialCoverage, "as_labelled");
+});
+
+test("policy YAML accepts the documented caution_action / unknown_action spellings as well as the serialized ones", () => {
+  const p = parsePolicyYaml("name: mine\nmin_score: 60\ncaution_action: approval\nunknown_action: block\n");
+  assert.equal(p.cautionAction, "approval"); assert.equal(p.unknownAction, "block");
+  assert.equal(parsePolicyYaml("caution: block\n").cautionAction, "block");
+});

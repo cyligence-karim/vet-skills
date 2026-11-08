@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_POLICY, SOLO_POLICY, parsePolicyYaml, serializePolicyYaml, type Policy } from "./policy/index.js";
 
-export const VERSION = "0.7.13";
+export const VERSION = "0.7.14";
 export const HOME = process.env.VET_SKILLS_HOME ?? join(homedir(), ".vet-skills");
 export const API = (process.env.KILLERSKILLS_API ?? "https://killerskills.ai").replace(/\/$/, "");
 
@@ -28,8 +28,8 @@ export type ResolveResponse = {
   publisher: { handle: string; verified: boolean; age_days: number };
   version: { semver: string; artifact_hash: string; declared_permissions: { network: string[]; filesystem: string[]; memory: boolean } };
   verdict: { id: string; score: number; label: "verified" | "caution" | "blocked"; duration_ms: number; scenarios_run: number } | null;
-  trace_summary: { egress_hosts: { host: string; declared: boolean }[]; files_read: string[]; files_written: string[]; memory_writes: unknown[]; tool_shadowing: { tool: string; server: string }[] } | null;
-  findings: { rule_id: string; severity: string; title: string; detail: string }[];
+  trace_summary: { egress_hosts: { host: string; declared: boolean; implied?: string }[]; files_read: string[]; files_written: string[]; memory_writes: unknown[]; tool_shadowing: { tool: string; server: string }[]; coverage?: { level: "full" | "startup_only" | "install_failed" | "install_only"; summary: string; tested: string[]; untested: string[]; needs: string[] } | null } | null;
+  findings: { rule_id: string; severity: string; title: string; detail: string; file?: string | null; line?: number | null; evidence?: string | null }[];
   last_safe_version: { semver: string; score: number } | null;
   /** Open or confirmed incident: a hook elsewhere saw this package misbehave (open = honeypot re-run pending; confirmed = observed). */
   incident?: { status: "open" | "confirmed"; source: "field" | "sandbox"; opened_at: string; kinds: string[]; machines: number; note: string | null; page: string } | null;

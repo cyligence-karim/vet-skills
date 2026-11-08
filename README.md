@@ -219,9 +219,39 @@ Policy acme/default-strict:
 Pin instead: deploy-helper@2.2.4 (score 88)
 ```
 
+### Coverage, findings, recommendation (0.7.14)
+
+Every verdict now says what the honeypot actually exercised before you read the
+label. The label line carries a qualifier when the run was partial (`VERIFIED 85
+· startup only`), and the report ends with three blocks:
+
+```
+Coverage  Started with a decoy SUPABASE_ACCESS_TOKEN and answered initialize; the tool list did not come back. Authenticated tool behavior not tested.
+  tested      server startup with a tagged decoy in SUPABASE_ACCESS_TOKEN · MCP initialize · every file read, file written and host contacted by what ran
+  not tested  the tool list · what the tools do when called with a real credential
+  needs       SUPABASE_ACCESS_TOKEN — give it to the guard with --secrets, never to a chat or a report
+
+Findings  15 static matches; each shows the line that tripped it and what would resolve it
+  AST04 medium   MCP server using network transport (SSE/HTTP)
+      at       dist/chunk-7LBYXIBL.js:1  …createMcpServer as cs}from"@supabase/mcp-utils"…
+      resolves informational for an MCP server: it speaks HTTP by design
+
+Recommendation  Install with a scoped credential, under the guard.
+  vet-skills run --secrets SUPABASE_ACCESS_TOKEN=api.supabase.com -- <the server's command>
+```
+
+Coverage levels: **full** (the server answered `tools/list`, or an agent task
+ran), **startup only** (the server exited before answering, usually asking for a
+credential; it is launched once more with a tagged decoy in that variable, and
+the trace shows where the decoy went), **not started** (its dependencies failed
+to install), **install only**, and **static only** (nothing has run yet; the
+crawler's run replaces the verdict within a cycle, `vet-skills try` runs it now).
+The recommendation follows from the evidence, not the label; it never asks for a
+credential.
+
 Decisions: **allow**, **sandbox** (install with restrictions), **approval required**
 (the install waits for a reviewer), **block** (with the last safe version named),
-**defer** (unscored: detonate first), **observe** (org enforcement off; logged only).
+**defer** (unscored: run it in the honeypot first), **observe** (org enforcement off; logged only).
 
 ## Fail-open
 

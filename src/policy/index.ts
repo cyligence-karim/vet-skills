@@ -38,7 +38,16 @@ export interface Policy {
    * hold → held and the agent told to ask, as if there were no context. Actions with no supporting context are always held.
    */
   context: Record<ContextKind, ContextAction>;
+  /**
+   * Coverage clause: what to do with a verdict whose honeypot run did not reach the server's tools (startup only, not
+   * started, install only, or static only). `as_labelled` keeps the published label; `caution` treats a Verified as
+   * Caution so the caution action applies; `approval` and `block` are what they say. Full-coverage verdicts are untouched.
+   */
+  partialCoverage: CoverageAction;
 }
+export type CoverageLevel = "full" | "startup_only" | "install_failed" | "install_only" | "static_only";
+/** What a partial-coverage verdict does: the label stands as published (default), or it is treated as Caution (so the caution action applies), or it needs approval, or it is blocked. */
+export type CoverageAction = "as_labelled" | "caution" | "approval" | "block";
 export type ContextKind = "credential_read" | "egress_unexpected" | "memory_write" | "outside_project_write";
 export type ContextAction = "allow_when_user_touched" | "hold";
 export const CONTEXT_KINDS: readonly ContextKind[] = ["credential_read", "egress_unexpected", "memory_write", "outside_project_write"];
@@ -51,6 +60,8 @@ export interface VerdictInput {
   flags: Partial<Record<BehaviorFlag, boolean>>;
   /** Hosts the trace observed, with whether the manifest declared them. */
   egress?: { host: string; declared: boolean }[];
+  /** How far the honeypot run got (engine ≥ 1.8); "static_only" when nothing ran. Unknown when absent. */
+  coverage?: CoverageLevel;
   declaredNetwork?: string[];
   lastSafeVersion?: { semver: string; score: number } | null;
 }
@@ -108,6 +119,7 @@ export const DEFAULT_POLICY: Policy = {
   cautionAction: "sandbox",
   unknownAction: "detonate",
   offlineAction: "allow",
+  partialCoverage: "as_labelled",
   behavior: {
     credential_reads: "block",
     undeclared_egress: "block",
@@ -161,9 +173,11 @@ export function parsePolicyYaml(text: string): Policy {
     name: typeof y.name === "string" ? y.name : DEFAULT_POLICY.name,
     version: num(y.version, 1),
     minScore: Math.min(100, Math.max(0, num(y.min_score, DEFAULT_POLICY.minScore))),
-    cautionAction: str(y.caution, ["sandbox", "approval", "allow", "block"] as const, DEFAULT_POLICY.cautionAction),
-    unknownAction: str(y.unknown, ["detonate", "block", "approval", "allow"] as const, DEFAULT_POLICY.unknownAction),
-    offlineAction: str(y.offline, ["allow", "block", "approval"] as const, DEFAULT_POLICY.offlineAction),
+    // Both spellings are accepted: the docs wrote `caution_action` / `unknown_action` while the serializer wrote `caution` / `unknown`.
+    cautionAction: str(y.caution ?? y.caution_action, ["sandbox", "approval", "allow", "block"] as const, DEFAULT_POLICY.cautionAction),
+    unknownAction: str(y.unknown ?? y.unknown_action, ["detonate", "block", "approval", "allow"] as const, DEFAULT_POLICY.unknownAction),
+    offlineAction: str(y.offline ?? y.offline_action, ["allow", "block", "approval"] as const, DEFAULT_POLICY.offlineAction),
+    partialCoverage: str(y.partial_coverage, ["as_labelled", "caution", "approval", "block"] as const, DEFAULT_POLICY.partialCoverage),
     behavior,
     publishers: {
       allow: list(p.allow),
@@ -187,6 +201,7 @@ export function serializePolicyYaml(p: Policy): string {
     caution: p.cautionAction,
     unknown: p.unknownAction,
     offline: p.offlineAction,
+    partial_coverage: p.partialCoverage,
     behavior: p.behavior,
     publishers: { allow: p.publishers.allow, block: p.publishers.block, block_younger_than_days: p.publishers.blockYoungerThanDays },
     agents: p.agents,
@@ -210,7 +225,8 @@ function restrictionsFor(v: VerdictInput, flagged: BehaviorFlag[]): Restrictions
 }
 
 export function evaluate(input: EvaluateInput): Decision {
-  const { policy, verdict, publisher } = input;
+  const { policy, publisher } = input;
+  const verdictIn = input.verdict;
   const enforcement = input.enforcement ?? "enforce";
   const rules: RuleResult[] = [];
   const pol = { name: policy.name, version: policy.version };
@@ -220,7 +236,7 @@ export function evaluate(input: EvaluateInput): Decision {
     reason,
     rules,
     policy: pol,
-    lastSafeVersion: verdict?.lastSafeVersion ?? null,
+    lastSafeVersion: verdictIn?.lastSafeVersion ?? null,
     ...extra,
   });
 
@@ -245,7 +261,7 @@ export function evaluate(input: EvaluateInput): Decision {
   }
 
   // Offline with nothing cached: fail-open by default.
-  if (input.offline && !verdict) {
+  if (input.offline && !verdictIn) {
     rules.push({ rule: "offline", outcome: policy.offlineAction === "block" ? "block" : "warn", detail: `verdict API unreachable; policy offline action = ${policy.offlineAction}` });
     if (policy.offlineAction === "block") return done("block", "verdict API unreachable and policy blocks unknown installs when offline", { kind: "unknown" });
     if (policy.offlineAction === "approval") return done("approval_required", "verdict API unreachable; approval required for unscored installs", { kind: "unknown" });
@@ -253,7 +269,7 @@ export function evaluate(input: EvaluateInput): Decision {
   }
 
   // Unscored.
-  if (!verdict) {
+  if (!verdictIn) {
     rules.push({ rule: "unscored", outcome: policy.unknownAction === "block" ? "block" : "info", detail: `no verdict; policy unknown action = ${policy.unknownAction}` });
     switch (policy.unknownAction) {
       case "detonate": return done("defer", "no verdict yet; detonating before deciding", { kind: "unknown" });
@@ -262,6 +278,7 @@ export function evaluate(input: EvaluateInput): Decision {
       case "allow": return done("allow", "no verdict; policy allows unscored skills with a warning");
     }
   }
+  let verdict: VerdictInput = verdictIn;
 
   // Behavior rules, independent of score.
   const flagged = FLAGS.filter((f) => verdict.flags[f]);
@@ -290,6 +307,16 @@ export function evaluate(input: EvaluateInput): Decision {
   rules.push({ rule: "min_score", outcome: "pass", detail: allowListed ? "bypassed (allow-listed publisher)" : `${verdict.score} ≥ ${policy.minScore}` });
 
   const restrictions = restrictionsFor(verdict, [...warnings, ...(approvalFlag ? [approvalFlag] : [])]);
+
+  // Coverage clause: a label the run did not earn in full is handled as the policy says. Default keeps the label.
+  const partial = verdict.coverage !== undefined && verdict.coverage !== "full";
+  const coverageText = verdict.coverage ? verdict.coverage.replace(/_/g, " ") : "unknown";
+  if (!allowListed && partial && policy.partialCoverage !== "as_labelled") {
+    if (policy.partialCoverage === "block") { rules.push({ rule: "partial_coverage", outcome: "block", detail: `coverage ${coverageText}; policy blocks partial coverage` }); return done("block", `the honeypot run covered ${coverageText}; policy requires full coverage`, { kind: "blocked_exception" }); }
+    if (policy.partialCoverage === "approval") { rules.push({ rule: "partial_coverage", outcome: "approval", detail: `coverage ${coverageText}` }); return done("approval_required", `the honeypot run covered ${coverageText}; policy requires approval for partial coverage`, { kind: "caution", restrictions }); }
+    rules.push({ rule: "partial_coverage", outcome: "warn", detail: `coverage ${coverageText}; treated as caution` });
+    verdict = { ...verdict, label: verdict.label === "blocked" ? "blocked" : "caution" };
+  } else if (partial) rules.push({ rule: "partial_coverage", outcome: "pass", detail: `coverage ${coverageText}; label stands (partial_coverage: as_labelled)` });
 
   if (approvalFlag) {
     return done("approval_required", `${FLAG_LABEL[approvalFlag]} requires approval`, { kind: "caution", restrictions });
