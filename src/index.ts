@@ -222,7 +222,7 @@ async function main(): Promise<number> {
         }
         console.log("");
         for (const l of renderEvidence({ label: d.verdict.label, score: d.verdict.score, coverage: cov, egress: d.trace?.egress_hosts ?? [], filesRead: d.trace?.files_read ?? [], memoryWrites: d.trace?.memory_writes.length ?? 0, findings: d.findings, name: d.skill.name })) console.log(l);
-        console.log(`\n${c.muted(`Full trace: ${API}${d.skill.page}${d.skill.attestation ? ` · JSON: ${API}${d.skill.attestation}` : ""}`)}`);
+        console.log(`\n${c.muted(`Full trace: ${API}${d.skill.page}${d.skill.report ? ` · JSON: ${API}${d.skill.report}` : ""}`)}`);
         return d.verdict.label === "blocked" ? 2 : 0;
       } finally { got.cleanup(); }
     }
