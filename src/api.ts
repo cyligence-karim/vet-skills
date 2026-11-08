@@ -82,7 +82,7 @@ export interface DetonateResponse {
   findings: { rule_id: string; severity: string; title: string; detail: string; file?: string | null; line?: number | null; evidence?: string | null }[];
   trace: { events?: { t_ms: number; scenario: string; category: string; action: string; target: string; detail: string; severity: string; decoy_hit?: string | null }[]; egress_hosts: { host: string; declared: boolean; implied?: string }[]; files_read: string[]; memory_writes: { file: string }[]; tool_shadowing: { tool: string }[]; coverage?: { level: "full" | "startup_only" | "install_failed" | "install_only"; summary: string; tested: string[]; untested: string[]; needs: string[] } | null } | null;
   benchmark?: { instruction_tokens: number; instruction_files: number; bundle_files: number; bundle_bytes: number; mcp: { handshake_ms: number | null; tools: number; context_tokens: number; description_chars_avg: number; undocumented_tools: number } | null } | null;
-  skill: { name: string; semver: string; artifact_hash: string; registry: string; publisher: string; page: string };
+  skill: { name: string; semver: string; artifact_hash: string; registry: string; publisher: string; page: string; attestation?: string };
 }
 export interface PublishResponse {
   verdict: { id: string; score: number; label: "verified" | "caution" | "blocked"; engine_version: string; scenarios_run: number; duration_ms: number };

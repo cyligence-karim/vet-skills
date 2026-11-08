@@ -181,11 +181,12 @@ async function main(): Promise<number> {
         if (!res.ok) { console.log(`${c.caution("!")} Run failed (${res.status ?? "offline"}): ${res.error}`); return 1; }
         const d = res.data;
         const paint = d.verdict.label === "verified" ? c.verified : d.verdict.label === "caution" ? c.caution : c.blocked;
+        // --json: stdout is the JSON document and nothing else, so it can be piped.
+        if (values.json) { console.log(JSON.stringify(d, null, 2)); return d.verdict.label === "blocked" ? 2 : 0; }
         const cov = d.trace?.coverage ?? null;
         const qualifier = !d.trace ? "static only" : cov && cov.level !== "full" ? cov.summary.replace(/\.$/, "").split(";")[0].toLowerCase() : "";
         console.log(`\n${paint(d.verdict.label.toUpperCase())} ${c.bold(String(d.verdict.score))}${qualifier ? ` ${c.caution(`· ${qualifier}`)}` : ""} ${c.muted(`· ${d.skill.name}@${d.skill.semver} · engine ${d.verdict.engine_version} · ${d.verdict.duration_ms} ms`)}`);
         if (d.verdict.overrides.length) console.log(`${c.blocked("overrides")} ${d.verdict.overrides.join(", ")}`);
-        if (values.json) { console.log(JSON.stringify(d, null, 2)); return d.verdict.label === "blocked" ? 2 : 0; }
         // The registry verdict for the same package, when there is one: the two can differ, and the reasons are printed.
         if (got.registry === "npm" || got.registry === "pypi") {
           const q = got.label.replace(/^@/, "").replace(/^([^/]+)\//, "$1/");
@@ -221,7 +222,7 @@ async function main(): Promise<number> {
         }
         console.log("");
         for (const l of renderEvidence({ label: d.verdict.label, score: d.verdict.score, coverage: cov, egress: d.trace?.egress_hosts ?? [], filesRead: d.trace?.files_read ?? [], memoryWrites: d.trace?.memory_writes.length ?? 0, findings: d.findings, name: d.skill.name })) console.log(l);
-        console.log(`\n${c.muted(`Full trace: ${API}${d.skill.page}`)}`);
+        console.log(`\n${c.muted(`Full trace: ${API}${d.skill.page}${d.skill.attestation ? ` · JSON: ${API}${d.skill.attestation}` : ""}`)}`);
         return d.verdict.label === "blocked" ? 2 : 0;
       } finally { got.cleanup(); }
     }
@@ -236,6 +237,7 @@ async function main(): Promise<number> {
       const res = await detonate(new Uint8Array(tar.stdout), { publisher: values.publisher });
       if (!res.ok) { console.log(`${c.caution("!")} Detonation failed (${res.status ?? "offline"}): ${res.error}`); return 1; }
       const d = res.data;
+      if (values.json) { console.log(JSON.stringify(d, null, 2)); return d.verdict.label === "blocked" ? 2 : 0; }
       const paint = d.verdict.label === "verified" ? c.verified : d.verdict.label === "caution" ? c.caution : c.blocked;
       console.log(`${paint(d.verdict.label.toUpperCase())} ${c.bold(String(d.verdict.score))} ${c.muted(`· ${d.skill.name}@${d.skill.semver} · engine ${d.verdict.engine_version} · ${d.verdict.duration_ms} ms`)}`);
       console.log(c.muted(`behavior ${d.verdict.components.behavior} · static ${d.verdict.components.static} · prompt ${d.verdict.components.prompt} · publisher ${d.verdict.components.publisher}`));

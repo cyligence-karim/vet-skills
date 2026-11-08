@@ -13,7 +13,12 @@ import { basename, dirname, join, resolve } from "node:path";
 
 export type Fetched = { dir: string; label: string; cleanup: () => void; registry: "npm" | "pypi" | "github" | "local" };
 
-const sh = (cmd: string, args: string[], cwd?: string) => spawnSync(cmd, args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+/** Run a tool; a missing binary comes back as an ordinary failure with a readable message, never undefined output. */
+const sh = (cmd: string, args: string[], cwd?: string) => {
+  const r = spawnSync(cmd, args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (r.error) return { ...r, status: r.status ?? 127, stdout: r.stdout ?? "", stderr: (r.error as NodeJS.ErrnoException).code === "ENOENT" ? `${cmd} is not installed or not on PATH (vet-skills try needs it to fetch the package; a local directory needs no tools)` : r.error.message };
+  return { ...r, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+};
 
 function onlyDir(root: string): string {
   const entries = readdirSync(root).filter((n) => !n.startsWith("."));
