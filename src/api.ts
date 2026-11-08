@@ -56,7 +56,7 @@ export function evaluateRemote(body: Record<string, unknown>) {
   return call<EvaluateResponse>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/evaluate`, { method: "POST", body: JSON.stringify(body), headers: orgHeaders() });
 }
 
-export type ReportResponse = { policy_version: number; policy_yaml?: string; enforcement: "observe" | "enforce"; pending_removals: { removal_id: string; install_id: string; skill: string }[]; pending_approvals: { request_id: string; status: string; skill: string }[] };
+export type ReportResponse = { policy_version: number; policy_yaml?: string; enforcement: "observe" | "enforce"; require_guard?: boolean; pending_removals: { removal_id: string; install_id: string; skill: string }[]; pending_approvals: { request_id: string; status: string; skill: string }[] };
 
 export function report(body: Record<string, unknown>) {
   const org = readOrg();

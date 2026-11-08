@@ -57,6 +57,7 @@ import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from 
 import { observe, pruneSessions, readDeviations, readAllows, recordPrompt, revokeAllow } from "./runtime.js";
 import { plantCanaries, readCanaries, removeCanaries } from "./canary.js";
 import { execGuarded, guardStatus, installGuard, parseExecArgs, uninstallGuard } from "./guard.js";
+import { guardPosture } from "./sync.js";
 import { homedir } from "node:os";
 import { c } from "./render.js";
 
@@ -405,7 +406,7 @@ async function main(): Promise<number> {
       console.log(`cache    ${st.cacheEntries} verdicts · ${Math.round(st.cacheBytes / 1024)} KB · ${st.home}`);
       console.log(`last     ${last ? `${last.decision} ${last.skill}@${last.semver} · ${last.at}` : c.muted("no decisions yet")}`);
       if (org) {
-        const res = await report({ installed: [], removed: [], hook_version: VERSION });
+        const res = await report({ installed: [], removed: [], hook_version: VERSION, guard: guardPosture() });
         if (res.ok) {
           if (res.data.policy_version !== org.policyVersion && res.data.policy_yaml) { writePolicy(res.data.policy_yaml); writeOrg({ ...org, policyVersion: res.data.policy_version, enforcement: res.data.enforcement }); console.log(`${c.verified("✓")} Policy updated to v${res.data.policy_version}`); }
           for (const a of res.data.pending_approvals) console.log(`approval ${a.skill} · ${a.status} · ${a.request_id}`);

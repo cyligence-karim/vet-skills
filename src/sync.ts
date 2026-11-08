@@ -9,7 +9,8 @@ import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { confirmRemoval, report, type ReportResponse } from "./api.js";
-import { readOrg } from "./state.js";
+import { installGuard, wrappedServers } from "./guard.js";
+import { VERSION, readOrg } from "./state.js";
 
 export function skillDirs(name: string): string[] {
   const bare = name.replace(/^.*\//, "").replace(/@.*$/, "");
@@ -41,8 +42,19 @@ export async function applyRemovals(pending: ReportResponse["pending_removals"],
 export async function sync(log: (l: string) => void = () => {}): Promise<{ ok: boolean; removed: number; error?: string }> {
   const org = readOrg();
   if (!org) return { ok: false, removed: 0, error: "not joined" };
-  const res = await report({ installed: [], removed: [], hook_version: undefined });
+  const res = await report({ installed: [], removed: [], hook_version: VERSION, guard: guardPosture() });
   if (!res.ok) return { ok: false, removed: 0, error: res.error };
   const removed = await applyRemovals(res.data.pending_removals, log);
+  // Required-guard mode: the org wants every MCP server under the guard; a machine reporting none installs it now.
+  if (res.data.require_guard && guardPosture().servers === 0) {
+    const touched = installGuard();
+    const n = touched.reduce((k, t) => k + t.wrapped.length, 0);
+    if (n) { log(`${readOrg()?.slug ?? "your org"} requires the guard: ${n} MCP server${n === 1 ? "" : "s"} now run under it (restart the agents to pick it up)`); await report({ installed: [], removed: [], hook_version: VERSION, guard: guardPosture() }).catch(() => null); }
+  }
   return { ok: true, removed };
+}
+
+/** How many stdio MCP servers on this machine run under the guard, and in which clients. */
+export function guardPosture(): { servers: number; clients: string[] } {
+  try { const w = wrappedServers({ project: process.cwd() }); return { servers: w.length, clients: [...new Set(w.map((x) => x.client))] }; } catch { return { servers: 0, clients: [] }; }
 }
