@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_POLICY, SOLO_POLICY, evaluate, parsePolicyYaml, serializePolicyYaml, flagsFromTrace, type VerdictInput, type PublisherInput } from "../src/policy/index.ts";
+import { DEFAULT_POLICY, SOLO_POLICY, evaluate, parsePolicyYaml, serializePolicyYaml, flagsFromTrace, type VerdictInput, type PublisherInput, toolRuleFor } from "../src/policy/index.ts";
 
 const stripe: PublisherInput = { handle: "stripe", verified: true, ageDays: 600 };
 const devtools: PublisherInput = { handle: "devtools-cloud", verified: false, ageDays: 9 };
@@ -121,4 +121,17 @@ test("policy YAML accepts the documented caution_action / unknown_action spellin
   const p = parsePolicyYaml("name: mine\nmin_score: 60\ncaution_action: approval\nunknown_action: block\n");
   assert.equal(p.cautionAction, "approval"); assert.equal(p.unknownAction, "block");
   assert.equal(parsePolicyYaml("caution: block\n").cautionAction, "block");
+});
+
+test("runtime clause: parsed with defaults, round-trips, and tool rules match tool or server/tool", () => {
+  const d = parsePolicyYaml("name: x\nversion: 1\n");
+  assert.equal(d.runtime.network, "observe"); assert.equal(d.runtime.newHost, "warn"); assert.equal(d.runtime.secrets, "broker"); assert.equal(d.runtime.blockedVersions, "refuse");
+  assert.ok(d.runtime.tools.some((t) => t.match === "delete_*" && t.action === "approve"));
+  const y = parsePolicyYaml("name: x\nruntime:\n  network: enforce\n  new_host: block\n  tools:\n    - match: 'github/delete_*'\n      action: deny\n    - match: '*'\n      action: allow\n  default_tool_action: approve\n  approval_timeout_seconds: 5\n");
+  assert.equal(y.runtime.network, "enforce"); assert.equal(y.runtime.newHost, "block"); assert.equal(y.runtime.approvalTimeoutSeconds, 10);
+  assert.equal(toolRuleFor(y.runtime.tools, "github", "delete_repo")?.action, "deny");
+  assert.equal(toolRuleFor(y.runtime.tools, "gitlab", "delete_repo")?.action, "allow");
+  assert.equal(toolRuleFor([], "x", "y"), null);
+  const back = parsePolicyYaml(serializePolicyYaml(y));
+  assert.deepEqual(back.runtime, y.runtime);
 });

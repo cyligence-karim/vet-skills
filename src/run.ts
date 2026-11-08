@@ -25,6 +25,7 @@ import { request as httpsRequest } from "node:https";
 import { connect } from "node:net";
 import { TLSSocket, createSecureContext } from "node:tls";
 import { brokerEnv, parseSecrets, substitute, RunCA, type SecretBinding } from "./broker.js";
+import { toolRuleFor, type ToolAction, type ToolRule } from "./policy/index.js";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSkill } from "./api.js";
@@ -32,27 +33,55 @@ import { hiddenTextFindings, hiddenSummary } from "./policy/index.js";
 import { canariesIn, describeCanary, readCanaries } from "./canary.js";
 import { HOME } from "./state.js";
 
-export interface RunOptions { deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void; /** Filesystem (and on macOS network) containment around the server process. */ contain?: boolean; /** `NAME=host,…`: secrets the guard holds and injects only into requests to that host (see broker.ts). */ secrets?: string }
+export interface RunOptions {
+  deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void;
+  /** Filesystem (and on macOS network) containment around the server process. */ contain?: boolean;
+  /** `NAME=host,…`: secrets the guard holds and injects only into requests to that host (see broker.ts). */ secrets?: string;
+  /** Observe mode (`vet-skills guard`): every host is allowed and recorded; `net` lists what is expected, so the rest is reported as new. */ observe?: boolean;
+  /** Hosts that must be tunnelled opaquely (the client pins certificates); learned at runtime and persisted by the caller. */ opaque?: string[];
+  /** Typed events for the runtime log (guard.ts). */ onEvent?: (e: GuardEvent) => void;
+  /** Tool-call rules beyond `deny`: first match wins; `approve` calls `approver` and waits. */ toolRules?: ToolRule[]; defaultToolAction?: ToolAction;
+  /** Decides a held tool call; resolves to true (run) or false (deny). Absent ⇒ approve behaves as deny with a notice. */ approver?: (call: { server: string; tool: string; args: Record<string, unknown>; rule: ToolRule | null }) => Promise<{ allowed: boolean; by: string }>;
+  /** Hosts the server's own code names (from the verdict's credential surface), to label a contacted host as its own. */ ownHosts?: string[];
+}
+
+export type HostMode = "brokered" | "tunnel" | "plain" | "opaque";
+export type GuardEvent =
+  | { kind: "host"; host: string; port: number; mode: HostMode; expected: boolean }
+  | { kind: "blocked"; host: string }
+  | { kind: "tool_call"; tool: string; args: string[]; action: "allowed" | "denied" | "approved" | "refused" | "held"; by?: string; reason?: string }
+  | { kind: "secret"; name: string; host: string; refused: boolean }
+  | { kind: "canary"; where: string; tool: string }
+  | { kind: "poison"; tool: string; summary: string }
+  | { kind: "pin_fallback"; host: string }
+  | { kind: "exit"; code: number | null; calls: number; denied: number; blocked: number };
 
 /** The broker side of the proxy: bound hosts are TLS-terminated and their requests rewritten. */
 export interface BrokerHooks { ca: RunCA; bindings: SecretBinding[]; onBroker: (host: string, used: SecretBinding[], refused: SecretBinding[]) => void }
+
+export interface ProxyOptions { observe?: boolean; opaque?: Set<string>; onHost?: (host: string, port: number, mode: HostMode) => void; onPinFallback?: (host: string) => void }
 
 const globToRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
 
 /** A tiny CONNECT/GET proxy that only forwards to allowed hosts (exact or suffix match). With a broker, bound hosts are
  *  terminated and rewritten (see broker.ts). */
-export function startAllowlistProxy(hosts: string[], onDeny: (host: string) => void, broker?: BrokerHooks): Promise<{ url: string; close: () => void }> {
-  const allowed = (h: string) => hosts.some((a) => h === a || h.endsWith(`.${a}`));
+export function startAllowlistProxy(hosts: string[], onDeny: (host: string) => void, broker?: BrokerHooks, px: ProxyOptions = {}): Promise<{ url: string; close: () => void }> {
+  const listed = (h: string) => hosts.some((a) => h === a || h.endsWith(`.${a}`));
+  // Observe mode (the guard on a developer's machine) lets every host through and records it; the caller decides what is new.
+  const allowed = (h: string) => px.observe === true || listed(h);
+  const isBound = (h: string) => (broker?.bindings ?? []).some((b) => h === b.host || h.endsWith(`.${b.host}`));
   // With a broker every allowed host is terminated, not only the bound ones: that is how a placeholder sent to the
-  // wrong host becomes visible. Clients that pin certificates will refuse the run's CA; use --net without --secrets then.
-  const bound = (_h: string) => broker !== undefined;
+  // wrong host becomes visible. A client that pins certificates refuses the run's CA; after its first failed handshake
+  // the host is remembered as opaque (px.opaque, persisted by the caller) and tunnelled from then on.
+  const terminate = (h: string) => broker !== undefined && !px.opaque?.has(h);
   const srv: Server = createServer((req, res) => {
     // Plain HTTP: forward only to allowed hosts.
     let host = "";
     try { host = new URL(req.url ?? "").hostname; } catch { /* absolute-form expected */ }
     if (!host || !allowed(host)) { onDeny(host || "?"); res.writeHead(403, { "content-type": "text/plain" }); res.end(`vet-skills run: ${host} is not an allowed host\n`); return; }
     const u = new URL(req.url!);
-    if (broker && bound(host)) { relayRewritten(req, res, { host, port: Number(u.port || 80), tls: false, path: `${u.pathname}${u.search}` }, broker); return; }
+    px.onHost?.(host, Number(u.port || 80), broker ? "brokered" : "plain");
+    if (broker) { relayRewritten(req, res, { host, port: Number(u.port || 80), tls: false, path: `${u.pathname}${u.search}` }, broker); return; }
     const up = connect(Number(u.port || 80), u.hostname, () => {
       up.write(`${req.method} ${u.pathname}${u.search} HTTP/1.1\r\n`);
       for (const [k, v] of Object.entries(req.headers)) if (k !== "proxy-connection") up.write(`${k}: ${Array.isArray(v) ? v.join(", ") : v}\r\n`);
@@ -69,17 +98,25 @@ export function startAllowlistProxy(hosts: string[], onDeny: (host: string) => v
   srv.on("connect", (req, socket, head) => {
     const [host, port] = (req.url ?? "").split(":");
     if (!host || !allowed(host)) { onDeny(host || "?"); socket.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
-    if (broker && bound(host)) {
+    if (broker && terminate(host)) {
       let leaf: { key: string; cert: string };
       try { leaf = broker.ca.leaf(host); } catch { socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n"); return; }
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       const tls = new TLSSocket(socket, { isServer: true, secureContext: createSecureContext({ key: leaf.key, cert: leaf.cert }), ALPNProtocols: ["http/1.1"] }) as TLSSocket & { brokerHost?: string; brokerPort?: number };
       tls.brokerHost = host; tls.brokerPort = Number(port || 443);
-      tls.on("error", () => socket.destroy());
+      let spoke = false;
+      tls.once("secure", () => { spoke = true; px.onHost?.(host, Number(port || 443), "brokered"); });
+      tls.on("error", () => {
+        // Handshake refused before any byte was decrypted: the client did not accept the run's CA. A bound host cannot be
+        // made opaque (the secret could not be injected), so it stays terminated and the caller is told; others fall back.
+        if (!spoke && !isBound(host)) { px.opaque?.add(host); px.onPinFallback?.(host); }
+        socket.destroy();
+      });
       if (head.length) tls.unshift(head);
       mitm.emit("connection", tls);
       return;
     }
+    px.onHost?.(host, Number(port || 443), px.opaque?.has(host) ? "opaque" : "tunnel");
     const up = connect(Number(port || 443), host, () => { socket.write("HTTP/1.1 200 Connection Established\r\n\r\n"); if (head.length) up.write(head); socket.pipe(up); up.pipe(socket); });
     up.on("error", () => socket.end()); socket.on("error", () => up.end());
   });
@@ -164,10 +201,13 @@ function record(label: string, tool: string, keys: string[], denied: boolean) {
 /** Relay newline-delimited JSON-RPC both ways, filtering tools/call. Returns the server's exit code. */
 export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   const log = opts.log ?? ((l) => process.stderr.write(`vet-skills run · ${l}\n`));
+  const emit = (e: GuardEvent) => { try { opts.onEvent?.(e); } catch { /* never break the relay */ } };
   const deny = opts.deny.map(globToRe);
   let proxy: { url: string; close: () => void } | null = null;
   let hosts: string[] = [];
   const blockedHosts = new Map<string, number>();
+  const seenHosts = new Set<string>();
+  const opaque = new Set(opts.opaque ?? []);
   // Credential broker: the server gets placeholders; the proxy puts the real values into requests to the bound hosts.
   let broker: BrokerHooks | null = null; let ca: RunCA | null = null;
   const brokered = new Set<string>();
@@ -178,64 +218,106 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
     if (p.bindings.length) {
       try { ca = RunCA.create(); } catch (e) { log((e as Error).message); return 2; }
       broker = { ca, bindings: p.bindings, onBroker: (host, used, refused) => {
-        for (const b of used) { const k = `${b.name}→${host}`; if (!brokered.has(k)) { brokered.add(k); log(`brokered ${b.name} into a request to ${host}`); } }
-        for (const b of refused) { const k = `!${b.name}→${host}`; if (!brokered.has(k)) { brokered.add(k); record(opts.label, `secret:${b.name}`, [host], true); log(`✕ ${opts.label} sent the ${b.name} placeholder to ${host}, which it is not bound to (bound: ${b.host}). The real value never left this process; treat the server as hostile.`); } }
+        for (const b of used) { const k = `${b.name}→${host}`; if (!brokered.has(k)) { brokered.add(k); emit({ kind: "secret", name: b.name, host, refused: false }); log(`brokered ${b.name} into a request to ${host}`); } }
+        for (const b of refused) { const k = `!${b.name}→${host}`; if (!brokered.has(k)) { brokered.add(k); record(opts.label, `secret:${b.name}`, [host], true); emit({ kind: "secret", name: b.name, host, refused: true }); log(`✕ ${opts.label} sent the ${b.name} placeholder to ${host}, which it is not bound to (bound: ${b.host}). The real value never left this process; treat the server as hostile.`); } }
       } };
     }
   }
-  if (opts.net !== "off" || broker) {
+  const expected = (h: string) => hosts.some((a) => h === a || h.endsWith(`.${a}`)) || (opts.ownHosts ?? []).some((a) => h === a || h.endsWith(`.${a}`)) || /^(localhost|127\.0\.0\.1|registry\.npmjs\.org|pypi\.org|files\.pythonhosted\.org)$/.test(h);
+  if (opts.net !== "off" || broker || opts.observe) {
     hosts = opts.net === "declared" ? await declaredHosts(opts.query ?? opts.label) : opts.net === "off" ? [] : opts.net;
-    if (opts.net === "declared" && !hosts.length && !broker) log(`no declared hosts on record for ${opts.query ?? opts.label}; network stays open (use --net host1,host2 to pin it)`);
+    if (opts.net === "declared" && !hosts.length && !broker && !opts.observe) log(`no declared hosts on record for ${opts.query ?? opts.label}; network stays open (use --net host1,host2 to pin it)`);
     else {
       for (const b of broker?.bindings ?? []) if (!hosts.includes(b.host)) hosts.push(b.host);
-      if (opts.net === "off" && broker) log(`--secrets implies a network pin: only ${hosts.join(", ")} reachable (add --net to widen it)`);
-      proxy = await startAllowlistProxy(hosts, (h) => { blockedHosts.set(h, (blockedHosts.get(h) ?? 0) + 1); if (blockedHosts.get(h) === 1) log(`blocked connection to ${h} (answered 403; the server keeps running)`); }, broker ?? undefined);
+      if (opts.net === "off" && broker && !opts.observe) log(`--secrets implies a network pin: only ${hosts.join(", ")} reachable (add --net to widen it)`);
+      proxy = await startAllowlistProxy(hosts, (h) => { blockedHosts.set(h, (blockedHosts.get(h) ?? 0) + 1); emit({ kind: "blocked", host: h }); if (blockedHosts.get(h) === 1) log(`blocked connection to ${h} (answered 403; the server keeps running)`); }, broker ?? undefined, {
+        observe: opts.observe, opaque,
+        onHost: (host, port, mode) => { const k = `${host}:${port}`; if (seenHosts.has(k)) return; seenHosts.add(k); const ok = expected(host); emit({ kind: "host", host, port, mode, expected: ok }); if (opts.observe && !ok) log(`contacted ${host}${port !== 443 ? `:${port}` : ""}, which nothing on record for ${opts.label} names`); },
+        onPinFallback: (host) => { emit({ kind: "pin_fallback", host }); log(`${host}: the client pins its certificate, so this host is tunnelled opaquely from now on (placeholders sent there cannot be seen)`); },
+      });
     }
   }
-  const env = { ...process.env, ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: "127.0.0.1,localhost", ALL_PROXY: proxy.url } : {}), ...(broker && ca ? brokerEnv(broker.bindings, ca.caBundle, ca.caPem) : {}) };
-  log(`guarding ${opts.label}${deny.length ? ` · denying ${opts.deny.join(", ")}` : ""}${proxy ? ` · network limited to ${hosts.join(", ")} (clients that ignore HTTPS_PROXY are not contained)` : ""}${broker ? ` · holding ${broker.bindings.map((b) => `${b.name} for ${b.host}`).join(", ")} (the server sees placeholders)` : ""}`);
+  const env = { ...process.env, ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: "127.0.0.1,localhost", ALL_PROXY: proxy.url, NODE_USE_ENV_PROXY: "1" } : {}), ...(broker && ca ? brokerEnv(broker.bindings, ca.caBundle, ca.caPem) : {}) };
+  log(`guarding ${opts.label}${deny.length ? ` · denying ${opts.deny.join(", ")}` : ""}${proxy && !opts.observe ? ` · network limited to ${hosts.join(", ")} (clients that ignore HTTPS_PROXY are not contained)` : ""}${proxy && opts.observe ? ` · recording every host it contacts${hosts.length ? ` (${hosts.length} on record)` : ""}` : ""}${broker ? ` · holding ${broker.bindings.map((b) => `${b.name} for ${b.host}`).join(", ")} (the server sees placeholders)` : ""}`);
   let launch = cmd;
   if (opts.contain) { const w = containWrap(cmd, proxy ? Number(new URL(proxy.url).port) : null); launch = w.cmd; log(w.note); }
   const child = spawn(launch[0], launch.slice(1), { stdio: ["pipe", "pipe", "inherit"], env });
   const pending = new Map<number | string, string>();
   const canaryReg = readCanaries();
   let calls = 0, deniedCalls = 0;
-  // agent → server
+  const rules = opts.toolRules ?? [];
+  const refuse = (id: number | string | undefined, code: number, message: string) => { if (id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n"); };
+  // agent → server. Lines are relayed in order; a held call (approval) parks the queue behind it so the server never
+  // sees a later call before an earlier one was decided.
   let inBuf = "";
+  let chain: Promise<void> = Promise.resolve();
+  const handleLine = async (line: string) => {
+    let m: { id?: number | string; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } } | null = null;
+    try { m = JSON.parse(line); } catch { /* pass through */ }
+    if (m?.method === "tools/call" && m.params?.name) {
+      const name = m.params.name;
+      const args = m.params.arguments ?? {};
+      const keys = Object.keys(args);
+      calls++;
+      // A planted canary in the arguments the agent is sending to this server: exfiltration in progress. Refuse the call.
+      const leak = canariesIn(line, canaryReg);
+      if (leak.length) {
+        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "canary", where: "arguments", tool: name }); emit({ kind: "tool_call", tool: name, args: keys, action: "refused", reason: "canary in arguments" });
+        log(`✕ CREDENTIAL EXFILTRATION: ${describeCanary(leak[0])} value in the arguments of tools/call ${name}; call refused. Revoke real credentials in that folder.`);
+        refuse(m.id, -32600, `vet-skills run refused tools/call ${name}: the arguments carry a planted canary credential (exfiltration).`);
+        return;
+      }
+      if (deny.some((re) => re.test(name))) {
+        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: "--deny" });
+        log(`denied tools/call ${name}`);
+        refuse(m.id, -32601, `Tool "${name}" is denied by vet-skills run on this machine.`);
+        return;
+      }
+      const rule = toolRuleFor(rules, opts.label, name);
+      const action: ToolAction = rule?.action ?? opts.defaultToolAction ?? "allow";
+      if (action === "deny") {
+        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: rule ? `policy rule ${rule.match}${rule.reason ? ` (${rule.reason})` : ""}` : "policy default" });
+        log(`denied tools/call ${name} (policy${rule ? `: ${rule.match}` : ""})`);
+        refuse(m.id, -32601, `Tool "${name}" is denied by your organization's runtime policy${rule?.reason ? `: ${rule.reason}` : ""}.`);
+        return;
+      }
+      if (action === "approve") {
+        if (!opts.approver) {
+          deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: "needs approval; no approver" });
+          log(`held tools/call ${name}: policy requires approval and this machine has no approver (join an org, or change runtime.tools)`);
+          refuse(m.id, -32601, `Tool "${name}" needs approval under the runtime policy and no approver is configured on this machine.`);
+          return;
+        }
+        emit({ kind: "tool_call", tool: name, args: keys, action: "held", reason: rule?.reason });
+        log(`holding tools/call ${name} for approval${rule?.reason ? ` (${rule.reason})` : ""}…`);
+        const d = await opts.approver({ server: opts.label, tool: name, args, rule }).catch((e: Error) => ({ allowed: false, by: `error: ${e.message}` }));
+        if (!d.allowed) {
+          deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", by: d.by, reason: "approval denied or timed out" });
+          log(`✕ tools/call ${name} denied (${d.by})`);
+          refuse(m.id, -32601, `Tool "${name}" was not approved (${d.by}).`);
+          return;
+        }
+        record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "approved", by: d.by });
+        log(`tools/call ${name} approved by ${d.by}`);
+        if (m.id !== undefined) pending.set(m.id, name);
+        child.stdin.write(line + "\n");
+        return;
+      }
+      record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "allowed" });
+      if (m.id !== undefined) pending.set(m.id, name);
+    }
+    child.stdin.write(line + "\n");
+  };
   process.stdin.on("data", (chunk) => {
     inBuf += chunk.toString();
     let i;
     while ((i = inBuf.indexOf("\n")) >= 0) {
       const line = inBuf.slice(0, i); inBuf = inBuf.slice(i + 1);
       if (!line.trim()) continue;
-      let m: { id?: number | string; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } } | null = null;
-      try { m = JSON.parse(line); } catch { /* pass through */ }
-      if (m?.method === "tools/call" && m.params?.name) {
-        const name = m.params.name;
-        const keys = Object.keys(m.params.arguments ?? {});
-        calls++;
-        // A planted canary in the arguments the agent is sending to this server: exfiltration in progress. Refuse the call.
-        const leak = canariesIn(line, canaryReg);
-        if (leak.length) {
-          deniedCalls++; record(opts.label, name, keys, true);
-          log(`✕ CREDENTIAL EXFILTRATION: ${describeCanary(leak[0])} value in the arguments of tools/call ${name}; call refused. Revoke real credentials in that folder.`);
-          if (m.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -32600, message: `vet-skills run refused tools/call ${name}: the arguments carry a planted canary credential (exfiltration).` } }) + "\n");
-          continue;
-        }
-        if (deny.some((re) => re.test(name))) {
-          deniedCalls++;
-          record(opts.label, name, keys, true);
-          log(`denied tools/call ${name}`);
-          if (m.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: `Tool "${name}" is denied by vet-skills run on this machine.` } }) + "\n");
-          continue;
-        }
-        record(opts.label, name, keys, false);
-        if (m.id !== undefined) pending.set(m.id, name);
-      }
-      child.stdin.write(line + "\n");
+      chain = chain.then(() => handleLine(line));
     }
   });
-  process.stdin.on("end", () => child.stdin.end());
+  process.stdin.on("end", () => { chain.then(() => child.stdin.end()); });
   // server → agent: relayed as is, but inspected. tools/list descriptions are instructions the agent will follow; a
   // tools/call result is data that must not carry any. Findings are logged and told to the agent out of band (stderr).
   let outBuf = "";
@@ -254,21 +336,21 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
         for (const t of m.result.tools) {
           const f = hiddenTextFindings(`${t.description ?? ""}\n${JSON.stringify(t.inputSchema ?? {})}`, { phrases: true }).filter((x) => x.severity !== "medium");
           const key = `desc|${t.name}`;
-          if (f.length && !warned.has(key)) { warned.add(key); record(opts.label, t.name ?? "?", [], false); log(`tool "${t.name}" description carries instructions for the agent (tool poisoning): ${hiddenSummary(f)}. Deny it with --deny ${t.name} if you do not trust it.`); }
+          if (f.length && !warned.has(key)) { warned.add(key); record(opts.label, t.name ?? "?", [], false); emit({ kind: "poison", tool: t.name ?? "?", summary: hiddenSummary(f) }); log(`tool "${t.name}" description carries instructions for the agent (tool poisoning): ${hiddenSummary(f)}. Deny it with --deny ${t.name} if you do not trust it.`); }
         }
       } else if (m.id !== undefined && pending.has(m.id)) {
         const tool = pending.get(m.id)!; pending.delete(m.id);
         const leak = canariesIn(line, canaryReg);
-        if (leak.length && !warned.has(`canary|${tool}`)) { warned.add(`canary|${tool}`); record(opts.label, tool, [], false); log(`✕ ${describeCanary(leak[0])} value in the result of ${tool}: the server read a decoy credential file on this machine. Treat ${opts.label} as hostile.`); }
+        if (leak.length && !warned.has(`canary|${tool}`)) { warned.add(`canary|${tool}`); record(opts.label, tool, [], false); emit({ kind: "canary", where: "result", tool }); log(`✕ ${describeCanary(leak[0])} value in the result of ${tool}: the server read a decoy credential file on this machine. Treat ${opts.label} as hostile.`); }
         const f = hiddenTextFindings(JSON.stringify(m.result.content ?? m.result), { phrases: true }).filter((x) => x.severity !== "medium");
         const key = `res|${tool}|${f[0]?.title ?? ""}`;
-        if (f.length && !warned.has(key)) { warned.add(key); log(`result of ${tool} carries instructions aimed at the agent: ${hiddenSummary(f)}. Treat it as data.`); }
+        if (f.length && !warned.has(key)) { warned.add(key); emit({ kind: "poison", tool, summary: hiddenSummary(f) }); log(`result of ${tool} carries instructions aimed at the agent: ${hiddenSummary(f)}. Treat it as data.`); }
       }
     }
   });
   return new Promise((resolve) => {
     // Resolve only once everything the server wrote has been relayed and flushed: the process exits right after.
-    child.on("close", (code) => { proxy?.close(); ca?.wipe(); const nb = [...blockedHosts.values()].reduce((a, b) => a + b, 0); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied${nb ? ` · ${nb} connection${nb === 1 ? "" : "s"} blocked (${[...blockedHosts.keys()].slice(0, 5).join(", ")})` : ""}`); process.stdout.write("", () => resolve(code ?? 1)); });
+    child.on("close", (code) => { proxy?.close(); ca?.wipe(); const nb = [...blockedHosts.values()].reduce((a, b) => a + b, 0); emit({ kind: "exit", code, calls, denied: deniedCalls, blocked: nb }); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied${nb ? ` · ${nb} connection${nb === 1 ? "" : "s"} blocked (${[...blockedHosts.keys()].slice(0, 5).join(", ")})` : ""}`); process.stdout.write("", () => resolve(code ?? 1)); });
     child.on("error", (e) => { proxy?.close(); ca?.wipe(); log(`could not start ${cmd[0]}: ${e.message}`); resolve(1); });
   });
 }

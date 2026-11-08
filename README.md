@@ -5,10 +5,55 @@ Check agent skills and MCP servers before they run. Verdicts come from
 
 ```
 npm i -g vet-skills                          # the CLI (Node 20+)
+vet-skills guard install                     # every MCP server in Claude Code, Cursor, Windsurf, Codex, Gemini CLI, Claude Desktop runs under the guard
 vet-skills hook install all                  # Claude Code, Cursor, Codex, Windsurf, Gemini CLI: install check, runtime observation, canaries
 vet-skills check <skill>                     # or just ask before you add one
 vet-skills publish ./my-skill                # org members: detonate + list in the private registry
 ```
+
+## The guard: every MCP server, every time (0.8)
+
+An MCP server is third-party code running on your machine with your tokens in
+its environment. `vet-skills guard install` rewrites the MCP configs of Claude
+Code, Claude Desktop, Cursor, Windsurf, Gemini CLI and Codex so every stdio
+server starts as `vet-skills guard exec … -- <original command>`. The agent
+talks to the guard; the guard talks to the server. On every launch:
+
+- **Credentials become placeholders.** The variables the package's verdict
+  names as credentials are replaced in the server's environment; the real
+  value is injected only into requests to the vendor's own hosts. A
+  placeholder sent anywhere else is logged as an exfiltration attempt and the
+  value never left the guard. No configuration: the binding comes from the
+  package's own code (`--secrets NAME=host` still overrides it).
+- **Every host is recorded.** Observe mode by default; the first time a
+  version reaches a host that neither its verdict, its code nor an earlier
+  session on this machine named, you are told on stderr. Policy
+  `runtime.new_host: block` refuses it instead.
+- **Flagged versions do not start.** A Blocked verdict, a confirmed incident
+  or a revocation (by KillerSkills, or by your organization) is refused at
+  launch with the reason: the kill switch reaches every guard at its next start.
+- **Tool calls follow rules.** Policy `runtime.tools`: `allow`, `deny` or
+  `approve` (held for a decision in the org's Runtime page or Slack; later
+  calls queue behind it in order).
+- **The session is written down** in `~/.vet-skills/runtime/guard.jsonl`:
+  hosts, tool names and argument *keys* (never values), brokered and refused
+  secrets, exit. Enrolled machines report it to the org's Runtime page; others,
+  with telemetry on, send an anonymous sighting (package, version, hosts) that
+  feeds the public "observed in the field" section and the honeypot re-run queue.
+
+```
+$ vet-skills guard install
+✓ claude-code: supabase, github, filesystem now run under the guard (~/.claude.json)
+✓ cursor: github now run under the guard (~/.cursor/mcp.json)
+  claude-code: notion-remote skipped — remote server (http/sse); the guard wraps stdio servers
+$ vet-skills guard status
+$ vet-skills guard uninstall                 # originals back (also kept in ~/.vet-skills/guard/backup)
+```
+
+Limits, stated: remote (http/sse) servers are not wrapped; a client that
+ignores `HTTPS_PROXY` is not seen by the proxy; a client that pins certificates
+is tunnelled opaquely after its first refused handshake, so placeholders sent to
+that host cannot be inspected. The guard says so on stderr when either happens.
 
 ## Use it as an MCP server
 
@@ -277,6 +322,8 @@ prompts, environment variables, or file contents. `vet-skills leave` reverts.
 | `check <skill>` | Dry-run the decision. Exit 2 when blocked. |
 | `try <pkg\|pypi:name\|owner/repo\|path>` | Fetch it, run it in the honeypot, print what it did and what it costs the agent. |
 | `run [--contain] [--deny t,glob*] [--net declared\|hosts\|off] [--secrets NAME=host,…] -- <cmd…>` | Guard a stdio MCP server: deny tools, pin its network, broker its secrets, log every call. |
+| `guard install \| uninstall \| status [--project]` | Wrap (or unwrap) every stdio MCP server in the agents' configs so it runs under the guard with the runtime policy; status shows sessions, hosts, held calls. |
+| `guard exec --server <n> --client <a> [--secrets …] -- <cmd…>` | Called from the rewritten configs: one server under the guard (verdict lookup, launch check, brokered credentials, host baseline, tool rules, session report). |
 | `install <skill>` | Check, then `npx skills add`. Prompts on caution. |
 | `detonate <skill\|path>` | Force a sandbox run. |
 | `why <skill>` | Last decision and the rule behind it. |

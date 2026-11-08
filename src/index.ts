@@ -27,6 +27,8 @@
  *   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
   vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
   vet-skills canary [install|remove]    decoy credential files on this machine; any sighting in a session is proof of exfiltration
+  vet-skills guard install|uninstall|status [--project]   wrap (or unwrap) every stdio MCP server in the agents' configs; status shows sessions, hosts, held calls
+  vet-skills guard exec --server <n> --client <a> -- <cmd…>   (called by the agent's config) run one server under the guard with the runtime policy
  *   vet-skills hook observe               (called by the agent after each tool call) compare behavior with the sandbox trace
  *   vet-skills runtime                    deviations observed in real sessions this week
  */
@@ -54,13 +56,15 @@ import { applyRemovals, sync } from "./sync.js";
 import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from "./attest.js";
 import { observe, pruneSessions, readDeviations, readAllows, recordPrompt, revokeAllow } from "./runtime.js";
 import { plantCanaries, readCanaries, removeCanaries } from "./canary.js";
+import { execGuarded, guardStatus, installGuard, parseExecArgs, uninstallGuard } from "./guard.js";
 import { homedir } from "node:os";
 import { c } from "./render.js";
 
-// `run` owns everything after it (its own flags, then `--` and the server command); the shared parser never sees them.
+// `run` and `guard exec` own everything after them (their own flags, then `--` and the server command); the shared parser never sees them.
 const RUN_AT = process.argv.indexOf("run", 2);
+const GUARD_EXEC = process.argv[2] === "guard" && process.argv[3] === "exec";
 const { values, positionals } = parseArgs({
-  args: RUN_AT === 2 ? ["run"] : process.argv.slice(2),
+  args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", "exec"] : process.argv.slice(2),
   allowPositionals: true,
   options: {
     token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
@@ -78,6 +82,7 @@ const USAGE = `vet-skills ${VERSION} — check agent skills and MCP servers befo
 
 Get started:
   vet-skills hook install [claude-code|cursor|codex|windsurf|gemini|all]   install-time check + runtime observation for that agent (one time)
+  vet-skills guard install              every MCP server in Claude Code, Cursor, Windsurf, Codex, Gemini and Claude Desktop runs under the guard: tokens become placeholders, hosts and tool calls are recorded, flagged versions do not launch
   vet-skills check <skill>              see the verdict for anything before installing it
   vet-skills join <org> --token <t>     enroll this machine in your team's policy (token from the dashboard)
 
@@ -102,6 +107,8 @@ Get started:
   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
   vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
   vet-skills canary [install|remove]    decoy credential files on this machine; any sighting in a session is proof of exfiltration
+  vet-skills guard install|uninstall|status [--project]   wrap (or unwrap) every stdio MCP server in the agents' configs; status shows sessions, hosts, held calls
+  vet-skills guard exec --server <n> --client <a> -- <cmd…>   (called by the agent's config) run one server under the guard with the runtime policy
 
 Docs: https://killerskills.ai/docs/cli
 `;
@@ -166,6 +173,37 @@ async function main(): Promise<number> {
       const parsed = parseRunArgs(process.argv.slice(RUN_AT + 1));
       if ("error" in parsed) { console.error(parsed.error); return 1; }
       return guard(parsed.cmd, parsed.opts);
+    }
+
+    case "guard": {
+      const sub = rest[0];
+      if (sub === "exec") {
+        const a = parseExecArgs(process.argv.slice(4));
+        if ("error" in a) { console.error(a.error); return 2; }
+        return execGuarded(a);
+      }
+      const project = values.project ? process.cwd() : null;
+      if (sub === "install" || sub === undefined) {
+        const touched = installGuard({ project });
+        const total = touched.reduce((n, t) => n + t.wrapped.length, 0);
+        for (const t of touched) {
+          if (t.wrapped.length) console.log(`${c.verified("✓")} ${t.client}: ${t.wrapped.join(", ")} now run under the guard (${t.file})`);
+          for (const sk of t.skipped) console.log(c.muted(`  ${t.client}: ${sk.name} skipped — ${sk.why}`));
+        }
+        if (!touched.length) console.log("No MCP configs found for Claude Code, Claude Desktop, Cursor, Windsurf, Gemini CLI or Codex" + (project ? "" : " (add --project to include this folder's .mcp.json, .cursor/mcp.json, .vscode/mcp.json)") + ".");
+        else if (!total) console.log(c.muted("Every stdio server found was already under the guard."));
+        else console.log(`\nRestart the agents to pick the change up. Each server now starts as \`vet-skills guard exec\`: credentials it needs become placeholders, every host it contacts is recorded, and a version with a blocked verdict or a confirmed incident does not launch. \`vet-skills guard status\` shows what happened; \`vet-skills guard uninstall\` puts the original commands back.`);
+        return 0;
+      }
+      if (sub === "uninstall") {
+        const touched = uninstallGuard({ project });
+        const total = touched.reduce((n, t) => n + t.wrapped.length, 0);
+        for (const t of touched) if (t.wrapped.length) console.log(`${c.verified("✓")} ${t.client}: ${t.wrapped.join(", ")} restored (${t.file})`);
+        console.log(total ? "Restart the agents to pick the change up." : c.muted("Nothing was under the guard."));
+        return 0;
+      }
+      if (sub === "status") { for (const l of guardStatus({ project })) console.log(l); return 0; }
+      console.error("usage: vet-skills guard install|uninstall|status [--project]"); return 1;
     }
 
     case "try": {

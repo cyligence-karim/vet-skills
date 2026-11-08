@@ -71,6 +71,42 @@ export function runtimeReport(body: { events: { skill: string; semver: string | 
   return call<{ ok: true }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/runtime`, { method: "POST", body: JSON.stringify(body), headers: orgHeaders() }, 6000);
 }
 
+/** One guarded MCP server session (or a progress snapshot of one), from `vet-skills guard exec` on an enrolled machine. */
+export interface GuardSessionReport {
+  session: string; server: string; client: string; pkg: string | null; registry: string | null; semver: string | null;
+  started: string; ended: string | null; final: boolean; exit_code: number | null; machine: string; cwd_hash: string | null;
+  hosts: { host: string; port: number; mode: string; expected: boolean; first_seen_here: boolean }[];
+  tools: { tool: string; calls: number; denied: number; approved: number }[];
+  secrets: { name: string; host: string; refused: boolean }[];
+  canary: boolean; poison: string[]; launch: "ran" | "refused" | "warned"; launch_reason: string | null;
+  guard_version: string; policy_version: number | null;
+}
+export function guardReport(body: GuardSessionReport) {
+  const org = readOrg();
+  if (!org) return Promise.resolve<ApiResult<{ ok: true; alerts?: { kind: string; detail: string }[] }>>({ ok: false, error: "not joined", offline: false });
+  return call<{ ok: true; alerts?: { kind: string; detail: string }[] }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/guard`, { method: "POST", body: JSON.stringify(body), headers: orgHeaders() }, 6000);
+}
+/** Anonymous field sighting from a machine not in an org: package, version, hosts and whether anything refused. Nothing about the user, the server label, the tools or the arguments. */
+export function guardSighting(body: { pkg: string; registry: string | null; semver: string | null; hosts: { host: string; expected: boolean }[]; placeholder_refused: boolean; canary: boolean; guard_version: string; os: string }) {
+  return call<{ ok: true }>(`/api/v1/runtime/sightings`, { method: "POST", body: JSON.stringify(body) }, 6000);
+}
+/** Before launching: is this version flagged across the network? `revoked` refuses; `under_review` warns. */
+export function launchCheck(pkg: string, semver: string | null, registry?: string | null) {
+  const qs = new URLSearchParams({ pkg }); if (semver) qs.set("semver", semver); if (registry) qs.set("registry", registry);
+  return call<{ state: "clear" | "under_review" | "revoked"; reason: string | null; page: string | null; sightings?: { installs: number; hosts: number } }>(`/api/v1/runtime/launch-check?${qs}`, { headers: orgHeaders() }, 3000);
+}
+/** Approval of a held tool call (enrolled machines): create, then poll until decided or the deadline passes. */
+export function approvalCreate(body: { server: string; pkg: string | null; semver: string | null; tool: string; arg_keys: string[]; arg_preview: string; reason: string | null; session: string; timeout_seconds: number }) {
+  const org = readOrg();
+  if (!org) return Promise.resolve<ApiResult<{ id: string; url: string }>>({ ok: false, error: "not joined", offline: false });
+  return call<{ id: string; url: string }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/tool-approvals`, { method: "POST", body: JSON.stringify(body), headers: orgHeaders() }, 6000);
+}
+export function approvalPoll(id: string) {
+  const org = readOrg();
+  if (!org) return Promise.resolve<ApiResult<{ status: "pending" | "approved" | "denied" | "expired"; by: string | null }>>({ ok: false, error: "not joined", offline: false });
+  return call<{ status: "pending" | "approved" | "denied" | "expired"; by: string | null }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/tool-approvals/${id}`, { headers: orgHeaders() }, 6000);
+}
+
 export function confirmRemoval(removalId: string, body: { status: "confirmed" | "failed"; detail?: string }) {
   const org = readOrg();
   if (!org) return Promise.resolve<ApiResult<{ ok: boolean }>>({ ok: false, error: "not joined", offline: false });

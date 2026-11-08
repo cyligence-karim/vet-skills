@@ -67,3 +67,22 @@ test("run --contain: wraps in the OS sandbox when available, never breaks the co
   else if (process.platform === "darwin" && w.cmd[0] === "/usr/bin/sandbox-exec") { assert.match(w.cmd[2], /deny file-read\*[^\n]*\.ssh/); assert.match(w.cmd[2], /localhost:4321/); }
   else assert.match(w.note, /unavailable|not available/);
 });
+
+test("guard observe mode: an unlisted host is tunnelled and reported as unexpected rather than refused", async () => {
+  const { createServer } = await import("node:net");
+  // A local "upstream" that answers anything, standing in for the unexpected host (CONNECT to 127.0.0.1:<port>).
+  const upstream = createServer((s) => { s.on("data", () => s.end("hello")); });
+  await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
+  const uport = (upstream.address() as { port: number }).port;
+  const seen: { host: string; port: number; mode: string }[] = []; const denied: string[] = [];
+  const p = await startAllowlistProxy(["api.example.com"], (h) => denied.push(h), undefined, { observe: true, onHost: (host, port, mode) => seen.push({ host, port, mode }) });
+  const { port } = new URL(p.url);
+  const res = await new Promise<string>((resolve) => {
+    const s = connect(Number(port), "127.0.0.1", () => s.write(`CONNECT 127.0.0.1:${uport} HTTP/1.1\r\nHost: 127.0.0.1:${uport}\r\n\r\n`));
+    let d = ""; s.on("data", (c: Buffer) => { d += c; if (/200 Connection Established/.test(d) && !/hello/.test(d)) s.write("x"); if (/hello/.test(d)) s.end(); }); s.on("close", () => resolve(d)); s.on("error", () => resolve(d));
+  });
+  p.close(); upstream.close();
+  assert.match(res, /200 Connection Established/); assert.match(res, /hello/);
+  assert.deepEqual(denied, []);
+  assert.deepEqual(seen, [{ host: "127.0.0.1", port: uport, mode: "tunnel" }]);
+});

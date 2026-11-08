@@ -44,7 +44,36 @@ export interface Policy {
    * Caution so the caution action applies; `approval` and `block` are what they say. Full-coverage verdicts are untouched.
    */
   partialCoverage: CoverageAction;
+  /**
+   * Runtime clause: how the guard treats an MCP server it launches on a developer's machine (`vet-skills guard`).
+   *   network   observe: every host is recorded and allowed; enforce: only hosts the verdict saw or declared, plus the hosts
+   *             credentials are bound to, are reachable (the rest get 403 and are recorded as blocked).
+   *   new_host  what happens the first time this package version contacts a host no verdict, declaration or earlier
+   *             guarded session on this machine has seen: allow silently, warn (recorded, told to the user), block.
+   *   secrets   broker: credential variables the verdict names are replaced by placeholders and injected only into
+   *             requests to the vendor's hosts; passthrough: the server gets the real values (recorded as such).
+   *   blocked_versions  refuse: a version whose verdict is blocked, or with a confirmed incident, does not launch; warn: launches with a notice.
+   *   tools     tool-call rules, first match wins. `match` is a glob on `tool` or `server/tool`; `action` is allow, deny, or
+   *             approve (held until someone with the approval link decides; denied if nobody does within the timeout).
+   *   default_tool_action  for calls no rule matches.
+   */
+  runtime: RuntimePolicy;
 }
+export interface RuntimePolicy {
+  network: "observe" | "enforce";
+  newHost: "allow" | "warn" | "block";
+  secrets: "broker" | "passthrough";
+  blockedVersions: "refuse" | "warn";
+  tools: ToolRule[];
+  defaultToolAction: ToolAction;
+  /** Seconds a held tool call waits for an approval before it is denied. */
+  approvalTimeoutSeconds: number;
+}
+export type ToolAction = "allow" | "deny" | "approve";
+export interface ToolRule { match: string; action: ToolAction; reason?: string }
+export const DEFAULT_RUNTIME: RuntimePolicy = { network: "observe", newHost: "warn", secrets: "broker", blockedVersions: "refuse", tools: [], defaultToolAction: "allow", approvalTimeoutSeconds: 300 };
+/** Tool names that change or destroy state: the strict runtime policy holds them for approval. */
+export const DESTRUCTIVE_TOOL_GLOBS = ["delete_*", "*_delete", "remove_*", "drop_*", "destroy_*", "purge_*", "force_push*", "*_force", "execute_sql", "run_sql", "run_query", "send_email", "send_message", "transfer_*", "pay_*", "deploy_*", "rotate_*", "revoke_*"];
 export type CoverageLevel = "full" | "startup_only" | "install_failed" | "install_only" | "static_only";
 /** What a partial-coverage verdict does: the label stands as published (default), or it is treated as Caution (so the caution action applies), or it needs approval, or it is blocked. */
 export type CoverageAction = "as_labelled" | "caution" | "approval" | "block";
@@ -132,6 +161,7 @@ export const DEFAULT_POLICY: Policy = {
   agents: ["claude_code", "cursor", "codex", "copilot", "gemini_cli", "other"],
   approvals: { ttlDays: 90, blockedExceptionApprovers: 2 },
   context: DEFAULT_CONTEXT,
+  runtime: { ...DEFAULT_RUNTIME, tools: DESTRUCTIVE_TOOL_GLOBS.map((g) => ({ match: g, action: "approve" as const, reason: "changes or destroys state" })) },
 };
 
 /** The permissive personal policy the CLI uses before anyone configures one. */
@@ -141,7 +171,16 @@ export const SOLO_POLICY: Policy = {
   cautionAction: "allow",
   behavior: { ...DEFAULT_POLICY.behavior, fs_outside_project: "warn" },
   publishers: { allow: [], block: [], blockYoungerThanDays: 0 },
+  // A personal machine has nobody to approve: destructive tools run, the guard records and says so.
+  runtime: { ...DEFAULT_RUNTIME, tools: [] },
 };
+
+/** Matches a tool rule glob against `tool` or `server/tool`. */
+export function toolRuleFor(rules: ToolRule[], server: string, tool: string): ToolRule | null {
+  const re = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
+  for (const r of rules) { const x = re(r.match); if (x.test(tool) || x.test(`${server}/${tool}`)) return r; }
+  return null;
+}
 
 export const FLAG_LABEL: Record<BehaviorFlag, string> = {
   credential_reads: "reads credential paths",
@@ -169,6 +208,22 @@ export function parsePolicyYaml(text: string): Policy {
   const cx = (y.context ?? {}) as Record<string, unknown>;
   const context = { ...DEFAULT_CONTEXT };
   for (const k of CONTEXT_KINDS) context[k] = str(cx[k], ["allow_when_user_touched", "hold"] as const, DEFAULT_CONTEXT[k]);
+  const rt = (y.runtime ?? {}) as Record<string, unknown>;
+  const tools: ToolRule[] = Array.isArray(rt.tools) ? rt.tools.flatMap((t) => {
+    if (!t || typeof t !== "object") return [];
+    const o = t as Record<string, unknown>;
+    if (typeof o.match !== "string" || !o.match.trim()) return [];
+    return [{ match: o.match.trim().slice(0, 200), action: str(o.action, ["allow", "deny", "approve"] as const, "allow"), ...(typeof o.reason === "string" ? { reason: o.reason.slice(0, 200) } : {}) }];
+  }).slice(0, 200) : DEFAULT_POLICY.runtime.tools;
+  const runtime: RuntimePolicy = {
+    network: str(rt.network, ["observe", "enforce"] as const, DEFAULT_RUNTIME.network),
+    newHost: str(rt.new_host, ["allow", "warn", "block"] as const, DEFAULT_RUNTIME.newHost),
+    secrets: str(rt.secrets, ["broker", "passthrough"] as const, DEFAULT_RUNTIME.secrets),
+    blockedVersions: str(rt.blocked_versions, ["refuse", "warn"] as const, DEFAULT_RUNTIME.blockedVersions),
+    tools,
+    defaultToolAction: str(rt.default_tool_action, ["allow", "deny", "approve"] as const, DEFAULT_RUNTIME.defaultToolAction),
+    approvalTimeoutSeconds: Math.min(3600, Math.max(10, num(rt.approval_timeout_seconds, DEFAULT_RUNTIME.approvalTimeoutSeconds))),
+  };
   return {
     name: typeof y.name === "string" ? y.name : DEFAULT_POLICY.name,
     version: num(y.version, 1),
@@ -190,6 +245,7 @@ export function parsePolicyYaml(text: string): Policy {
       blockedExceptionApprovers: num(a.blocked_exception_approvers, DEFAULT_POLICY.approvals.blockedExceptionApprovers),
     },
     context,
+    runtime,
   };
 }
 
@@ -207,6 +263,7 @@ export function serializePolicyYaml(p: Policy): string {
     agents: p.agents,
     approvals: { ttl_days: p.approvals.ttlDays, blocked_exception_approvers: p.approvals.blockedExceptionApprovers },
     context: p.context ?? DEFAULT_CONTEXT,
+    runtime: { network: p.runtime.network, new_host: p.runtime.newHost, secrets: p.runtime.secrets, blocked_versions: p.runtime.blockedVersions, default_tool_action: p.runtime.defaultToolAction, approval_timeout_seconds: p.runtime.approvalTimeoutSeconds, tools: p.runtime.tools.map((t) => ({ match: t.match, action: t.action, ...(t.reason ? { reason: t.reason } : {}) })) },
   });
 }
 
