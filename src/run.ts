@@ -43,6 +43,7 @@ export interface RunOptions {
   /** Tool-call rules beyond `deny`: first match wins; `approve` calls `approver` and waits. */ toolRules?: ToolRule[]; defaultToolAction?: ToolAction;
   /** Decides a held tool call; resolves to true (run) or false (deny). Absent ⇒ approve behaves as deny with a notice. */ approver?: (call: { server: string; tool: string; args: Record<string, unknown>; rule: ToolRule | null }) => Promise<{ allowed: boolean; by: string }>;
   /** Hosts the server's own code names (from the verdict's credential surface), to label a contacted host as its own. */ ownHosts?: string[];
+  /** The live bindings once parsed, so the caller can rotate `value` in place (short-lived credential renewal). */ onBindings?: (bindings: SecretBinding[]) => void;
 }
 
 export type HostMode = "brokered" | "tunnel" | "plain" | "opaque";
@@ -216,6 +217,7 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
     if (p.error) { log(p.error); return 2; }
     for (const n of p.missing) log(`--secrets: ${n} is not set in the environment; nothing to broker for it`);
     if (p.bindings.length) {
+      opts.onBindings?.(p.bindings);
       try { ca = RunCA.create(); } catch (e) { log((e as Error).message); return 2; }
       broker = { ca, bindings: p.bindings, onBroker: (host, used, refused) => {
         for (const b of used) { const k = `${b.name}→${host}`; if (!brokered.has(k)) { brokered.add(k); emit({ kind: "secret", name: b.name, host, refused: false }); log(`brokered ${b.name} into a request to ${host}`); } }

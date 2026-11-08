@@ -68,10 +68,30 @@ export interface RuntimePolicy {
   defaultToolAction: ToolAction;
   /** Seconds a held tool call waits for an approval before it is denied. */
   approvalTimeoutSeconds: number;
+  /**
+   * Short-lived credentials: instead of brokering the long-lived value, the guard exchanges it for a scoped token that
+   * lives minutes, per launch, and revokes it at exit where the vendor allows. The server only ever holds a placeholder
+   * for a credential that will be dead within the hour.
+   */
+  exchange: ExchangeRule[];
+}
+export type ExchangeKind = "github_app" | "aws_sts" | "gcp_impersonate";
+export interface ExchangeRule {
+  /** The variable the server expects (GITHUB_TOKEN, AWS_ACCESS_KEY_ID …). For aws_sts the three AWS variables are set together. */
+  var: string;
+  kind: ExchangeKind;
+  /** Host the minted credential is bound to; defaults per kind (api.github.com · amazonaws.com · googleapis.com). */
+  host?: string;
+  /** github_app: non-secret ids (the private key stays on the machine: VET_GITHUB_APP_KEY_FILE); repositories and permissions scope the token. */
+  appId?: string; installationId?: string; repositories?: string[]; permissions?: Record<string, string>;
+  /** aws_sts: the role to assume, lifetime (900–3600 s) and an optional inline session policy (JSON) that narrows it further. */
+  roleArn?: string; durationSeconds?: number; sessionPolicy?: string;
+  /** gcp_impersonate: the service account and scopes; lifetime in seconds (≤ 3600). */
+  serviceAccount?: string; scopes?: string[];
 }
 export type ToolAction = "allow" | "deny" | "approve";
 export interface ToolRule { match: string; action: ToolAction; reason?: string }
-export const DEFAULT_RUNTIME: RuntimePolicy = { network: "observe", newHost: "warn", secrets: "broker", blockedVersions: "refuse", tools: [], defaultToolAction: "allow", approvalTimeoutSeconds: 300 };
+export const DEFAULT_RUNTIME: RuntimePolicy = { network: "observe", newHost: "warn", secrets: "broker", blockedVersions: "refuse", tools: [], defaultToolAction: "allow", approvalTimeoutSeconds: 300, exchange: [] };
 /** Tool names that change or destroy state: the strict runtime policy holds them for approval. */
 export const DESTRUCTIVE_TOOL_GLOBS = ["delete_*", "*_delete", "remove_*", "drop_*", "destroy_*", "purge_*", "force_push*", "*_force", "execute_sql", "run_sql", "run_query", "send_email", "send_message", "transfer_*", "pay_*", "deploy_*", "rotate_*", "revoke_*"];
 export type CoverageLevel = "full" | "startup_only" | "install_failed" | "install_only" | "static_only";
@@ -223,6 +243,20 @@ export function parsePolicyYaml(text: string): Policy {
     tools,
     defaultToolAction: str(rt.default_tool_action, ["allow", "deny", "approve"] as const, DEFAULT_RUNTIME.defaultToolAction),
     approvalTimeoutSeconds: Math.min(3600, Math.max(10, num(rt.approval_timeout_seconds, DEFAULT_RUNTIME.approvalTimeoutSeconds))),
+    exchange: Array.isArray(rt.exchange) ? rt.exchange.flatMap((e) => {
+      if (!e || typeof e !== "object") return [];
+      const o = e as Record<string, unknown>;
+      if (typeof o.var !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(o.var) || !["github_app", "aws_sts", "gcp_impersonate"].includes(String(o.kind))) return [];
+      const sv = (k: string) => (typeof o[k] === "string" ? (o[k] as string).slice(0, 400) : undefined);
+      const r: ExchangeRule = { var: o.var, kind: o.kind as ExchangeKind };
+      if (sv("host")) r.host = sv("host")!.toLowerCase();
+      if (sv("app_id")) r.appId = sv("app_id"); if (sv("installation_id")) r.installationId = sv("installation_id");
+      if (Array.isArray(o.repositories)) r.repositories = o.repositories.map(String).slice(0, 100);
+      if (o.permissions && typeof o.permissions === "object") r.permissions = Object.fromEntries(Object.entries(o.permissions as Record<string, unknown>).filter(([, v]) => typeof v === "string").map(([k, v]) => [k, String(v)]).slice(0, 50));
+      if (sv("role_arn")) r.roleArn = sv("role_arn"); if (typeof o.duration_seconds === "number") r.durationSeconds = Math.min(3600, Math.max(900, o.duration_seconds)); if (sv("session_policy")) r.sessionPolicy = typeof o.session_policy === "string" ? (o.session_policy as string).slice(0, 4000) : undefined;
+      if (sv("service_account")) r.serviceAccount = sv("service_account"); if (Array.isArray(o.scopes)) r.scopes = o.scopes.map(String).slice(0, 20);
+      return [r];
+    }).slice(0, 50) : [],
   };
   return {
     name: typeof y.name === "string" ? y.name : DEFAULT_POLICY.name,
@@ -263,7 +297,7 @@ export function serializePolicyYaml(p: Policy): string {
     agents: p.agents,
     approvals: { ttl_days: p.approvals.ttlDays, blocked_exception_approvers: p.approvals.blockedExceptionApprovers },
     context: p.context ?? DEFAULT_CONTEXT,
-    runtime: { network: p.runtime.network, new_host: p.runtime.newHost, secrets: p.runtime.secrets, blocked_versions: p.runtime.blockedVersions, default_tool_action: p.runtime.defaultToolAction, approval_timeout_seconds: p.runtime.approvalTimeoutSeconds, tools: p.runtime.tools.map((t) => ({ match: t.match, action: t.action, ...(t.reason ? { reason: t.reason } : {}) })) },
+    runtime: { network: p.runtime.network, new_host: p.runtime.newHost, secrets: p.runtime.secrets, blocked_versions: p.runtime.blockedVersions, default_tool_action: p.runtime.defaultToolAction, approval_timeout_seconds: p.runtime.approvalTimeoutSeconds, tools: p.runtime.tools.map((t) => ({ match: t.match, action: t.action, ...(t.reason ? { reason: t.reason } : {}) })), ...(p.runtime.exchange.length ? { exchange: p.runtime.exchange.map((e) => ({ var: e.var, kind: e.kind, ...(e.host ? { host: e.host } : {}), ...(e.appId ? { app_id: e.appId } : {}), ...(e.installationId ? { installation_id: e.installationId } : {}), ...(e.repositories ? { repositories: e.repositories } : {}), ...(e.permissions ? { permissions: e.permissions } : {}), ...(e.roleArn ? { role_arn: e.roleArn } : {}), ...(e.durationSeconds ? { duration_seconds: e.durationSeconds } : {}), ...(e.sessionPolicy ? { session_policy: e.sessionPolicy } : {}), ...(e.serviceAccount ? { service_account: e.serviceAccount } : {}), ...(e.scopes ? { scopes: e.scopes } : {}) })) } : {}) },
   });
 }
 

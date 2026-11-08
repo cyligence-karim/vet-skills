@@ -50,6 +50,15 @@ $ vet-skills guard status
 $ vet-skills guard uninstall                 # originals back (also kept in ~/.vet-skills/guard/backup)
 ```
 
+**Short-lived credentials** (`runtime.exchange` in the policy): instead of
+brokering the long-lived value, the guard trades it before launch for a scoped
+token that lives minutes — a GitHub App installation token (repositories and
+permissions from the policy), an AWS STS role session (`aws sts assume-role`),
+or a GCP impersonated access token (`gcloud`) — binds that to the vendor host,
+renews it in long sessions and revokes it at exit where the vendor allows. The
+server holds a placeholder for a credential that is dead within the hour. The
+App key, AWS profile and gcloud login stay on the machine and are only read to mint.
+
 Limits, stated: remote (http/sse) servers are not wrapped; a client that
 ignores `HTTPS_PROXY` is not seen by the proxy; a client that pins certificates
 is tunnelled opaquely after its first refused handshake, so placeholders sent to

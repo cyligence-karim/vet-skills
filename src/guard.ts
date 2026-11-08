@@ -25,6 +25,8 @@ import { dirname, join } from "node:path";
 import { approvalCreate, approvalPoll, guardReport, guardSighting, launchCheck, resolveSkill, type GuardSessionReport } from "./api.js";
 import { guard, parseRunArgs, type GuardEvent, type RunOptions } from "./run.js";
 import { HOME, VERSION, clientId, readOrg, readPolicy, telemetryEnabled, type ResolveResponse } from "./state.js";
+import { mint, secretsSpecFor, type Minted } from "./exchange.js";
+import type { SecretBinding } from "./broker.js";
 import type { ToolRule } from "./policy/index.js";
 
 export type GuardClient = "claude-code" | "claude-desktop" | "cursor" | "windsurf" | "gemini" | "codex" | "vscode";
@@ -302,8 +304,26 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
     report.launch = "warned"; report.launch_reason = why;
     log(`⚠ launching ${a.server} although ${why} (policy runtime.blocked_versions: warn)`);
   }
+  // Short-lived credentials first: a policy exchange rule for a variable this server wants replaces the long-lived value
+  // in our environment with a minted, scoped, minutes-long token; the broker then binds that. Failure falls back to the
+  // long-lived value under the broker, and says so.
+  const wants = new Set<string>([...(v?.credentials?.env.filter((e) => e.kind === "credential").map((e) => e.name) ?? []), ...(v?.trace_summary?.coverage?.needs ?? []).filter((n) => /^[A-Z][A-Z0-9_]+$/.test(n))]);
+  const minted: Minted[] = [];
+  for (const rule of rt.exchange) {
+    const applies = wants.has(rule.var) || !!process.env[rule.var] || (rule.kind === "aws_sts" && (wants.has("AWS_ACCESS_KEY_ID") || !!process.env.AWS_ACCESS_KEY_ID));
+    if (!applies) continue;
+    try {
+      const m = await mint(rule);
+      for (const [k, val] of Object.entries(m.values)) process.env[k] = val;
+      minted.push(m);
+      const mins = Math.max(1, Math.round((m.expiresAt.getTime() - Date.now()) / 60_000));
+      report.secrets.push({ name: rule.var, host: m.host, refused: false, exchange: { kind: m.kind, scope: m.scope, expires: m.expiresAt.toISOString() } });
+      log(`exchanged ${rule.var} for a ${mins}-minute ${m.kind.replace("_", " ")} credential (${m.scope}); the long-lived value stays on this machine`);
+    } catch (e) { log(`⚠ ${rule.var}: ${(e as Error).message}; falling back to the long-lived value under the broker`); }
+  }
   // Secrets: the variables the verdict names as credentials, present in this environment, bound to the vendor's hosts.
   let secrets = a.secrets;
+  if (minted.length) secrets = [secretsSpecFor(minted), a.secrets].filter(Boolean).join(",");
   if (!secrets && rt.secrets === "broker" && v?.credentials) {
     const own = v.credentials.hosts.filter((h) => h.own).map((h) => registrableDomain(h.host));
     const implied = (v.trace_summary?.egress_hosts ?? []).map((h) => h.implied).filter((x): x is string => !!x);
@@ -322,8 +342,10 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   const rules: ToolRule[] = rt.tools;
   const approver = org ? makeApprover({ server: a.server, pkg: report.pkg, semver, session, timeout: rt.approvalTimeoutSeconds, log }) : undefined;
   const sessionHosts = new Set<string>();
+  let live: SecretBinding[] = [];
   const opts: RunOptions = {
-    deny: [], net: enforce ? known : known, observe: !enforce, label: a.server, query, secrets, opaque, ownHosts, toolRules: rules, defaultToolAction: rt.defaultToolAction, approver,
+    deny: [], net: known, observe: !enforce, label: a.server, query, secrets, opaque, ownHosts, toolRules: rules, defaultToolAction: rt.defaultToolAction, approver,
+    onBindings: (b) => { live = b; },
     log,
     onEvent: (e: GuardEvent) => {
       appendGuardLog({ ...e, session, server: a.server, pkg: report.pkg, semver });
@@ -339,8 +361,26 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   appendGuardLog({ kind: "start", session, server: a.server, client: a.client, pkg: report.pkg, semver, label: v?.verdict?.label ?? null, coverage: v?.trace_summary?.coverage?.level ?? null, enforce, secrets: secrets ? secrets.split(",").map((s) => s.split("=")[0]) : [] });
   log(`${a.server} → ${pkg}${semver ? `@${semver}` : ""}${v?.verdict ? ` · ${v.verdict.label} ${v.verdict.score}` : " · no verdict on record"}${v?.trace_summary?.coverage ? ` · ${v.trace_summary.coverage.level.replace("_", " ")}` : ""} · policy ${policy.name} (${source})`);
   const timer = setInterval(() => { flush(false).catch(() => null); }, 5 * 60_000); timer.unref();
+  // Renewal: a minted credential nearing expiry in a long session is minted again and swapped into the live bindings;
+  // the server keeps its placeholder and never notices.
+  const renew = setInterval(async () => {
+    for (let i = 0; i < minted.length; i++) {
+      const m = minted[i];
+      if (m.expiresAt.getTime() - Date.now() > 3 * 60_000) continue;
+      const rule = rt.exchange.find((r) => Object.keys(m.values).includes(r.var) || (r.kind === "aws_sts" && m.kind === "aws_sts"));
+      if (!rule) continue;
+      try {
+        const fresh = await mint(rule);
+        for (const [k, val] of Object.entries(fresh.values)) { const b = live.find((x) => x.name === k); if (b) b.value = val; }
+        await m.revoke?.().catch(() => null);
+        minted[i] = fresh;
+        log(`renewed ${rule.var} (${fresh.kind.replace("_", " ")}, expires ${fresh.expiresAt.toISOString().slice(11, 16)} UTC)`);
+      } catch (e) { log(`⚠ could not renew ${rule.var}: ${(e as Error).message}; the current token expires ${m.expiresAt.toISOString().slice(11, 16)} UTC`); }
+    }
+  }, 60_000); renew.unref();
   const code = await guard(parsed.cmd, opts);
-  clearInterval(timer);
+  clearInterval(timer); clearInterval(renew);
+  for (const m of minted) { await m.revoke?.().catch(() => null); if (m.revoke) log(`revoked the ${m.kind.replace("_", " ")} credential minted for this session`); }
   // Baseline: the hosts this version reached on this machine, so the next session knows what is new.
   const b = readBaseline(); const cur = b[key] ?? { hosts: [], sessions: 0, last: started };
   cur.hosts = [...new Set([...cur.hosts, ...sessionHosts])].slice(0, 200); cur.sessions += 1; cur.last = new Date().toISOString(); b[key] = cur; writeBaseline(b);

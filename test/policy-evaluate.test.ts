@@ -135,3 +135,12 @@ test("runtime clause: parsed with defaults, round-trips, and tool rules match to
   const back = parsePolicyYaml(serializePolicyYaml(y));
   assert.deepEqual(back.runtime, y.runtime);
 });
+
+test("runtime.exchange: parsed, bounded and round-tripped", () => {
+  const y = parsePolicyYaml("name: x\nruntime:\n  exchange:\n    - var: GITHUB_TOKEN\n      kind: github_app\n      app_id: '12345'\n      installation_id: '678'\n      repositories: [acme/api]\n      permissions: { contents: read, pull_requests: write }\n    - var: AWS_ACCESS_KEY_ID\n      kind: aws_sts\n      role_arn: arn:aws:iam::1:role/agent\n      duration_seconds: 120\n    - var: bad kind\n      kind: nope\n");
+  assert.equal(y.runtime.exchange.length, 2);
+  assert.equal(y.runtime.exchange[0].kind, "github_app"); assert.deepEqual(y.runtime.exchange[0].repositories, ["acme/api"]); assert.equal(y.runtime.exchange[0].permissions?.contents, "read");
+  assert.equal(y.runtime.exchange[1].durationSeconds, 900, "AWS minimum is 900 s");
+  assert.deepEqual(parsePolicyYaml(serializePolicyYaml(y)).runtime.exchange, y.runtime.exchange);
+  assert.deepEqual(parsePolicyYaml("name: x\n").runtime.exchange, []);
+});

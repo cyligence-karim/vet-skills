@@ -77,7 +77,7 @@ export interface GuardSessionReport {
   started: string; ended: string | null; final: boolean; exit_code: number | null; machine: string; cwd_hash: string | null;
   hosts: { host: string; port: number; mode: string; expected: boolean; first_seen_here: boolean }[];
   tools: { tool: string; calls: number; denied: number; approved: number }[];
-  secrets: { name: string; host: string; refused: boolean }[];
+  secrets: { name: string; host: string; refused: boolean; exchange?: { kind: string; scope: string; expires: string } }[];
   canary: boolean; poison: string[]; launch: "ran" | "refused" | "warned"; launch_reason: string | null;
   guard_version: string; policy_version: number | null;
 }
