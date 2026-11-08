@@ -107,6 +107,11 @@ export function approvalPoll(id: string) {
   return call<{ status: "pending" | "approved" | "denied" | "expired"; by: string | null }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/tool-approvals/${id}`, { headers: orgHeaders() }, 6000);
 }
 
+/** One-time activation signal when the guard is installed on a machine: counts and client names, nothing else. Telemetry opt-out applies. */
+export function funnelGuardInstall(body: { servers: number; clients: string[]; version: string; os: string }) {
+  return call<{ ok: true }>(`/api/v1/funnel`, { method: "POST", body: JSON.stringify({ kind: "guard_install", ...body }) }, 4000);
+}
+
 export function confirmRemoval(removalId: string, body: { status: "confirmed" | "failed"; detail?: string }) {
   const org = readOrg();
   if (!org) return Promise.resolve<ApiResult<{ ok: boolean }>>({ ok: false, error: "not joined", offline: false });

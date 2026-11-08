@@ -34,7 +34,7 @@
  */
 import { parseArgs } from "node:util";
 import { spawnSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve, join, dirname, basename } from "node:path";
 import { hostname, platform, userInfo } from "node:os";
 import { createHash } from "node:crypto";
@@ -58,6 +58,7 @@ import { observe, pruneSessions, readDeviations, readAllows, recordPrompt, revok
 import { plantCanaries, readCanaries, removeCanaries } from "./canary.js";
 import { execGuarded, guardStatus, installGuard, parseExecArgs, uninstallGuard } from "./guard.js";
 import { guardPosture } from "./sync.js";
+import { funnelGuardInstall } from "./api.js";
 import { homedir } from "node:os";
 import { c } from "./render.js";
 
@@ -187,6 +188,7 @@ async function main(): Promise<number> {
       if (sub === "install" || sub === undefined) {
         const touched = installGuard({ project });
         const total = touched.reduce((n, t) => n + t.wrapped.length, 0);
+        if (total && telemetryEnabled() && !existsSync(join(HOME, "guard", "activated"))) { try { mkdirSync(join(HOME, "guard"), { recursive: true }); writeFileSync(join(HOME, "guard", "activated"), new Date().toISOString()); } catch { /* ignore */ } await funnelGuardInstall({ servers: total, clients: [...new Set(touched.filter((t) => t.wrapped.length).map((t) => t.client))], version: VERSION, os: process.platform }).catch(() => null); }
         for (const t of touched) {
           if (t.wrapped.length) console.log(`${c.verified("✓")} ${t.client}: ${t.wrapped.join(", ")} now run under the guard (${t.file})`);
           for (const sk of t.skipped) console.log(c.muted(`  ${t.client}: ${sk.name} skipped — ${sk.why}`));
