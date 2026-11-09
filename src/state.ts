@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_POLICY, SOLO_POLICY, parsePolicyYaml, serializePolicyYaml, type Policy } from "./policy/index.js";
 
-export const VERSION = "0.8.2";
+export const VERSION = "0.8.3";
 export const HOME = process.env.VET_SKILLS_HOME ?? join(homedir(), ".vet-skills");
 export const API = (process.env.KILLERSKILLS_API ?? "https://killerskills.ai").replace(/\/$/, "");
 

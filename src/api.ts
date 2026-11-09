@@ -80,6 +80,8 @@ export interface GuardSessionReport {
   secrets: { name: string; host: string; refused: boolean; exchange?: { kind: string; scope: string; expires: string } }[];
   canary: boolean; poison: string[]; launch: "ran" | "refused" | "warned"; launch_reason: string | null;
   guard_version: string; policy_version: number | null;
+  /** Per-call decisions (deny/held always; allow folded per tool and minute). Key names only. */
+  decisions?: { tool: string; outcome: "allow" | "deny" | "held"; rule: string; at: string; count: number; reply_observed: boolean | null; approval_id: string | null; disposition: string | null; arg_keys: string[] }[];
 }
 export function guardReport(body: GuardSessionReport) {
   const org = readOrg();

@@ -41,7 +41,7 @@ export interface RunOptions {
   /** Hosts that must be tunnelled opaquely (the client pins certificates); learned at runtime and persisted by the caller. */ opaque?: string[];
   /** Typed events for the runtime log (guard.ts). */ onEvent?: (e: GuardEvent) => void;
   /** Tool-call rules beyond `deny`: first match wins; `approve` calls `approver` and waits. */ toolRules?: ToolRule[]; defaultToolAction?: ToolAction;
-  /** Decides a held tool call; resolves to true (run) or false (deny). Absent ⇒ approve behaves as deny with a notice. */ approver?: (call: { server: string; tool: string; args: Record<string, unknown>; rule: ToolRule | null }) => Promise<{ allowed: boolean; by: string }>;
+  /** Decides a held tool call; resolves to true (run) or false (deny). Absent ⇒ approve behaves as deny with a notice. */ approver?: (call: { server: string; tool: string; args: Record<string, unknown>; rule: ToolRule | null }) => Promise<{ allowed: boolean; by: string; id?: string }>;
   /** Hosts the server's own code names (from the verdict's credential surface), to label a contacted host as its own. */ ownHosts?: string[];
   /** The live bindings once parsed, so the caller can rotate `value` in place (short-lived credential renewal). */ onBindings?: (bindings: SecretBinding[]) => void;
 }
@@ -50,7 +50,8 @@ export type HostMode = "brokered" | "tunnel" | "plain" | "opaque";
 export type GuardEvent =
   | { kind: "host"; host: string; port: number; mode: HostMode; expected: boolean }
   | { kind: "blocked"; host: string }
-  | { kind: "tool_call"; tool: string; args: string[]; action: "allowed" | "denied" | "approved" | "refused" | "held"; by?: string; reason?: string }
+  | { kind: "tool_call"; tool: string; args: string[]; action: "allowed" | "denied" | "approved" | "refused" | "held"; by?: string; reason?: string; /** JSON-RPC id, so a later reply can be matched. */ id?: number | string; /** The rule glob that decided it ("default" when none matched). */ rule?: string; approvalId?: string }
+  | { kind: "tool_reply"; tool: string; id: number | string }
   | { kind: "secret"; name: string; host: string; refused: boolean }
   | { kind: "canary"; where: string; tool: string }
   | { kind: "poison"; tool: string; summary: string }
@@ -278,7 +279,7 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
       const rule = toolRuleFor(rules, opts.label, name);
       const action: ToolAction = rule?.action ?? opts.defaultToolAction ?? "allow";
       if (action === "deny") {
-        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: rule ? `policy rule ${rule.match}${rule.reason ? ` (${rule.reason})` : ""}` : "policy default" });
+        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: rule ? `policy rule ${rule.match}${rule.reason ? ` (${rule.reason})` : ""}` : "policy default", id: m.id, rule: rule?.match ?? "default" });
         log(`denied tools/call ${name} (policy${rule ? `: ${rule.match}` : ""})`);
         refuse(m.id, -32601, `Tool "${name}" is denied by your organization's runtime policy${rule?.reason ? `: ${rule.reason}` : ""}.`);
         return;
@@ -290,22 +291,22 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
           refuse(m.id, -32601, `Tool "${name}" needs approval under the runtime policy and no approver is configured on this machine.`);
           return;
         }
-        emit({ kind: "tool_call", tool: name, args: keys, action: "held", reason: rule?.reason });
+        emit({ kind: "tool_call", tool: name, args: keys, action: "held", reason: rule?.reason, id: m.id, rule: rule?.match ?? "default" });
         log(`holding tools/call ${name} for approval${rule?.reason ? ` (${rule.reason})` : ""}…`);
         const d = await opts.approver({ server: opts.label, tool: name, args, rule }).catch((e: Error) => ({ allowed: false, by: `error: ${e.message}` }));
         if (!d.allowed) {
-          deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", by: d.by, reason: "approval denied or timed out" });
+          deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", by: d.by, reason: "approval denied or timed out", id: m.id, rule: rule?.match ?? "default", approvalId: (d as { id?: string }).id });
           log(`✕ tools/call ${name} denied (${d.by})`);
           refuse(m.id, -32601, `Tool "${name}" was not approved (${d.by}).`);
           return;
         }
-        record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "approved", by: d.by });
+        record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "approved", by: d.by, id: m.id, rule: rule?.match ?? "default", approvalId: (d as { id?: string }).id });
         log(`tools/call ${name} approved by ${d.by}`);
         if (m.id !== undefined) pending.set(m.id, name);
         child.stdin.write(line + "\n");
         return;
       }
-      record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "allowed" });
+      record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "allowed", id: m.id, rule: rule?.match ?? "default" });
       if (m.id !== undefined) pending.set(m.id, name);
     }
     child.stdin.write(line + "\n");
@@ -342,6 +343,7 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
         }
       } else if (m.id !== undefined && pending.has(m.id)) {
         const tool = pending.get(m.id)!; pending.delete(m.id);
+        emit({ kind: "tool_reply", tool, id: m.id });
         const leak = canariesIn(line, canaryReg);
         if (leak.length && !warned.has(`canary|${tool}`)) { warned.add(`canary|${tool}`); record(opts.label, tool, [], false); emit({ kind: "canary", where: "result", tool }); log(`✕ ${describeCanary(leak[0])} value in the result of ${tool}: the server read a decoy credential file on this machine. Treat ${opts.label} as hostile.`); }
         const f = hiddenTextFindings(JSON.stringify(m.result.content ?? m.result), { phrases: true }).filter((x) => x.severity !== "medium");

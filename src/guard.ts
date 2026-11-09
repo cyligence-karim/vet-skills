@@ -279,6 +279,11 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   const key = `${registry ?? "?"}:${pkg}@${semver ?? "?"}`;
   const report: GuardSessionReport = { session, server: a.server, client: a.client, pkg: v ? pkg : null, registry, semver, started, ended: null, final: false, exit_code: null, machine: clientId(), cwd_hash: createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16), hosts: [], tools: [], secrets: [], canary: false, poison: [], launch: "ran", launch_reason: null, guard_version: VERSION, policy_version: org?.policyVersion ?? null };
   const toolStats = new Map<string, { tool: string; calls: number; denied: number; approved: number }>();
+  // Per-call decisions for the org's record: deny and held always one row; allow folded per (tool, minute) with a count
+  // unless the org asked for full capture. Argument key names only. Replies are matched by JSON-RPC id.
+  const decisions: NonNullable<GuardSessionReport["decisions"]> = [];
+  const byRpcId = new Map<string, number>();
+  const fullCapture = process.env.VET_SKILLS_FULL_DECISIONS === "1";
   const flush = async (final: boolean) => {
     report.final = final; report.ended = final ? new Date().toISOString() : null;
     appendGuardLog({ kind: final ? "session" : "progress", session, server: a.server, client: a.client, pkg: report.pkg, semver, hosts: report.hosts.length, tools: [...toolStats.values()].reduce((n, t) => n + t.calls, 0), secrets: report.secrets.length, canary: report.canary, exit: report.exit_code });
@@ -350,7 +355,23 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
     onEvent: (e: GuardEvent) => {
       appendGuardLog({ ...e, session, server: a.server, pkg: report.pkg, semver });
       if (e.kind === "host") { const first = !prior.includes(e.host); sessionHosts.add(e.host); report.hosts.push({ host: e.host, port: e.port, mode: e.mode, expected: e.expected, first_seen_here: first }); if (!e.expected && first && rt.newHost !== "allow" && base[key]?.sessions) log(`⚠ new host for ${pkg}${semver ? `@${semver}` : ""}: ${e.host} — never seen in ${base[key].sessions} earlier session${base[key].sessions === 1 ? "" : "s"} on this machine${v?.skill.page ? ` · https://killerskills.ai${v.skill.page}` : ""}`); }
-      else if (e.kind === "tool_call") { const t = toolStats.get(e.tool) ?? { tool: e.tool, calls: 0, denied: 0, approved: 0 }; t.calls++; if (e.action === "denied" || e.action === "refused") t.denied++; if (e.action === "approved") t.approved++; toolStats.set(e.tool, t); report.tools = [...toolStats.values()]; }
+      else if (e.kind === "tool_call") {
+        const t = toolStats.get(e.tool) ?? { tool: e.tool, calls: 0, denied: 0, approved: 0 }; t.calls++; if (e.action === "denied" || e.action === "refused") t.denied++; if (e.action === "approved") t.approved++; toolStats.set(e.tool, t); report.tools = [...toolStats.values()];
+        const now = new Date();
+        const outcome = e.action === "allowed" ? "allow" : e.action === "approved" ? "held" : e.action === "held" ? "held" : "deny";
+        if (e.action === "held") { /* the outcome row is written when the approval resolves (approved/denied event follows) */ }
+        else if (outcome === "allow" && !fullCapture) {
+          const minute = now.toISOString().slice(0, 16);
+          const idx = decisions.findIndex((d) => d.outcome === "allow" && d.tool === e.tool && d.at.slice(0, 16) === minute);
+          if (idx >= 0) { decisions[idx].count++; if (e.id !== undefined) byRpcId.set(String(e.id), idx); }
+          else { decisions.push({ tool: e.tool, outcome: "allow", rule: e.rule ?? "default", at: now.toISOString(), count: 1, reply_observed: null, approval_id: null, disposition: null, arg_keys: e.args.slice(0, 20) }); if (e.id !== undefined) byRpcId.set(String(e.id), decisions.length - 1); }
+        } else {
+          decisions.push({ tool: e.tool, outcome, rule: e.action === "refused" ? "canary" : e.reason === "--deny" ? "--deny" : (e.rule ?? "default"), at: now.toISOString(), count: 1, reply_observed: e.action === "approved" ? false : null, approval_id: e.approvalId ?? null, disposition: e.action === "approved" ? "approved" : e.action === "denied" && e.approvalId ? "denied" : null, arg_keys: e.args.slice(0, 20) });
+          if (e.id !== undefined && e.action !== "denied" && e.action !== "refused") byRpcId.set(String(e.id), decisions.length - 1);
+        }
+        report.decisions = decisions.slice(-2000);
+      }
+      else if (e.kind === "tool_reply") { const idx = byRpcId.get(String(e.id)); if (idx !== undefined && decisions[idx]) { decisions[idx].reply_observed = true; byRpcId.delete(String(e.id)); } }
       else if (e.kind === "secret") report.secrets.push({ name: e.name, host: e.host, refused: e.refused });
       else if (e.kind === "canary") report.canary = true;
       else if (e.kind === "poison") report.poison.push(`${e.tool}: ${e.summary}`);
@@ -394,6 +415,7 @@ function makeApprover(ctx: { server: string; pkg: string | null; semver: string 
     const preview = Object.entries(args).slice(0, 8).map(([k, val]) => `${k}=${typeof val === "string" ? JSON.stringify(val.slice(0, 60)) : Array.isArray(val) ? `[${val.length}]` : typeof val}`).join(" ");
     const c = await approvalCreate({ server: ctx.server, pkg: ctx.pkg, semver: ctx.semver, tool, arg_keys: Object.keys(args), arg_preview: preview.slice(0, 400), reason: rule?.reason ?? null, session: ctx.session, timeout_seconds: ctx.timeout });
     if (!c.ok) return { allowed: false, by: `approval request failed (${c.error}); denied` };
+    const approvalId = c.data.id;
     ctx.log(`approval requested for ${tool}: ${c.data.url}`);
     const deadline = Date.now() + ctx.timeout * 1000;
     let wait = 2000;
@@ -401,11 +423,11 @@ function makeApprover(ctx: { server: string; pkg: string | null; semver: string 
       await new Promise((res) => setTimeout(res, wait)); wait = Math.min(10_000, wait * 1.5);
       const p = await approvalPoll(c.data.id);
       if (!p.ok) continue;
-      if (p.data.status === "approved") return { allowed: true, by: p.data.by ?? "approver" };
-      if (p.data.status === "denied") return { allowed: false, by: p.data.by ? `denied by ${p.data.by}` : "denied" };
+      if (p.data.status === "approved") return { allowed: true, by: p.data.by ?? "approver", id: approvalId };
+      if (p.data.status === "denied") return { allowed: false, by: p.data.by ? `denied by ${p.data.by}` : "denied", id: approvalId };
       if (p.data.status === "expired") break;
     }
-    return { allowed: false, by: `no decision within ${ctx.timeout}s` };
+    return { allowed: false, by: `no decision within ${ctx.timeout}s`, id: approvalId };
   };
 }
 
