@@ -5,8 +5,8 @@ Check agent skills and MCP servers before they run. Verdicts come from
 
 ```
 npm i -g vet-skills                          # the CLI (Node 20+)
-vet-skills guard install                     # every MCP server in Claude Code, Cursor, Windsurf, Codex, Gemini CLI, Grok CLI, Claude Desktop runs under the guard
-vet-skills hook install all                  # Claude Code, Cursor, Codex, Windsurf, Gemini CLI, Grok CLI: install check, runtime observation, canaries
+vet-skills guard install                     # every MCP server in 14 agents (Claude Code, Cursor, Codex, Gemini, Grok, Copilot, Kiro, Qwen, Cline, Zed, Amp, OpenCode, Windsurf, Claude Desktop) runs under the guard
+vet-skills hook install all                  # Claude Code, Cursor, Codex, Windsurf, Gemini CLI, Grok CLI, Copilot CLI, Kiro and Qwen Code: install check, runtime observation, canaries
 vet-skills check <skill>                     # or just ask before you add one
 vet-skills publish ./my-skill                # org members: detonate + list in the private registry
 ```
@@ -15,7 +15,7 @@ vet-skills publish ./my-skill                # org members: detonate + list in t
 
 An MCP server is third-party code running on your machine with your tokens in
 its environment. `vet-skills guard install` rewrites the MCP configs of Claude
-Code, Claude Desktop, Cursor, Windsurf, Gemini CLI, Codex and Grok CLI so every stdio
+Code, Claude Desktop, Cursor, Windsurf, Gemini CLI, Codex, Grok CLI, Copilot CLI, Kiro, Qwen Code, Cline, Zed, Amp and OpenCode so every stdio
 server starts as `vet-skills guard exec … -- <original command>`. The agent
 talks to the guard; the guard talks to the server. On every launch:
 
@@ -238,7 +238,7 @@ judges intent: the rule is the match, and it is printed.
 vet-skills discover            # every MCP server, skill, plugin and hook on this machine, with verdicts
 ```
 
-Reads Claude Code, Cursor, Windsurf, Claude Desktop, Gemini CLI, Codex and Grok CLI configs
+Reads Claude Code, Claude Desktop, Cursor, Windsurf, Codex, Gemini CLI, Grok CLI, Copilot CLI, Kiro, Qwen Code, Cline, Zed, Amp and OpenCode and Continue configs
 locally. Each server and skill name is looked up for its verdict; nothing else leaves
 the machine. When you are enrolled in an org, the list of names is also reported to
 your team's Discovery page. Environment values, arguments and file contents never are.

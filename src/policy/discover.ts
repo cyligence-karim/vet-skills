@@ -20,7 +20,7 @@ export interface Component {
   path: string;
   scope: "project" | "user";
   /** Agent the file belongs to. */
-  agent: "claude_code" | "cursor" | "vscode" | "windsurf" | "claude_desktop" | "gemini_cli" | "codex" | "grok" | "copilot" | "any";
+  agent: "claude_code" | "cursor" | "vscode" | "windsurf" | "claude_desktop" | "gemini_cli" | "codex" | "grok" | "copilot" | "kiro" | "qwen" | "cline" | "zed" | "amp" | "opencode" | "continue" | "any";
   transport?: "stdio" | "http";
   /** The package a stdio server runs, when it is a registry package (npx / uvx / docker). */
   package?: { registry: "npm" | "pypi" | "docker"; name: string };
@@ -50,6 +50,14 @@ const PROJECT_FILES: { re: RegExp; agent: Component["agent"] }[] = [
   { re: /(^|\/)\.grok\/config\.toml$/, agent: "grok" },
   { re: /(^|\/)\.grok\/hooks\/[^/]+\.json$/, agent: "grok" },
   { re: /(^|\/)\.github\/copilot-instructions\.md$/, agent: "copilot" },
+  { re: /(^|\/)\.github\/(mcp|hooks\/[^/]+)\.json$/, agent: "copilot" },
+  { re: /(^|\/)\.kiro\/(settings\/mcp|hooks\/[^/]+)\.json$/, agent: "kiro" },
+  { re: /(^|\/)\.qwen\/settings\.json$/, agent: "qwen" },
+  { re: /(^|\/)\.cline\/hooks\/[^/]+$/, agent: "cline" },
+  { re: /(^|\/)\.zed\/settings\.json$/, agent: "zed" },
+  { re: /(^|\/)\.amp\/settings\.jsonc?$/, agent: "amp" },
+  { re: /(^|\/)(\.opencode\/)?opencode\.jsonc?$/, agent: "opencode" },
+  { re: /(^|\/)\.continue\/(config\.yaml|mcpServers\/[^/]+\.yaml)$/, agent: "continue" },
   { re: /(^|\/)(CLAUDE|AGENTS|GEMINI)\.md$/, agent: "any" },
   { re: /(^|\/)\.(cursorrules|windsurfrules|clinerules)$/, agent: "any" },
 ];
@@ -64,6 +72,17 @@ export const USER_CONFIG_FILES: { path: string; agent: Component["agent"] }[] = 
   { path: ".gemini/settings.json", agent: "gemini_cli" },
   { path: ".codex/config.toml", agent: "codex" },
   { path: ".grok/config.toml", agent: "grok" },
+  { path: ".copilot/mcp-config.json", agent: "copilot" },
+  { path: ".kiro/settings/mcp.json", agent: "kiro" },
+  { path: ".qwen/settings.json", agent: "qwen" },
+  { path: ".cline/data/settings/cline_mcp_settings.json", agent: "cline" },
+  { path: "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json", agent: "cline" },
+  { path: ".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json", agent: "cline" },
+  { path: ".config/zed/settings.json", agent: "zed" },
+  { path: ".config/amp/settings.json", agent: "amp" },
+  { path: ".config/opencode/opencode.json", agent: "opencode" },
+  { path: ".config/opencode/opencode.jsonc", agent: "opencode" },
+  { path: ".continue/config.yaml", agent: "continue" },
   { path: "Library/Application Support/Claude/claude_desktop_config.json", agent: "claude_desktop" },
   { path: ".config/Claude/claude_desktop_config.json", agent: "claude_desktop" },
   { path: "AppData/Roaming/Claude/claude_desktop_config.json", agent: "claude_desktop" },
@@ -127,9 +146,10 @@ function serverComponents(servers: unknown, path: string, scope: Component["scop
   for (const [name, raw] of Object.entries(servers).slice(0, 200)) {
     if (!isObj(raw)) continue;
     const url = str(raw.url) ?? str(raw.serverUrl) ?? str(raw.httpUrl);
-    const command = str(raw.command);
-    const args = Array.isArray(raw.args) ? raw.args.filter((a): a is string => typeof a === "string") : [];
-    const envKeys = keysOf(raw.env);
+    const cmdArr = Array.isArray(raw.command) ? raw.command.filter((a): a is string => typeof a === "string") : null;
+    const command = cmdArr ? cmdArr[0] ?? null : str(raw.command);
+    const args = cmdArr ? cmdArr.slice(1) : Array.isArray(raw.args) ? raw.args.filter((a): a is string => typeof a === "string") : [];
+    const envKeys = keysOf(raw.env ?? raw.environment);
     const headerKeys = keysOf(raw.headers);
     if (url) out.push({ kind: "mcp_server", name, path, scope, agent, transport: "http", urlHost: hostOf(url), envKeys, headerKeys });
     else if (command) {
@@ -215,8 +235,12 @@ export function parseAgentConfig(path: string, text: string, scope: Component["s
     return [{ kind: "instructions", name: kind === "instructions" ? base : `${kind}: ${base.replace(/\.md$/i, "")}`, path: p, scope, agent, envKeys: [], headerKeys: [], detail: `${text.length.toLocaleString("en-US")} characters` }];
   }
   if (/config\.toml$/.test(p)) return codexToml(text, p, scope, agent === "grok" ? "grok" : "codex");
+  if (/\.ya?ml$/.test(p)) return continueYaml(text, p, scope);
   const j = parseJsonc(text);
   if (!isObj(j)) return [];
+  if (agent === "zed") return serverComponents(j.context_servers, p, scope, "zed");
+  if (agent === "amp") return serverComponents(j["amp.mcpServers"], p, scope, "amp");
+  if (agent === "opencode" && isObj(j.mcp)) { const mcp = j.mcp as Json; return serverComponents(isObj(mcp.servers) ? mcp.servers : mcp, p, scope, "opencode"); }
   if (/\.claude\/settings(\.local)?\.json$/.test(p)) return claudeSettings(j, p, scope);
   if (/\.vscode\/mcp\.json$/.test(p)) return serverComponents(j.servers, p, scope, "vscode");
   if (base === ".claude.json") {
@@ -226,6 +250,45 @@ export function parseAgentConfig(path: string, text: string, scope: Component["s
     return out;
   }
   return serverComponents(j.mcpServers ?? j.servers, p, scope, agent);
+}
+
+/** Continue's config.yaml / .continue/mcpServers/*.yaml: `mcpServers:` list items with name/command/args/env/url. A small
+ *  line-based reader; nothing else in the file is touched and unknown layouts yield no components rather than wrong ones. */
+function continueYaml(text: string, path: string, scope: Component["scope"]): Component[] {
+  type Cur = { name?: string; command?: string; args: string[]; url?: string; env: string[]; indent: number; pending?: "args" | "env"; pendingIndent: number };
+  const out: Component[] = [];
+  let inList = false; let cur: Cur | null = null;
+  const unquote = (s: string) => s.trim().replace(/^["']|["']$/g, "");
+  const flush = () => {
+    if (!cur) return;
+    if (cur.url) out.push({ kind: "mcp_server", name: cur.name ?? "mcp", path, scope, agent: "continue", transport: "http", urlHost: hostOf(cur.url), envKeys: cur.env, headerKeys: [] });
+    else if (cur.command) out.push({ kind: "mcp_server", name: cur.name ?? cur.command, path, scope, agent: "continue", transport: "stdio", command: cur.command.split(/[\\/]/).pop(), package: stdioPackage(cur.command, cur.args), envKeys: cur.env, headerKeys: [] });
+    cur = null;
+  };
+  const assign = (c: Cur, k: string, v: string, indent: number) => {
+    c.pending = undefined;
+    if (k === "name") c.name = unquote(v); else if (k === "command") c.command = unquote(v); else if (k === "url") c.url = unquote(v);
+    else if (k === "args") { const inline = v.match(/^\[(.*)\]$/); if (inline) c.args = inline[1].split(",").map(unquote).filter(Boolean); else { c.pending = "args"; c.pendingIndent = indent; } }
+    else if (k === "env") { c.pending = "env"; c.pendingIndent = indent; }
+  };
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+#.*$/, "");
+    if (!line.trim()) continue;
+    if (/^mcpServers:\s*$/.test(line)) { inList = true; continue; }
+    if (inList && /^\S/.test(line)) { flush(); inList = false; continue; }
+    if (!inList) continue;
+    const item = line.match(/^(\s*)-\s+(\w+):\s*(.*)$/);
+    if (item) { flush(); cur = { args: [], env: [], indent: item[1].length, pendingIndent: 0 }; assign(cur, item[2], item[3], item[1].length); continue; }
+    if (!cur) continue;
+    const arr = line.match(/^(\s*)-\s*(.+)$/);
+    if (arr && cur.pending === "args" && arr[1].length > cur.pendingIndent) { cur.args.push(unquote(arr[2])); continue; }
+    const kv = line.match(/^(\s*)([\w.-]+):\s*(.*)$/);
+    if (!kv) continue;
+    if (cur.pending === "env" && kv[1].length > cur.pendingIndent) { if (/^[\w.-]{1,120}$/.test(kv[2])) cur.env.push(kv[2]); continue; }
+    if (kv[1].length > cur.indent) assign(cur, kv[2], kv[3], kv[1].length);
+  }
+  flush();
+  return out;
 }
 
 /* --------------------------------------------------------------- blast radius */

@@ -29,8 +29,8 @@ import { mint, secretsSpecFor, type Minted } from "./exchange.js";
 import type { SecretBinding } from "./broker.js";
 import type { ToolRule } from "./policy/index.js";
 
-export type GuardClient = "claude-code" | "claude-desktop" | "cursor" | "windsurf" | "gemini" | "codex" | "grok" | "vscode";
-interface ConfigSpec { path: string; client: GuardClient; format: "mcpServers" | "claude-json" | "vscode" | "codex-toml"; scope: "user" | "project" }
+export type GuardClient = "claude-code" | "claude-desktop" | "cursor" | "windsurf" | "gemini" | "codex" | "grok" | "vscode" | "copilot" | "kiro" | "qwen" | "cline" | "zed" | "amp" | "opencode";
+interface ConfigSpec { path: string; client: GuardClient; format: "mcpServers" | "claude-json" | "vscode" | "codex-toml" | "amp" | "zed" | "opencode"; scope: "user" | "project" }
 
 const GUARD_DIR = join(HOME, "guard");
 const WRAPPED = join(GUARD_DIR, "wrapped.json");
@@ -47,6 +47,18 @@ export function configSpecs(opts: { home?: string; project?: string | null } = {
     { path: join(home, ".gemini", "settings.json"), client: "gemini", format: "mcpServers", scope: "user" },
     { path: join(home, ".codex", "config.toml"), client: "codex", format: "codex-toml", scope: "user" },
     { path: join(home, ".grok", "config.toml"), client: "grok", format: "codex-toml", scope: "user" },
+    { path: join(process.env.COPILOT_HOME ?? join(home, ".copilot"), "mcp-config.json"), client: "copilot", format: "mcpServers", scope: "user" },
+    { path: join(home, ".kiro", "settings", "mcp.json"), client: "kiro", format: "mcpServers", scope: "user" },
+    { path: join(home, ".qwen", "settings.json"), client: "qwen", format: "mcpServers", scope: "user" },
+    { path: process.env.CLINE_MCP_SETTINGS_PATH ?? join(home, ".cline", "data", "settings", "cline_mcp_settings.json"), client: "cline", format: "mcpServers", scope: "user" },
+    { path: join(home, "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"), client: "cline", format: "mcpServers", scope: "user" },
+    { path: join(home, ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"), client: "cline", format: "mcpServers", scope: "user" },
+    { path: join(home, "AppData", "Roaming", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"), client: "cline", format: "mcpServers", scope: "user" },
+    { path: join(process.env.XDG_CONFIG_HOME ?? join(home, ".config"), "zed", "settings.json"), client: "zed", format: "zed", scope: "user" },
+    { path: join(home, "AppData", "Roaming", "Zed", "settings.json"), client: "zed", format: "zed", scope: "user" },
+    { path: join(home, ".config", "amp", "settings.json"), client: "amp", format: "amp", scope: "user" },
+    { path: join(process.env.XDG_CONFIG_HOME ?? join(home, ".config"), "opencode", "opencode.json"), client: "opencode", format: "opencode", scope: "user" },
+    { path: join(process.env.XDG_CONFIG_HOME ?? join(home, ".config"), "opencode", "opencode.jsonc"), client: "opencode", format: "opencode", scope: "user" },
     { path: join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), client: "claude-desktop", format: "mcpServers", scope: "user" },
     { path: join(home, ".config", "Claude", "claude_desktop_config.json"), client: "claude-desktop", format: "mcpServers", scope: "user" },
     { path: join(home, "AppData", "Roaming", "Claude", "claude_desktop_config.json"), client: "claude-desktop", format: "mcpServers", scope: "user" },
@@ -56,13 +68,20 @@ export function configSpecs(opts: { home?: string; project?: string | null } = {
     { path: join(opts.project, ".cursor", "mcp.json"), client: "cursor", format: "mcpServers", scope: "project" },
     { path: join(opts.project, ".vscode", "mcp.json"), client: "vscode", format: "vscode", scope: "project" },
     { path: join(opts.project, ".gemini", "settings.json"), client: "gemini", format: "mcpServers", scope: "project" },
+    { path: join(opts.project, ".github", "mcp.json"), client: "copilot", format: "mcpServers", scope: "project" },
+    { path: join(opts.project, ".kiro", "settings", "mcp.json"), client: "kiro", format: "mcpServers", scope: "project" },
+    { path: join(opts.project, ".qwen", "settings.json"), client: "qwen", format: "mcpServers", scope: "project" },
+    { path: join(opts.project, ".zed", "settings.json"), client: "zed", format: "zed", scope: "project" },
+    { path: join(opts.project, ".amp", "settings.json"), client: "amp", format: "amp", scope: "project" },
+    { path: join(opts.project, "opencode.json"), client: "opencode", format: "opencode", scope: "project" },
+    { path: join(opts.project, ".opencode", "opencode.json"), client: "opencode", format: "opencode", scope: "project" },
   ] : [];
   return [...user, ...project].filter((s) => existsSync(s.path));
 }
 
 type Json = Record<string, unknown>;
 const isObj = (v: unknown): v is Json => !!v && typeof v === "object" && !Array.isArray(v);
-interface ServerEntry { command?: string; args?: string[]; env?: Record<string, string>; url?: string; type?: string; [k: string]: unknown }
+interface ServerEntry { command?: string | string[]; args?: string[]; env?: Record<string, string>; url?: string; type?: string; [k: string]: unknown }
 
 /** The absolute `vet-skills` to put in configs: GUI clients start with a short PATH. Falls back to `npx -y vet-skills@<version>`. */
 export function guardBinary(): { command: string; prefix: string[] } {
@@ -76,11 +95,19 @@ export function guardBinary(): { command: string; prefix: string[] } {
 export const isWrapped = (e: ServerEntry) => Array.isArray(e.args) && e.args.includes("guard") && e.args.includes("exec") && /vet-skills|npx$/.test(String(e.command ?? ""));
 
 function wrapEntry(name: string, client: GuardClient, e: ServerEntry, bin = guardBinary()): ServerEntry | null {
-  if (!e.command || isWrapped(e) || e.url || (e.type && e.type !== "stdio")) return null;
+  if (!e.command || isWrapped(e) || e.url || (e.type && e.type !== "stdio" && e.type !== "local")) return null;
+  if (typeof e.command !== "string" && !Array.isArray(e.command)) return null; // older nested { path, args } shape
+  if (Array.isArray(e.command)) {
+    // OpenCode keeps the whole command line in one array.
+    const cmd = e.command as string[]; if (!cmd.length || isWrappedArray(cmd)) return null;
+    return { ...e, command: [bin.command, ...bin.prefix, "guard", "exec", "--server", name, "--client", client, "--", ...cmd] };
+  }
   return { ...e, command: bin.command, args: [...bin.prefix, "guard", "exec", "--server", name, "--client", client, "--", e.command, ...(e.args ?? [])] };
 }
+const isWrappedArray = (cmd: string[]) => cmd.includes("guard") && cmd.includes("exec") && /vet-skills|npx$/.test(cmd[0] ?? "");
 /** The original command of a wrapped entry, read back from its own args (so uninstall works even without wrapped.json). */
 export function unwrapEntry(e: ServerEntry): ServerEntry | null {
+  if (Array.isArray(e.command)) { const cmd = e.command as string[]; if (!isWrappedArray(cmd)) return null; const i = cmd.indexOf("--"); if (i < 0 || i === cmd.length - 1) return null; return { ...e, command: cmd.slice(i + 1) }; }
   if (!isWrapped(e) || !Array.isArray(e.args)) return null;
   const i = e.args.indexOf("--"); if (i < 0 || i === e.args.length - 1) return null;
   const orig = e.args.slice(i + 1);
@@ -98,6 +125,13 @@ function readJsonc(text: string): unknown {
 /** Every `mcpServers`-shaped map in a config, with a path label for wrapped.json. */
 function serverMaps(spec: ConfigSpec, root: Json): { label: string; map: Json }[] {
   if (spec.format === "vscode") return isObj(root.servers) ? [{ label: "servers", map: root.servers }] : [];
+  if (spec.format === "amp") return isObj(root["amp.mcpServers"]) ? [{ label: "amp.mcpServers", map: root["amp.mcpServers"] as Json }] : [];
+  if (spec.format === "zed") return isObj(root.context_servers) ? [{ label: "context_servers", map: root.context_servers }] : [];
+  if (spec.format === "opencode") {
+    if (!isObj(root.mcp)) return [];
+    const mcp = root.mcp as Json;
+    return isObj(mcp.servers) ? [{ label: "mcp.servers", map: mcp.servers }] : [{ label: "mcp", map: mcp }];
+  }
   const out: { label: string; map: Json }[] = [];
   if (isObj(root.mcpServers)) out.push({ label: "mcpServers", map: root.mcpServers });
   if (spec.format === "claude-json" && isObj(root.projects)) for (const [p, v] of Object.entries(root.projects)) if (isObj(v) && isObj(v.mcpServers)) out.push({ label: `projects.${p}.mcpServers`, map: v.mcpServers });
@@ -116,7 +150,7 @@ function rewriteJson(spec: ConfigSpec, mode: "wrap" | "unwrap", bin: ReturnType<
       const e = v as ServerEntry;
       if (mode === "wrap") {
         const w = wrapEntry(name, spec.client, e, bin);
-        if (!w) { if (!isWrapped(e)) t.skipped.push({ name, why: e.url || (e.type && e.type !== "stdio") ? "remote server (http/sse); the guard wraps stdio servers" : "no command" }); continue; }
+        if (!w) { if (!isWrapped(e) && !(Array.isArray(e.command) && isWrappedArray(e.command as string[]))) t.skipped.push({ name, why: e.url || (e.type && e.type !== "stdio" && e.type !== "local") ? "remote server (http/sse); the guard wraps stdio servers" : isObj(e.command) ? "older nested command shape; edit it to command/args and re-run" : "no command" }); continue; }
         map[name] = w; t.wrapped.push(name); changed = true;
       } else {
         const u = unwrapEntry(e); if (!u) continue;
@@ -142,13 +176,13 @@ export function rewriteCodexToml(text: string, mode: "wrap" | "unwrap", bin: Ret
       const q = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
       if (cmd && mode === "wrap" && !(args.includes("guard") && args.includes("exec"))) {
         const w = wrapEntry(section, client, { command: cmd, args }, bin)!;
-        lines[cmdIdx] = `command = ${q(w.command!)}`;
+        lines[cmdIdx] = `command = ${q(String(w.command))}`;
         const argsText = `args = [${w.args!.map(q).join(", ")}]`;
         if (argsIdx >= 0) lines[argsIdx] = argsText; else lines.splice(cmdIdx + 1, 0, argsText);
         wrapped.push(section);
       } else if (cmd && mode === "unwrap" && args.includes("guard") && args.includes("exec")) {
         const u = unwrapEntry({ command: cmd, args })!;
-        lines[cmdIdx] = `command = ${q(u.command!)}`;
+        lines[cmdIdx] = `command = ${q(String(u.command))}`;
         if (argsIdx >= 0) { if (u.args!.length) lines[argsIdx] = `args = [${u.args!.map(q).join(", ")}]`; else removed.push(argsIdx); }
         wrapped.push(section);
       }

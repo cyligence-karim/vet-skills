@@ -23,7 +23,7 @@
  *   vet-skills verify <skill|path>        check the signed verdict against what is on disk
  *   vet-skills lock                       pin every installed skill's hash + attestation in vet-skills.lock
  *   vet-skills verify --lock              offline: installed skills still match the lock and signatures verify
- *   vet-skills hook install [claude-code|cursor|codex|windsurf|gemini|grok|all]   register the hooks for that agent (all = every one found)
+ *   vet-skills hook install [claude-code|cursor|codex|windsurf|gemini|grok|copilot|kiro|qwen|all]   register the hooks for that agent (all = every one found)
  *   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
   vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
   vet-skills canary [install|remove]    decoy credential files on this machine; any sighting in a session is proof of exfiltration
@@ -50,7 +50,7 @@ import { VERSION, API, HOME, readLog, readOrg, readPolicy, readToken, stateSumma
 import { hookEval, installClaudeCodeHook, installCodexHook, installCursorHook } from "./hook.js";
 import { cursorHook } from "./cursor.js";
 import { renderEvidence } from "./evidence.js";
-import { geminiHook, grokHook, installGeminiHook, installGrokHook, installWindsurfHook, windsurfHook } from "./agents.js";
+import { copilotHook, geminiHook, grokHook, installCopilotHook, installGeminiHook, installGrokHook, installKiroHook, installQwenHook, installWindsurfHook, kiroHook, qwenHook, windsurfHook } from "./agents.js";
 import type { AgentKind } from "./policy/index.js";
 import { applyRemovals, sync } from "./sync.js";
 import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from "./attest.js";
@@ -61,12 +61,15 @@ import { guardPosture } from "./sync.js";
 import { funnelGuardInstall } from "./api.js";
 import { homedir } from "node:os";
 import { c } from "./render.js";
+import { approvalsCmd, reviewCmd, threatsCmd } from "./org.js";
 
 // `run` and `guard exec` own everything after them (their own flags, then `--` and the server command); the shared parser never sees them.
 const RUN_AT = process.argv.indexOf("run", 2);
 const GUARD_EXEC = process.argv[2] === "guard" && process.argv[3] === "exec";
+/** review / approvals / threats take their own flags (--month, --from, --by …); they parse process.argv themselves. */
+const ORG_CMD = ["review", "approvals", "threats"].includes(process.argv[2] ?? "");
 const { values, positionals } = parseArgs({
-  args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", "exec"] : process.argv.slice(2),
+  args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", "exec"] : ORG_CMD ? [process.argv[2]] : process.argv.slice(2),
   allowPositionals: true,
   options: {
     token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
@@ -83,8 +86,8 @@ async function ask(question: string, choices: string[]): Promise<string> {
 const USAGE = `vet-skills ${VERSION} — check agent skills and MCP servers before they run.
 
 Get started:
-  vet-skills hook install [claude-code|cursor|codex|windsurf|gemini|grok|all]   install-time check + runtime observation for that agent (one time)
-  vet-skills guard install              every MCP server in Claude Code, Cursor, Windsurf, Codex, Gemini and Claude Desktop runs under the guard: tokens become placeholders, hosts and tool calls are recorded, flagged versions do not launch
+  vet-skills hook install [claude-code|cursor|codex|windsurf|gemini|grok|copilot|kiro|qwen|all]   install-time check + runtime observation for that agent (one time)
+  vet-skills guard install              every MCP server in 14 agents (Claude Code to Zed) runs under the guard: tokens become placeholders, hosts and tool calls are recorded, flagged versions do not launch
   vet-skills check <skill>              see the verdict for anything before installing it
   vet-skills join <org> --token <t>     enroll this machine in your team's policy (token from the dashboard)
 
@@ -105,12 +108,15 @@ Get started:
   vet-skills verify <skill|path>        check the signed verdict against what is on disk
   vet-skills lock                       pin every installed skill's hash + attestation in vet-skills.lock
   vet-skills verify --lock              offline: installed skills still match the lock and signatures verify
-  vet-skills hook install [claude-code|cursor|codex|windsurf|gemini|grok|all]   register the hooks for that agent (all = every one found)
+  vet-skills hook install [claude-code|cursor|codex|windsurf|gemini|grok|copilot|kiro|qwen|all]   register the hooks for that agent (all = every one found)
   vet-skills hook eval                  (called by the agent) read hook JSON on stdin
   vet-skills runtime [allows|revoke <id>] what installed skills did in real sessions that the sandbox never saw; scoped allows
   vet-skills canary [install|remove]    decoy credential files on this machine; any sighting in a session is proof of exfiltration
   vet-skills guard install|uninstall|status [--project]   wrap (or unwrap) every stdio MCP server in the agents' configs; status shows sessions, hosts, held calls
   vet-skills guard exec --server <n> --client <a> -- <cmd…>   (called by the agent's config) run one server under the guard with the runtime policy
+  vet-skills review [list|create|show|disposition|download]   access review packs for the org (approver); verify <pack.zip> needs no account
+  vet-skills approvals [list|approve <id>|deny <id>]   pending install requests and held tool calls, decided from the terminal (approver)
+  vet-skills threats [--json|--stix]    the confirmed-incident feed
 
 Docs: https://killerskills.ai/docs/cli
 `;
@@ -177,6 +183,9 @@ async function main(): Promise<number> {
       return guard(parsed.cmd, parsed.opts);
     }
 
+    case "review": return reviewCmd(process.argv[3], process.argv.slice(4));
+    case "approvals": return approvalsCmd(process.argv[3], process.argv.slice(4));
+    case "threats": return threatsCmd(process.argv.slice(3));
     case "guard": {
       const sub = rest[0];
       if (sub === "exec") {
@@ -573,6 +582,22 @@ ${c.ink2("Before you install one")}`);
         if (Math.random() < 0.02) pruneSessions();
         return 0;
       }
+      if (sub === "copilot") {
+        const chunks: Buffer[] = [];
+        for await (const ch of process.stdin) chunks.push(ch as Buffer);
+        const r = await copilotHook(Buffer.concat(chunks).toString("utf8"), rest[1]).catch(() => ({ code: 0, stderr: "", stdout: "" }));
+        if (r.stdout) process.stdout.write(r.stdout + "\n");
+        if (r.stderr) process.stderr.write(r.stderr + "\n");
+        return r.code === 2 ? 2 : 0;
+      }
+      if (sub === "kiro" || sub === "qwen") {
+        const chunks: Buffer[] = [];
+        for await (const ch of process.stdin) chunks.push(ch as Buffer);
+        const r = await (sub === "kiro" ? kiroHook(Buffer.concat(chunks).toString("utf8"), rest[1]) : qwenHook(Buffer.concat(chunks).toString("utf8"))).catch(() => ({ code: 0, stderr: "" }));
+        if (r.stderr) process.stderr.write(r.stderr + "\n");
+        if (Math.random() < 0.02) pruneSessions();
+        return r.code;
+      }
       if (sub === "grok") {
         const chunks: Buffer[] = [];
         for await (const ch of process.stdin) chunks.push(ch as Buffer);
@@ -608,7 +633,7 @@ ${c.ink2("Before you install one")}`);
       }
       if (sub === "install") {
         const target = rest[1] ?? "claude-code";
-        const targets = target === "all" ? ["claude-code", "cursor", "codex", "windsurf", "gemini", "grok"] : [target];
+        const targets = target === "all" ? ["claude-code", "cursor", "codex", "windsurf", "gemini", "grok", "copilot", "kiro", "qwen"] : [target];
         for (const tg of targets) {
           if (tg === "claude-code") { const r = installClaudeCodeHook(); console.log(r.changed ? `${c.verified("✓")} Claude Code hook installed in ${r.path}` : c.muted(`Claude Code hook already present in ${r.path}`)); }
           else if (tg === "cursor") { const r = installCursorHook(); console.log(r.changed ? `${c.verified("✓")} Cursor hooks installed in ${r.path} (restart Cursor once)` : c.muted(`Cursor hooks already present in ${r.path}`)); }
@@ -616,7 +641,10 @@ ${c.ink2("Before you install one")}`);
           else if (tg === "windsurf") { const r = installWindsurfHook(); console.log(r.changed ? `${c.verified("✓")} Windsurf (Cascade) hooks installed in ${r.path}` : c.muted(`Windsurf hooks already present in ${r.path}`)); }
           else if (tg === "gemini") { const r = installGeminiHook(); console.log(r.changed ? `${c.verified("✓")} Gemini CLI hooks installed in ${r.path}` : c.muted(`Gemini CLI hooks already present in ${r.path}`)); }
           else if (tg === "grok") { const r = installGrokHook(); console.log(r.changed ? `${c.verified("✓")} Grok CLI hooks installed in ${r.path}` : c.muted(`Grok CLI hooks already present in ${r.path}`)); }
-          else { console.error(`Unknown agent ${tg}. Supported: claude-code, cursor, codex, windsurf, gemini, grok, all.`); return 1; }
+          else if (tg === "copilot") { const r = installCopilotHook(); console.log(r.changed ? `${c.verified("✓")} Copilot CLI hooks installed in ${r.path}` : c.muted(`Copilot CLI hooks already present in ${r.path}`)); }
+          else if (tg === "kiro") { const r = installKiroHook(); console.log(r.changed ? `${c.verified("✓")} Kiro hooks installed in ${r.path}` : c.muted(`Kiro hooks already present in ${r.path}`)); }
+          else if (tg === "qwen") { const r = installQwenHook(); console.log(r.changed ? `${c.verified("✓")} Qwen Code hooks installed in ${r.path}` : c.muted(`Qwen Code hooks already present in ${r.path}`)); }
+          else { console.error(`Unknown agent ${tg}. Supported: claude-code, cursor, codex, windsurf, gemini, grok, copilot, kiro, qwen, all.`); return 1; }
         }
         console.log(c.muted("Every install the agent makes (skills add, claude mcp add, npx …) is checked before it runs, what skills and MCP servers do in sessions is compared with their sandbox trace (vet-skills runtime), and a planted canary credential leaving the machine stops the session."));
         if (!readCanaries()?.canaries.length) {

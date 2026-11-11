@@ -8,13 +8,13 @@
     "url": "https://github.com/cyligence-karim/vet-skills",
     "source": "github"
   },
-  "version": "0.8.5",
+  "version": "0.9.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "vet-skills",
-      "version": "0.8.5",
+      "version": "0.9.0",
       "transport": {
         "type": "stdio"
       },

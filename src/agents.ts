@@ -9,6 +9,14 @@
  * Gemini CLI: ~/.gemini/settings.json  { hooks: { BeforeTool: [{ matcher, hooks: [{ type: "command", command }] }], … } }
  *   stdin: { session_id, hook_event_name, tool_name, tool_input, tool_response?: { llmContent }, prompt? }
  *   shell tool is run_shell_command { command }; MCP tools are mcp_<server>_<tool>; file reads read_file { file_path | absolute_path }
+ * Copilot CLI: ~/.copilot/hooks/*.json  { version: 1, hooks: { preToolUse: [{ type: "command", command, timeoutSec }], … } }
+ *   stdin: camelCase { sessionId, cwd, toolName, toolArgs (often a JSON string) } or the VS-Code-compatible snake_case shape
+ *   { hook_event_name, tool_name, tool_input }. Blocking: stdout { permissionDecision: "deny", permissionDecisionReason } or exit 2;
+ *   any OTHER non-zero exit is fail-closed ("hook errored" denies), so this hook only ever exits 0 or 2.
+ * Kiro: ~/.kiro/hooks/*.json  { version: "v1", hooks: [{ name, trigger: "PreToolUse", matcher, action: { type: "command", command }, timeout }] }
+ *   stdin: { hook_event_name, session_id, cwd, tool_name, tool_input }; MCP tools are mcp_<server>_<tool>; any non-zero exit blocks PreToolUse.
+ * Qwen Code: ~/.qwen/settings.json  { hooks: { PreToolUse: [{ matcher, hooks: [{ type: "command", command, timeout(ms) }] }], … } }
+ *   stdin: { hook_event_name, session_id, tool_name, tool_input }; shell is run_shell_command, reads read_file; exit 2 blocks (stderr to the model).
  * Grok CLI (Grok Build): ~/.grok/hooks/*.json  { hooks: { PreToolUse: [{ matcher, hooks: [{ type: "command", command, timeout }] }], … } }
  *   stdin: { hookEventName, sessionId, cwd, workspaceRoot, toolName, toolInput, … } (camelCase; Claude tool names Bash / Read are
  *   accepted in matchers and mapped, MCP tools are <server>__<tool>). PreToolUse is the only blocking event: stdout
@@ -76,6 +84,28 @@ export function translateGrok(ev: Record<string, unknown>): Translated {
   }
 }
 
+/** Shared translation for the Claude-shaped agents (Copilot CLI, Kiro, Qwen Code): camel or snake case, common tool names. */
+export function translateGeneric(ev: Record<string, unknown>, agent: "copilot" | "kiro" | "qwen", eventHint?: string): Translated {
+  const session = String(ev.sessionId ?? ev.session_id ?? agent);
+  const eventRaw = String(ev.hookEventName ?? ev.hook_event_name ?? eventHint ?? "").toLowerCase();
+  const event = /^pre$|pretool/.test(eventRaw) ? "pre" : /^post$|posttool/.test(eventRaw) ? "post" : /prompt/.test(eventRaw) ? "prompt" : "other";
+  const name = String(ev.toolName ?? ev.tool_name ?? "");
+  let input: unknown = ev.toolInput ?? ev.tool_input ?? ev.toolArgs ?? ev.tool_args ?? {};
+  if (typeof input === "string") { try { input = JSON.parse(input); } catch { input = { command: input }; } }
+  const inp = (input ?? {}) as Record<string, unknown>;
+  const lower = name.toLowerCase();
+  const tool = /^(bash|shell|run_shell_command|execute_bash|executebash|run_command|execute_command|terminal)$/.test(lower) ? "Bash"
+    : /^(read|view|read_file|fs_read|read_many_files|view_file)$/.test(lower) ? "Read"
+    : /^mcp__/.test(name) ? name
+    : /^mcp_/.test(name) ? `mcp__${name.slice(4).replace(/_/, "__")}`
+    : /^[A-Za-z0-9-]+__[A-Za-z0-9_-]+$/.test(name) ? `mcp__${name}` : name;
+  const claudeInput = tool === "Bash" ? { command: String(inp.command ?? inp.cmd ?? inp.commandLine ?? "") } : tool === "Read" ? { file_path: String(inp.file_path ?? inp.path ?? inp.absolute_path ?? inp.filePath ?? "") } : inp;
+  if (event === "prompt") { const prompt = typeof ev.prompt === "string" ? ev.prompt : typeof ev.userPrompt === "string" ? ev.userPrompt : process.env.USER_PROMPT ?? ""; return { kind: "prompt", session, tool: "", input: null, prompt }; }
+  if (event === "pre") return tool === "Bash" ? { kind: "pre_shell", session, tool, input: claudeInput } : tool.startsWith("mcp__") ? { kind: "pre_mcp", session, tool, input: claudeInput } : tool === "Read" ? { kind: "pre_read", session, tool, input: claudeInput, filePath: String((claudeInput as { file_path?: string }).file_path ?? "") } : { kind: "ignore", session, tool, input: claudeInput };
+  if (event === "post") { const r = (ev.toolResult ?? ev.tool_result ?? ev.toolResponse ?? ev.tool_response ?? ev.output ?? null) as { textResultForLlm?: unknown; text_result_for_llm?: unknown; llmContent?: unknown } | null; return { kind: "post", session, tool, input: claudeInput, response: r && typeof r === "object" ? (r.textResultForLlm ?? r.text_result_for_llm ?? r.llmContent ?? r) : r }; }
+  return { kind: "ignore", session, tool: "", input: null };
+}
+
 function mcpTool(server: unknown, tool: unknown) { return `mcp__${String(server ?? "server").replace(/\W+/g, "_")}__${String(tool ?? "tool")}`; }
 
 /** Run the translated event through the same checks the Claude Code hook runs; exit 2 + stderr blocks. */
@@ -127,6 +157,77 @@ export async function grokHook(stdin: string): Promise<AgentReply & { stdout?: s
   // Only PreToolUse can block, and only an explicit deny does; everything else is passive and stdout is ignored.
   if (r.code === 2 && t.kind !== "post") return { ...r, stdout: JSON.stringify({ decision: "deny", reason: r.stderr.split("\n")[0].slice(0, 400) }) };
   return { ...r, code: 0 };
+}
+
+/** Copilot CLI: deny = stdout permissionDecision JSON + exit 2; never any other non-zero exit (fail-closed there). */
+export async function copilotHook(stdin: string, eventHint?: string): Promise<AgentReply & { stdout?: string }> {
+  let ev: Record<string, unknown> = {}; try { ev = JSON.parse(stdin); } catch { return { code: 0, stderr: "" }; }
+  const t = translateGeneric(ev, "copilot", eventHint);
+  const r = await runTranslated(t, "copilot");
+  if (r.code === 2 && t.kind !== "post") return { ...r, stdout: JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: r.stderr.split("\n")[0].slice(0, 400) }) };
+  return { ...r, code: 0 };
+}
+export async function kiroHook(stdin: string, eventHint?: string): Promise<AgentReply> {
+  let ev: Record<string, unknown> = {}; try { ev = JSON.parse(stdin); } catch { return { code: 0, stderr: "" }; }
+  const t = translateGeneric(ev, "kiro", eventHint);
+  const r = await runTranslated(t, "other");
+  return t.kind === "post" ? { ...r, code: 0 } : r;
+}
+export async function qwenHook(stdin: string): Promise<AgentReply> {
+  let ev: Record<string, unknown> = {}; try { ev = JSON.parse(stdin); } catch { return { code: 0, stderr: "" }; }
+  const t = translateGeneric(ev, "qwen");
+  return runTranslated(t, "other");
+}
+
+export function installCopilotHook(): { path: string; changed: boolean } {
+  const dir = join(process.env.COPILOT_HOME ?? join(homedir(), ".copilot"), "hooks");
+  const path = join(dir, "killerskills.json");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  let file: Record<string, unknown> = {};
+  if (existsSync(path)) { try { file = JSON.parse(readFileSync(path, "utf8")); } catch { file = {}; } }
+  file.version ??= 1;
+  const hooks = (file.hooks ??= {}) as Record<string, { type: string; command: string; timeoutSec?: number; matcher?: string }[]>;
+  let changed = false;
+  for (const [event, sub] of [["userPromptSubmitted", "prompt"], ["preToolUse", "pre"], ["postToolUse", "post"]] as const) {
+    const list = (hooks[event] ??= []);
+    if (list.some((h) => /vet-skills hook copilot/.test(h.command ?? ""))) continue;
+    list.push({ type: "command", command: `vet-skills hook copilot ${sub}`, timeoutSec: 60 }); changed = true;
+  }
+  if (changed) writeFileSync(path, JSON.stringify(file, null, 2) + "\n");
+  return { path, changed };
+}
+
+export function installKiroHook(): { path: string; changed: boolean } {
+  const dir = join(homedir(), ".kiro", "hooks");
+  const path = join(dir, "killerskills.json");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  let file: { version?: string; hooks?: { name: string; description?: string; trigger: string; matcher?: string; action: { type: string; command: string }; timeout?: number; enabled?: boolean }[] } = {};
+  if (existsSync(path)) { try { file = JSON.parse(readFileSync(path, "utf8")); } catch { file = {}; } }
+  file.version ??= "v1"; const hooks = (file.hooks ??= []);
+  let changed = false;
+  for (const [trigger, sub] of [["UserPromptSubmit", "prompt"], ["PreToolUse", "pre"], ["PostToolUse", "post"]] as const) {
+    if (hooks.some((h) => h.trigger === trigger && /vet-skills hook kiro/.test(h.action?.command ?? ""))) continue;
+    hooks.push({ name: `killerskills-${sub}`, description: "KillerSkills: verdict check on installs, canary refusals, runtime observation", trigger, ...(trigger === "UserPromptSubmit" ? {} : { matcher: "*" }), action: { type: "command", command: `vet-skills hook kiro ${sub}` }, timeout: 60, enabled: true }); changed = true;
+  }
+  if (changed) writeFileSync(path, JSON.stringify(file, null, 2) + "\n");
+  return { path, changed };
+}
+
+export function installQwenHook(): { path: string; changed: boolean } {
+  const dir = join(homedir(), ".qwen");
+  const path = join(dir, "settings.json");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  let settings: Record<string, unknown> = {};
+  if (existsSync(path)) { try { settings = JSON.parse(readFileSync(path, "utf8")); } catch { settings = {}; } }
+  const hooks = (settings.hooks ??= {}) as Record<string, { matcher?: string; hooks: { type: string; command: string; timeout?: number }[] }[]>;
+  let changed = false;
+  for (const event of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+    const list = (hooks[event] ??= []);
+    if (list.some((h) => h.hooks.some((x) => /vet-skills hook qwen/.test(x.command)))) continue;
+    list.push({ ...(event === "UserPromptSubmit" ? {} : { matcher: "" }), hooks: [{ type: "command", command: "vet-skills hook qwen", timeout: 60000 }] }); changed = true;
+  }
+  if (changed) writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+  return { path, changed };
 }
 
 export function installGrokHook(): { path: string; changed: boolean } {

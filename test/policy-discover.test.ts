@@ -60,3 +60,20 @@ test("blast radius ranks credentials, verdicts and honeypot behaviour", () => {
   assert.equal(classifyCredential("STRIPE_SECRET_KEY"), "payments");
   assert.equal(classifyCredential("LOG_LEVEL"), null);
 });
+
+test("discover: Zed, Amp, OpenCode, Copilot, Kiro, Qwen, Cline and Continue configs", () => {
+  const zed = parseAgentConfig(".config/zed/settings.json", JSON.stringify({ context_servers: { pg: { command: "npx", args: ["-y", "pg-mcp"], env: { PG: "x" } }, r: { url: "https://mcp.example/x" } } }), "user");
+  assert.deepEqual(zed.map((c) => [c.agent, c.name, c.transport, c.package?.name]), [["zed", "pg", "stdio", "pg-mcp"], ["zed", "r", "http", undefined]]);
+  const amp = parseAgentConfig(".config/amp/settings.json", JSON.stringify({ "amp.mcpServers": { linear: { command: "npx", args: ["linear-mcp"] } } }), "user");
+  assert.equal(amp[0].agent, "amp"); assert.equal(amp[0].package?.name, "linear-mcp");
+  const oc = parseAgentConfig(".config/opencode/opencode.json", JSON.stringify({ mcp: { servers: { ex: { type: "local", command: ["npx", "-y", "example-mcp"], environment: { K: "v" } } } } }), "user");
+  assert.equal(oc[0].agent, "opencode"); assert.equal(oc[0].package?.name, "example-mcp"); assert.deepEqual(oc[0].envKeys, ["K"]);
+  const ocV1 = parseAgentConfig("opencode.json", JSON.stringify({ mcp: { ex: { type: "local", command: ["uvx", "x-mcp"] } } }));
+  assert.equal(ocV1[0].package?.name, "x-mcp");
+  assert.equal(parseAgentConfig(".copilot/mcp-config.json", JSON.stringify({ mcpServers: { gh: { type: "local", command: "npx", args: ["@github/mcp"] } } }), "user")[0].agent, "copilot");
+  assert.equal(parseAgentConfig(".kiro/settings/mcp.json", JSON.stringify({ mcpServers: { fs: { command: "uvx", args: ["fs"] } } }), "user")[0].agent, "kiro");
+  assert.equal(parseAgentConfig(".qwen/settings.json", JSON.stringify({ hooks: {}, mcpServers: { c: { command: "npx", args: ["c"] } } }), "user")[0].agent, "qwen");
+  assert.equal(parseAgentConfig(".cline/data/settings/cline_mcp_settings.json", JSON.stringify({ mcpServers: { b: { command: "npx", args: ["b"] } } }), "user")[0].agent, "cline");
+  const cont = parseAgentConfig(".continue/config.yaml", `name: my\nversion: 0.0.1\nschema: v1\nmodels:\n  - name: gpt\nmcpServers:\n  - name: Playwright\n    command: npx\n    args:\n      - "-y"\n      - "@playwright/mcp@latest"\n    env:\n      TOKEN: \${{ secrets.TOKEN }}\n  - name: remote\n    type: sse\n    url: https://mcp.example/sse\n  - name: inline\n    command: uvx\n    args: ["weather-mcp"]\ncontext:\n  - provider: code\n`, "user");
+  assert.deepEqual(cont.map((c) => [c.agent, c.name, c.transport, c.package?.name ?? c.urlHost, c.envKeys]), [["continue", "Playwright", "stdio", "@playwright/mcp", ["TOKEN"]], ["continue", "remote", "http", "mcp.example", []], ["continue", "inline", "stdio", "weather-mcp", []]]);
+});

@@ -131,3 +131,32 @@ rl.on("close", () => process.exit(0));`);
   assert.ok(log.some((e) => e.kind === "tool_call" && e.tool === "delete_table" && e.action === "denied"));
   assert.ok(log.some((e) => e.kind === "session" && e.tools === 2));
 });
+
+test("guard: Copilot, Kiro, Qwen, Cline, Zed, Amp and OpenCode configs wrap and unwrap", () => {
+  const home = mkdtempSync(join(tmpdir(), "vs-guard-more-"));
+  for (const d of [".copilot", ".kiro/settings", ".qwen", ".cline/data/settings", ".config/zed", ".config/amp", ".config/opencode"]) mkdirSync(join(home, d), { recursive: true });
+  writeFileSync(join(home, ".copilot", "mcp-config.json"), JSON.stringify({ mcpServers: { gh: { type: "local", command: "npx", args: ["-y", "@github/mcp"], tools: ["*"] }, remote: { type: "http", url: "https://x" } } }));
+  writeFileSync(join(home, ".kiro", "settings", "mcp.json"), JSON.stringify({ mcpServers: { fs: { command: "uvx", args: ["fs-mcp"], disabled: false, autoApprove: [] } } }));
+  writeFileSync(join(home, ".qwen", "settings.json"), JSON.stringify({ hooks: {}, mcpServers: { ctx: { command: "npx", args: ["ctx"] } } }));
+  writeFileSync(join(home, ".cline", "data", "settings", "cline_mcp_settings.json"), JSON.stringify({ mcpServers: { brave: { command: "npx", args: ["brave"], env: { K: "v" } } } }));
+  writeFileSync(join(home, ".config", "zed", "settings.json"), JSON.stringify({ theme: "One Dark", context_servers: { pg: { command: "npx", args: ["pg-mcp"], env: {} }, old: { command: { path: "x", args: [] } } } }));
+  writeFileSync(join(home, ".config", "amp", "settings.json"), JSON.stringify({ "amp.mcpServers": { linear: { command: "npx", args: ["linear-mcp"] } } }));
+  writeFileSync(join(home, ".config", "opencode", "opencode.json"), JSON.stringify({ $schema: "https://opencode.ai/config.json", mcp: { servers: { ex: { type: "local", command: ["npx", "-y", "example-mcp"], environment: { K: "{env:K}" } }, rem: { type: "remote", url: "https://x" } } } }));
+  process.env.VET_SKILLS_BIN = "/opt/vs/vet-skills";
+  const t = installGuard({ home });
+  const by = (c: string) => t.find((x) => x.client === c)!;
+  assert.deepEqual(by("copilot").wrapped, ["gh"]); assert.equal(by("copilot").skipped[0].name, "remote");
+  assert.deepEqual(by("kiro").wrapped, ["fs"]); assert.deepEqual(by("qwen").wrapped, ["ctx"]); assert.deepEqual(by("cline").wrapped, ["brave"]);
+  assert.deepEqual(by("zed").wrapped, ["pg"]); assert.match(by("zed").skipped[0].why, /nested/);
+  assert.deepEqual(by("amp").wrapped, ["linear"]); assert.deepEqual(by("opencode").wrapped, ["ex"]);
+  const oc = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
+  assert.deepEqual(oc.mcp.servers.ex.command, ["/opt/vs/vet-skills", "guard", "exec", "--server", "ex", "--client", "opencode", "--", "npx", "-y", "example-mcp"]);
+  assert.deepEqual(oc.mcp.servers.ex.environment, { K: "{env:K}" });
+  const zed = JSON.parse(readFileSync(join(home, ".config", "zed", "settings.json"), "utf8")); assert.equal(zed.theme, "One Dark"); assert.equal(zed.context_servers.pg.command, "/opt/vs/vet-skills");
+  // Idempotent, then uninstall restores every original.
+  assert.equal(installGuard({ home }).reduce((n, x) => n + x.wrapped.length, 0), 0);
+  assert.equal(uninstallGuard({ home }).reduce((n, x) => n + x.wrapped.length, 0), 7);
+  assert.deepEqual(JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8")).mcp.servers.ex.command, ["npx", "-y", "example-mcp"]);
+  assert.equal(JSON.parse(readFileSync(join(home, ".copilot", "mcp-config.json"), "utf8")).mcpServers.gh.command, "npx");
+  delete process.env.VET_SKILLS_BIN;
+});

@@ -168,3 +168,31 @@ export type RepoScan = { ok: true; repo: string; page: string; headline: string;
 export function scanGithubRepo(owner: string, repo: string) {
   return call<RepoScan>(`/api/v1/scan/github/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {}, 25000);
 }
+
+/* ---- organization commands (review packs, approvals, threats) ---- */
+export type PackRow = { id: string; pack_ref: string; version: number; status: string; period_start: string; period_end: string; timezone: string; scope: { pseudonymize_hosts: boolean; include_allow_decisions: boolean }; created_at: string; created_by: string; finalized_at: string | null; finalized_by: string | null; core_hash: string | null; bundle_bytes: number | null; previous_pack_id: string | null };
+export type PackDetail = { pack: PackRow & { finalized_identity_source: string | null; attestations: unknown[] }; row_counts: Record<string, number>; known_gaps: string[]; exceptions: { id: string; rule_id: string; rule_version: string; severity_hint: string; subject: string; detail: string; supporting_records: string[]; disposition: string | null; note: string | null; owner: string | null; target_date: string | null; decided_by: string | null; decided_at: string | null }[] };
+function orgPath(rest: string) { const org = readOrg(); return org ? `/api/v1/orgs/${org.slug}/agents/${org.agentId}/${rest}` : null; }
+const noOrg = <T>(): ApiResult<T> => ({ ok: false, error: "not enrolled", offline: false });
+export function reviewPacks() { const p = orgPath("review-packs"); return p ? call<{ packs: PackRow[] }>(p, { headers: orgHeaders() }, 20000) : Promise.resolve(noOrg<{ packs: PackRow[] }>()); }
+export function reviewPackCreate(body: { month?: string; start?: string; end?: string; timezone: string; pseudonymize_hosts: boolean; include_allow_decisions: boolean }) { const p = orgPath("review-packs"); return p ? call<{ pack: PackRow; url: string }>(p, { method: "POST", body: JSON.stringify(body), headers: orgHeaders() }, 120000) : Promise.resolve(noOrg<{ pack: PackRow; url: string }>()); }
+export function reviewPackGet(id: string) { const p = orgPath(`review-packs/${encodeURIComponent(id)}`); return p ? call<PackDetail>(p, { headers: orgHeaders() }, 120000) : Promise.resolve(noOrg<PackDetail>()); }
+export function reviewSetDisposition(id: string, exc: string, body: { disposition: string | null; owner: string | null; target_date: string | null; note: string | null }) { const p = orgPath(`review-packs/${encodeURIComponent(id)}/exceptions/${encodeURIComponent(exc)}`); return p ? call<{ ok: true }>(p, { method: "POST", body: JSON.stringify(body), headers: orgHeaders() }, 20000) : Promise.resolve(noOrg<{ ok: true }>()); }
+export async function reviewPackDownload(id: string): Promise<ApiResult<{ bytes: Buffer; name: string }>> {
+  const p = orgPath(`review-packs/${encodeURIComponent(id)}/download`); if (!p) return noOrg();
+  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 180000);
+  try {
+    const res = await fetch(`${API}${p}`, { signal: ctrl.signal, headers: { ...orgHeaders(), "user-agent": `vet-skills/${VERSION}` } });
+    if (!res.ok) { let e = res.statusText; try { e = ((await res.json()) as { error?: string }).error ?? e; } catch { /* keep */ } return { ok: false, status: res.status, error: e, offline: res.status >= 500 }; }
+    const name = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") ?? "")?.[1] ?? `access-review-pack-${id}.zip`;
+    return { ok: true, data: { bytes: Buffer.from(await res.arrayBuffer()), name } };
+  } catch (e) { return { ok: false, error: (e as Error).message, offline: true }; } finally { clearTimeout(t); }
+}
+export type PendingApprovals = { install: { id: string; package: string; registry: string; kind: string; reason: string; requested_by: string; requested_at: string; approvals_needed: number; suggestion: string | null; policy_version: number | null }[]; tool: { id: string; server: string; package: string | null; tool: string; arg_keys: string[]; arg_preview: string; reason: string | null; requested_by: string; requested_at: string; expires_at: string }[] };
+export function approvalsPending() { const p = orgPath("approvals"); return p ? call<PendingApprovals>(p, { headers: orgHeaders() }, 20000) : Promise.resolve(noOrg<PendingApprovals>()); }
+export function approvalDecideInstall(id: string, op: string) { const p = orgPath(`approvals/install/${encodeURIComponent(id)}`); return p ? call<{ status: string; identity_source: string }>(p, { method: "POST", body: JSON.stringify({ op }), headers: orgHeaders() }, 20000) : Promise.resolve(noOrg<{ status: string; identity_source: string }>()); }
+export function approvalDecideTool(id: string, decision: "approved" | "denied") { const p = orgPath(`approvals/tool/${encodeURIComponent(id)}`); return p ? call<{ ok: true; decision: string; identity_source: string }>(p, { method: "POST", body: JSON.stringify({ decision }), headers: orgHeaders() }, 20000) : Promise.resolve(noOrg<{ ok: true; decision: string; identity_source: string }>()); }
+export async function threatsFeed(stix: boolean): Promise<ApiResult<unknown>> {
+  if (!stix) return call<unknown>("/api/v1/threats", {}, 20000);
+  try { const res = await fetch(`${API}/api/v1/threats.stix`, { headers: { "user-agent": `vet-skills/${VERSION}` } }); const text = await res.text(); if (!res.ok) return { ok: false, status: res.status, error: res.statusText, offline: res.status >= 500 }; return { ok: true, data: text }; } catch (e) { return { ok: false, error: (e as Error).message, offline: true }; }
+}
