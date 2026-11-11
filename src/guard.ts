@@ -29,7 +29,7 @@ import { mint, secretsSpecFor, type Minted } from "./exchange.js";
 import type { SecretBinding } from "./broker.js";
 import type { ToolRule } from "./policy/index.js";
 
-export type GuardClient = "claude-code" | "claude-desktop" | "cursor" | "windsurf" | "gemini" | "codex" | "vscode";
+export type GuardClient = "claude-code" | "claude-desktop" | "cursor" | "windsurf" | "gemini" | "codex" | "grok" | "vscode";
 interface ConfigSpec { path: string; client: GuardClient; format: "mcpServers" | "claude-json" | "vscode" | "codex-toml"; scope: "user" | "project" }
 
 const GUARD_DIR = join(HOME, "guard");
@@ -46,6 +46,7 @@ export function configSpecs(opts: { home?: string; project?: string | null } = {
     { path: join(home, ".codeium", "windsurf", "mcp_config.json"), client: "windsurf", format: "mcpServers", scope: "user" },
     { path: join(home, ".gemini", "settings.json"), client: "gemini", format: "mcpServers", scope: "user" },
     { path: join(home, ".codex", "config.toml"), client: "codex", format: "codex-toml", scope: "user" },
+    { path: join(home, ".grok", "config.toml"), client: "grok", format: "codex-toml", scope: "user" },
     { path: join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), client: "claude-desktop", format: "mcpServers", scope: "user" },
     { path: join(home, ".config", "Claude", "claude_desktop_config.json"), client: "claude-desktop", format: "mcpServers", scope: "user" },
     { path: join(home, "AppData", "Roaming", "Claude", "claude_desktop_config.json"), client: "claude-desktop", format: "mcpServers", scope: "user" },
@@ -127,8 +128,8 @@ function rewriteJson(spec: ConfigSpec, mode: "wrap" | "unwrap", bin: ReturnType<
   return t;
 }
 
-/** Codex keeps MCP servers in TOML: `[mcp_servers.NAME]` with `command = "…"` and `args = [...]`. Only those two lines move. */
-export function rewriteCodexToml(text: string, mode: "wrap" | "unwrap", bin: ReturnType<typeof guardBinary>): { text: string; wrapped: string[] } {
+/** Codex and Grok CLI keep MCP servers in TOML: `[mcp_servers.NAME]` with `command = "…"` and `args = [...]`. Only those two lines move. */
+export function rewriteCodexToml(text: string, mode: "wrap" | "unwrap", bin: ReturnType<typeof guardBinary>, client: GuardClient = "codex"): { text: string; wrapped: string[] } {
   const lines = text.split("\n");
   const wrapped: string[] = []; const removed: number[] = [];
   let section: string | null = null; let cmdIdx = -1; let argsIdx = -1;
@@ -140,7 +141,7 @@ export function rewriteCodexToml(text: string, mode: "wrap" | "unwrap", bin: Ret
       const args: string[] = argsLine ? [...(argsLine.match(/\[(.*)\]/)?.[1] ?? "").matchAll(/"((?:\\.|[^"])*)"/g)].map((m) => m[1]) : [];
       const q = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
       if (cmd && mode === "wrap" && !(args.includes("guard") && args.includes("exec"))) {
-        const w = wrapEntry(section, "codex", { command: cmd, args }, bin)!;
+        const w = wrapEntry(section, client, { command: cmd, args }, bin)!;
         lines[cmdIdx] = `command = ${q(w.command!)}`;
         const argsText = `args = [${w.args!.map(q).join(", ")}]`;
         if (argsIdx >= 0) lines[argsIdx] = argsText; else lines.splice(cmdIdx + 1, 0, argsText);
@@ -174,7 +175,7 @@ export function installGuard(opts: { project?: string | null; home?: string } = 
     try {
       if (spec.format === "codex-toml") {
         const text = readFileSync(spec.path, "utf8");
-        const r = rewriteCodexToml(text, "wrap", bin);
+        const r = rewriteCodexToml(text, "wrap", bin, spec.client);
         if (r.wrapped.length) { backup(spec.path, text); writeFileSync(spec.path, r.text); }
         out.push({ file: spec.path, client: spec.client, wrapped: r.wrapped, skipped: [] });
       } else { const t = rewriteJson(spec, "wrap", bin); if (t) out.push(t); }
@@ -192,7 +193,7 @@ export function uninstallGuard(opts: { project?: string | null; home?: string } 
     try {
       if (spec.format === "codex-toml") {
         const text = readFileSync(spec.path, "utf8");
-        const r = rewriteCodexToml(text, "unwrap", bin);
+        const r = rewriteCodexToml(text, "unwrap", bin, spec.client);
         if (r.wrapped.length) { backup(spec.path, text); writeFileSync(spec.path, r.text); }
         out.push({ file: spec.path, client: spec.client, wrapped: r.wrapped, skipped: [] });
       } else { const t = rewriteJson(spec, "unwrap", bin); if (t) out.push(t); }
@@ -214,7 +215,7 @@ export function wrappedServers(opts: { project?: string | null; home?: string } 
       const text = readFileSync(spec.path, "utf8");
       if (spec.format === "codex-toml") {
         const probe = rewriteCodexToml(text, "unwrap", guardBinary());
-        for (const n of probe.wrapped) out.push({ file: spec.path, client: spec.client, name: n, command: "(codex)" });
+        for (const n of probe.wrapped) out.push({ file: spec.path, client: spec.client, name: n, command: "(toml)" });
         continue;
       }
       const root = readJsonc(text); if (!isObj(root)) continue;

@@ -9,6 +9,10 @@
  * Gemini CLI: ~/.gemini/settings.json  { hooks: { BeforeTool: [{ matcher, hooks: [{ type: "command", command }] }], … } }
  *   stdin: { session_id, hook_event_name, tool_name, tool_input, tool_response?: { llmContent }, prompt? }
  *   shell tool is run_shell_command { command }; MCP tools are mcp_<server>_<tool>; file reads read_file { file_path | absolute_path }
+ * Grok CLI (Grok Build): ~/.grok/hooks/*.json  { hooks: { PreToolUse: [{ matcher, hooks: [{ type: "command", command, timeout }] }], … } }
+ *   stdin: { hookEventName, sessionId, cwd, workspaceRoot, toolName, toolInput, … } (camelCase; Claude tool names Bash / Read are
+ *   accepted in matchers and mapped, MCP tools are <server>__<tool>). PreToolUse is the only blocking event: stdout
+ *   { "decision": "deny", "reason" } plus exit 2 denies; timeouts and malformed output are fail-open on Grok's side.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -48,6 +52,26 @@ export function translateGemini(ev: Record<string, unknown>): Translated {
     case "BeforeAgent": return { kind: "prompt", session, tool: "", input: null, prompt: typeof ev.prompt === "string" ? ev.prompt : "" };
     case "BeforeTool": return tool === "Bash" ? { kind: "pre_shell", session, tool, input: claudeInput } : tool.startsWith("mcp__") ? { kind: "pre_mcp", session, tool, input: claudeInput } : tool === "Read" ? { kind: "pre_read", session, tool, input: claudeInput, filePath: String((claudeInput as { file_path?: string }).file_path ?? "") } : { kind: "ignore", session, tool, input: claudeInput };
     case "AfterTool": { const r = ev.tool_response as { llmContent?: unknown; returnDisplay?: unknown } | undefined; return { kind: "post", session, tool, input: claudeInput, response: r?.llmContent ?? r?.returnDisplay ?? r ?? null }; }
+    default: return { kind: "ignore", session, tool: "", input: null };
+  }
+}
+
+/** Grok sends camelCase; a few builds send snake_case. Tool names follow Claude's for the built-ins and <server>__<tool> for MCP. */
+export function translateGrok(ev: Record<string, unknown>): Translated {
+  const session = String(ev.sessionId ?? ev.session_id ?? "grok");
+  const event = String(ev.hookEventName ?? ev.hook_event_name ?? "");
+  const name = String(ev.toolName ?? ev.tool_name ?? "");
+  const input = (ev.toolInput ?? ev.tool_input ?? {}) as Record<string, unknown>;
+  const lower = name.toLowerCase();
+  const tool = lower === "bash" || lower === "shell" || lower === "run_command" || lower === "execute_command" || lower === "run_shell_command" ? "Bash"
+    : lower === "read" || lower === "read_file" || lower === "view_file" ? "Read"
+    : /^mcp__/.test(name) ? name
+    : /^[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/.test(name) ? `mcp__${name.replace("__", "__")}` : name;
+  const claudeInput = tool === "Bash" ? { command: String(input.command ?? input.cmd ?? "") } : tool === "Read" ? { file_path: String(input.file_path ?? input.path ?? input.absolute_path ?? input.filePath ?? "") } : input;
+  switch (event) {
+    case "UserPromptSubmit": return { kind: "prompt", session, tool: "", input: null, prompt: typeof ev.prompt === "string" ? ev.prompt : typeof ev.userPrompt === "string" ? ev.userPrompt : "" };
+    case "PreToolUse": return tool === "Bash" ? { kind: "pre_shell", session, tool, input: claudeInput } : tool.startsWith("mcp__") ? { kind: "pre_mcp", session, tool, input: claudeInput } : tool === "Read" ? { kind: "pre_read", session, tool, input: claudeInput, filePath: String((claudeInput as { file_path?: string }).file_path ?? "") } : { kind: "ignore", session, tool, input: claudeInput };
+    case "PostToolUse": return { kind: "post", session, tool, input: claudeInput, response: ev.toolResponse ?? ev.toolOutput ?? ev.toolResult ?? ev.tool_response ?? ev.output ?? null };
     default: return { kind: "ignore", session, tool: "", input: null };
   }
 }
@@ -94,6 +118,35 @@ export async function windsurfHook(stdin: string): Promise<AgentReply> {
 export async function geminiHook(stdin: string): Promise<AgentReply> {
   let ev: Record<string, unknown> = {}; try { ev = JSON.parse(stdin); } catch { return { code: 0, stderr: "" }; }
   return runTranslated(translateGemini(ev), "gemini_cli");
+}
+
+export async function grokHook(stdin: string): Promise<AgentReply & { stdout?: string }> {
+  let ev: Record<string, unknown> = {}; try { ev = JSON.parse(stdin); } catch { return { code: 0, stderr: "" }; }
+  const t = translateGrok(ev);
+  const r = await runTranslated(t, "other");
+  // Only PreToolUse can block, and only an explicit deny does; everything else is passive and stdout is ignored.
+  if (r.code === 2 && t.kind !== "post") return { ...r, stdout: JSON.stringify({ decision: "deny", reason: r.stderr.split("\n")[0].slice(0, 400) }) };
+  return { ...r, code: 0 };
+}
+
+export function installGrokHook(): { path: string; changed: boolean } {
+  const dir = join(homedir(), ".grok", "hooks");
+  const path = join(dir, "killerskills.json");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  let file: Record<string, unknown> = {};
+  if (existsSync(path)) { try { file = JSON.parse(readFileSync(path, "utf8")); } catch { file = {}; } }
+  const hooks = (file.hooks ??= {}) as Record<string, { matcher?: string; hooks: { type: string; command: string; timeout?: number }[] }[]>;
+  let changed = false;
+  const add = (event: string, matcher: string | undefined) => {
+    const list = (hooks[event] ??= []);
+    if (list.some((h) => h.hooks.some((x) => /vet-skills hook grok/.test(x.command)))) return;
+    list.push({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command: "vet-skills hook grok", timeout: 60 }] }); changed = true;
+  };
+  add("UserPromptSubmit", undefined);
+  add("PreToolUse", undefined);
+  add("PostToolUse", undefined);
+  if (changed) writeFileSync(path, JSON.stringify(file, null, 2) + "\n");
+  return { path, changed };
 }
 
 export function installWindsurfHook(): { path: string; changed: boolean } {

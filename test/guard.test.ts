@@ -11,20 +11,23 @@ process.env.VET_SKILLS_BIN = "/opt/vet-skills/bin/vet-skills";
 const { configSpecs, installGuard, uninstallGuard, wrappedServers, guardStatus, rewriteCodexToml, parseExecArgs, registrableDomain, unwrapEntry, isWrapped } = await import("../src/guard.ts");
 
 test("guard install wraps every stdio server in every client config, idempotently, and uninstall restores the originals", () => {
-  mkdirSync(join(home, ".cursor"), { recursive: true }); mkdirSync(join(home, ".codex"), { recursive: true }); mkdirSync(join(home, ".gemini"), { recursive: true });
+  mkdirSync(join(home, ".cursor"), { recursive: true }); mkdirSync(join(home, ".codex"), { recursive: true }); mkdirSync(join(home, ".gemini"), { recursive: true }); mkdirSync(join(home, ".grok"), { recursive: true });
+  writeFileSync(join(home, ".grok", "config.toml"), `[models]\ndefault = "grok-code"\n\n[mcp_servers.linear]\ncommand = "npx"\nargs = ["-y", "linear-mcp"]\n`);
   writeFileSync(join(home, ".claude.json"), JSON.stringify({ mcpServers: { supabase: { command: "npx", args: ["-y", "@supabase/mcp-server-supabase"], env: { SUPABASE_ACCESS_TOKEN: "x" } }, remote: { type: "http", url: "https://mcp.example/sse" } }, projects: { "/work/app": { mcpServers: { fs: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/work/app"] } } } } }));
   writeFileSync(join(home, ".cursor", "mcp.json"), `{\n  // cursor allows comments\n  "mcpServers": { "github": { "command": "docker", "args": ["run", "-i", "ghcr.io/github/github-mcp-server"], },\n  }\n}\n`);
   writeFileSync(join(home, ".gemini", "settings.json"), JSON.stringify({ theme: "dark", mcpServers: { ctx7: { command: "npx", args: ["-y", "@upstash/context7-mcp"] } } }));
   writeFileSync(join(home, ".codex", "config.toml"), `model = "o3"\n\n[mcp_servers.sentry]\ncommand = "npx"\nargs = ["-y", "@sentry/mcp-server"]\nenv = { SENTRY_TOKEN = "t" }\n\n[mcp_servers.plain]\ncommand = "uvx"\n\n[other]\nx = 1\n`);
   const specs = configSpecs({ home });
-  assert.deepEqual(specs.map((s) => s.client).sort(), ["claude-code", "codex", "cursor", "gemini"]);
+  assert.deepEqual(specs.map((s) => s.client).sort(), ["claude-code", "codex", "cursor", "gemini", "grok"]);
   const t = installGuard({ home });
   assert.deepEqual(t.find((x) => x.client === "claude-code")?.wrapped, ["supabase", "fs"]);
   assert.equal(t.find((x) => x.client === "claude-code")?.skipped[0]?.name, "remote");
-  assert.equal(wrappedServers({ home }).length, 6);
+  assert.equal(wrappedServers({ home }).length, 7);
+  assert.deepEqual(t.find((x) => x.client === "grok")?.wrapped, ["linear"]);
+  assert.match(readFileSync(join(home, ".grok", "config.toml"), "utf8"), /"--client", "grok", "--", "npx", "-y", "linear-mcp"/);
   assert.deepEqual(installGuard({ home }).reduce((n, x) => n + x.wrapped.length, 0), 0, "idempotent");
-  const st = guardStatus({ home }); assert.match(st[0], /6 MCP servers under the guard/);
-  assert.equal(uninstallGuard({ home }).reduce((n, x) => n + x.wrapped.length, 0), 6);
+  const st = guardStatus({ home }); assert.match(st[0], /7 MCP servers under the guard/);
+  assert.equal(uninstallGuard({ home }).reduce((n, x) => n + x.wrapped.length, 0), 7);
   assert.equal(wrappedServers({ home }).length, 0);
   assert.equal(JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")).mcpServers.supabase.command, "npx");
 });
@@ -84,7 +87,7 @@ test("guard install/uninstall against a fake home via the built CLI", async () =
   const r2 = await run(["guard", "install"]);
   assert.match(r2.out, /already under the guard/);
   const st = await run(["guard", "status"]);
-  assert.match(st.out, /6 MCP servers under the guard/);
+  assert.match(st.out, /7 MCP servers under the guard/);
   const r3 = await run(["guard", "uninstall"]);
   assert.equal(r3.code, 0, r3.err);
   const back = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8"));
