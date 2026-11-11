@@ -20,7 +20,7 @@ export interface Component {
   path: string;
   scope: "project" | "user";
   /** Agent the file belongs to. */
-  agent: "claude_code" | "cursor" | "vscode" | "windsurf" | "claude_desktop" | "gemini_cli" | "codex" | "copilot" | "any";
+  agent: "claude_code" | "cursor" | "vscode" | "windsurf" | "claude_desktop" | "gemini_cli" | "codex" | "grok" | "copilot" | "any";
   transport?: "stdio" | "http";
   /** The package a stdio server runs, when it is a registry package (npx / uvx / docker). */
   package?: { registry: "npm" | "pypi" | "docker"; name: string };
@@ -47,6 +47,8 @@ const PROJECT_FILES: { re: RegExp; agent: Component["agent"] }[] = [
   { re: /(^|\/)\.vscode\/mcp\.json$/, agent: "vscode" },
   { re: /(^|\/)\.gemini\/settings\.json$/, agent: "gemini_cli" },
   { re: /(^|\/)\.codex\/config\.toml$/, agent: "codex" },
+  { re: /(^|\/)\.grok\/config\.toml$/, agent: "grok" },
+  { re: /(^|\/)\.grok\/hooks\/[^/]+\.json$/, agent: "grok" },
   { re: /(^|\/)\.github\/copilot-instructions\.md$/, agent: "copilot" },
   { re: /(^|\/)(CLAUDE|AGENTS|GEMINI)\.md$/, agent: "any" },
   { re: /(^|\/)\.(cursorrules|windsurfrules|clinerules)$/, agent: "any" },
@@ -61,6 +63,7 @@ export const USER_CONFIG_FILES: { path: string; agent: Component["agent"] }[] = 
   { path: ".codeium/windsurf/mcp_config.json", agent: "windsurf" },
   { path: ".gemini/settings.json", agent: "gemini_cli" },
   { path: ".codex/config.toml", agent: "codex" },
+  { path: ".grok/config.toml", agent: "grok" },
   { path: "Library/Application Support/Claude/claude_desktop_config.json", agent: "claude_desktop" },
   { path: ".config/Claude/claude_desktop_config.json", agent: "claude_desktop" },
   { path: "AppData/Roaming/Claude/claude_desktop_config.json", agent: "claude_desktop" },
@@ -168,8 +171,8 @@ function claudeSettings(j: Json, path: string, scope: Component["scope"]): Compo
   return out;
 }
 
-/** `[mcp_servers.name]` tables in Codex's config.toml: command, args, env keys. */
-function codexToml(text: string, path: string, scope: Component["scope"]): Component[] {
+/** `[mcp_servers.name]` tables in Codex's or Grok CLI's config.toml: command, args, env keys. */
+function codexToml(text: string, path: string, scope: Component["scope"], agent: Component["agent"] = "codex"): Component[] {
   const out: Component[] = [];
   const blocks = text.split(/^\s*\[/m).slice(1);
   for (const b of blocks) {
@@ -180,8 +183,8 @@ function codexToml(text: string, path: string, scope: Component["scope"]): Compo
       const args = [...(body.match(/^\s*args\s*=\s*\[([^\]]*)\]/m)?.[1] ?? "").matchAll(/"([^"]*)"/g)].map((m) => m[1]);
       const url = body.match(/^\s*url\s*=\s*"([^"]+)"/m)?.[1] ?? null;
       const envKeys = [...(body.match(/^\s*env\s*=\s*\{([^}]*)\}/m)?.[1] ?? "").matchAll(/([\w.-]+)\s*=/g)].map((m) => m[1]);
-      if (url) out.push({ kind: "mcp_server", name: head[2], path, scope, agent: "codex", transport: "http", urlHost: hostOf(url), envKeys, headerKeys: [] });
-      else if (command) out.push({ kind: "mcp_server", name: head[2], path, scope, agent: "codex", transport: "stdio", command: command.split(/[\\/]/).pop(), package: stdioPackage(command, args), envKeys, headerKeys: [] });
+      if (url) out.push({ kind: "mcp_server", name: head[2], path, scope, agent, transport: "http", urlHost: hostOf(url), envKeys, headerKeys: [] });
+      else if (command) out.push({ kind: "mcp_server", name: head[2], path, scope, agent, transport: "stdio", command: command.split(/[\\/]/).pop(), package: stdioPackage(command, args), envKeys, headerKeys: [] });
     }
     const envTable = b.match(/^mcp_servers\.("?)([\w.-]+)\1\.env\]/);
     if (envTable) {
@@ -211,7 +214,7 @@ export function parseAgentConfig(path: string, text: string, scope: Component["s
     const kind = /\/\.claude\/commands\//.test(`/${p}`) ? "slash command" : /\/\.claude\/agents\//.test(`/${p}`) ? "subagent" : "instructions";
     return [{ kind: "instructions", name: kind === "instructions" ? base : `${kind}: ${base.replace(/\.md$/i, "")}`, path: p, scope, agent, envKeys: [], headerKeys: [], detail: `${text.length.toLocaleString("en-US")} characters` }];
   }
-  if (/config\.toml$/.test(p)) return codexToml(text, p, scope);
+  if (/config\.toml$/.test(p)) return codexToml(text, p, scope, agent === "grok" ? "grok" : "codex");
   const j = parseJsonc(text);
   if (!isObj(j)) return [];
   if (/\.claude\/settings(\.local)?\.json$/.test(p)) return claudeSettings(j, p, scope);
