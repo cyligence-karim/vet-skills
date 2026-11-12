@@ -45,8 +45,9 @@ export async function sync(log: (l: string) => void = () => {}): Promise<{ ok: b
   const res = await report({ installed: [], removed: [], hook_version: VERSION, guard: guardPosture() });
   if (!res.ok) return { ok: false, removed: 0, error: res.error };
   const removed = await applyRemovals(res.data.pending_removals, log);
-  // Required-guard mode: the org wants every MCP server under the guard; a machine reporting none installs it now.
-  if (res.data.require_guard && guardPosture().servers === 0) {
+  // Required-guard mode: the org wants every MCP server under the guard. installGuard is idempotent, so each sync wraps
+  // whatever was added to a config since the last one (0.9.1; before, only a machine with nothing wrapped was touched).
+  if (res.data.require_guard) {
     const touched = installGuard();
     const n = touched.reduce((k, t) => k + t.wrapped.length, 0);
     if (n) { log(`${readOrg()?.slug ?? "your org"} requires the guard: ${n} MCP server${n === 1 ? "" : "s"} now run under it (restart the agents to pick it up)`); await report({ installed: [], removed: [], hook_version: VERSION, guard: guardPosture() }).catch(() => null); }

@@ -160,3 +160,21 @@ test("guard: Copilot, Kiro, Qwen, Cline, Zed, Amp and OpenCode configs wrap and 
   assert.equal(JSON.parse(readFileSync(join(home, ".copilot", "mcp-config.json"), "utf8")).mcpServers.gh.command, "npx");
   delete process.env.VET_SKILLS_BIN;
 });
+
+test("guard status names servers added after install; a dry run changes nothing", () => {
+  const home = mkdtempSync(join(tmpdir(), "vs-guard-added-"));
+  mkdirSync(join(home, ".cursor"), { recursive: true });
+  writeFileSync(join(home, ".cursor", "mcp.json"), JSON.stringify({ mcpServers: { a: { command: "npx", args: ["a"] } } }));
+  process.env.VET_SKILLS_BIN = "/opt/vs/vet-skills";
+  installGuard({ home });
+  const before = readFileSync(join(home, ".cursor", "mcp.json"), "utf8");
+  const cfg = JSON.parse(before); cfg.mcpServers.b = { command: "uvx", args: ["b-mcp"] }; writeFileSync(join(home, ".cursor", "mcp.json"), JSON.stringify(cfg));
+  const dry = installGuard({ home, dryRun: true });
+  assert.deepEqual(dry.flatMap((t) => t.wrapped), ["b"]);
+  assert.equal(JSON.parse(readFileSync(join(home, ".cursor", "mcp.json"), "utf8")).mcpServers.b.command, "uvx", "dry run did not write");
+  const status = guardStatus({ home }).join("\n");
+  assert.match(status, /1 stdio server configured since then and NOT under the guard: b \(cursor\)/);
+  installGuard({ home });
+  assert.ok(!/NOT under the guard/.test(guardStatus({ home }).join("\n")));
+  delete process.env.VET_SKILLS_BIN;
+});

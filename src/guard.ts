@@ -138,7 +138,7 @@ function serverMaps(spec: ConfigSpec, root: Json): { label: string; map: Json }[
   return out;
 }
 
-function rewriteJson(spec: ConfigSpec, mode: "wrap" | "unwrap", bin: ReturnType<typeof guardBinary>): Touched | null {
+function rewriteJson(spec: ConfigSpec, mode: "wrap" | "unwrap", bin: ReturnType<typeof guardBinary>, dryRun = false): Touched | null {
   const text = readFileSync(spec.path, "utf8");
   const root = readJsonc(text);
   if (!isObj(root)) return null;
@@ -158,7 +158,7 @@ function rewriteJson(spec: ConfigSpec, mode: "wrap" | "unwrap", bin: ReturnType<
       }
     }
   }
-  if (changed) { backup(spec.path, text); writeFileSync(spec.path, JSON.stringify(root, null, 2) + "\n"); }
+  if (changed && !dryRun) { backup(spec.path, text); writeFileSync(spec.path, JSON.stringify(root, null, 2) + "\n"); }
   return t;
 }
 
@@ -202,7 +202,7 @@ function backup(path: string, text: string) {
   try { mkdirSync(join(GUARD_DIR, "backup"), { recursive: true, mode: 0o700 }); writeFileSync(join(GUARD_DIR, "backup", `${createHash("sha1").update(path).digest("hex").slice(0, 10)}-${Date.now()}.bak`), text); } catch { /* best effort */ }
 }
 
-export function installGuard(opts: { project?: string | null; home?: string } = {}): Touched[] {
+export function installGuard(opts: { project?: string | null; home?: string; dryRun?: boolean } = {}): Touched[] {
   const bin = guardBinary();
   const out: Touched[] = [];
   for (const spec of configSpecs(opts)) {
@@ -210,11 +210,12 @@ export function installGuard(opts: { project?: string | null; home?: string } = 
       if (spec.format === "codex-toml") {
         const text = readFileSync(spec.path, "utf8");
         const r = rewriteCodexToml(text, "wrap", bin, spec.client);
-        if (r.wrapped.length) { backup(spec.path, text); writeFileSync(spec.path, r.text); }
+        if (r.wrapped.length && !opts.dryRun) { backup(spec.path, text); writeFileSync(spec.path, r.text); }
         out.push({ file: spec.path, client: spec.client, wrapped: r.wrapped, skipped: [] });
-      } else { const t = rewriteJson(spec, "wrap", bin); if (t) out.push(t); }
+      } else { const t = rewriteJson(spec, "wrap", bin, opts.dryRun); if (t) out.push(t); }
     } catch (e) { out.push({ file: spec.path, client: spec.client, wrapped: [], skipped: [{ name: "*", why: (e as Error).message }] }); }
   }
+  if (opts.dryRun) return out;
   const reg = readWrapped(); reg.installedAt ??= new Date().toISOString(); reg.binary = bin; reg.files = [...new Set([...(reg.files ?? []), ...out.filter((t) => t.wrapped.length).map((t) => t.file)])];
   writeWrapped(reg);
   return out;
@@ -473,6 +474,9 @@ export function guardStatus(opts: { project?: string | null; home?: string } = {
   const reg = readWrapped();
   lines.push(w.length ? `${w.length} MCP server${w.length === 1 ? "" : "s"} under the guard${reg.installedAt ? ` since ${reg.installedAt.slice(0, 10)}` : ""}:` : "No MCP server is under the guard. Run: vet-skills guard install");
   for (const s of w) lines.push(`  ${s.name.padEnd(28)} ${s.client.padEnd(14)} ${s.command}`);
+  // Servers added to a config since the last install are not wrapped until the next `guard install` (or org sync under a required guard).
+  const pending = installGuard({ ...opts, dryRun: true }).flatMap((t) => t.wrapped.map((n) => `${n} (${t.client})`));
+  if (pending.length) lines.push("", `${pending.length} stdio server${pending.length === 1 ? "" : "s"} configured since then and NOT under the guard: ${pending.join(", ")} — run: vet-skills guard install`);
   const log = readGuardLog(7);
   const sessions = log.filter((e) => e.kind === "start");
   const hosts = log.filter((e) => e.kind === "host");
