@@ -18,7 +18,7 @@ import { API, VERSION } from "./state.js";
 import { resolveSkill } from "./api.js";
 
 export interface Envelope { payloadType: string; payload: string; signatures: { keyid: string; sig: string }[] }
-export interface Statement { _type: string; issuer: string; issued_at: string; subject: { name: string; publisher: string; registry: string; version: string; artifact_hash: string }; predicate: { verdict_id: string; label: string; score: number; engine_version: string; scenarios_run: number; static_only: boolean; detonated_at: string; superseded: boolean; verdict_url: string } }
+export interface Statement { _type: string; issuer: string; issued_at: string; subject: { name: string; publisher: string; registry: string; version: string; artifact_hash: string }; predicate: { verdict_id: string; label: string; score: number; engine_version: string; scenarios_run: number; static_only: boolean; /** Signed since Nov 2026; absent on older envelopes. */ coverage?: { level: string; could_not_test: string[]; needs: string[] }; detonated_at: string; superseded: boolean; verdict_url: string } }
 export interface Jwk { kid: string; kty: string; crv: string; x: string; dev?: boolean }
 export interface LockEntry { name: string; path: string; artifact_hash: string; verdict: { id: string; label: string; score: number; engine_version: string } | null; attestation: Envelope | null }
 export interface Lockfile { version: 1; generated_at: string; generated_by: string; issuer: string; keys: Jwk[]; skills: LockEntry[] }
@@ -26,6 +26,11 @@ export interface Lockfile { version: 1; generated_at: string; generated_by: stri
 export const LOCKFILE = "vet-skills.lock";
 const PAYLOAD_TYPE = "application/vnd.killerskills.verdict+json";
 const SKIP = new Set(["node_modules", ".git", ".pglite", ".next", "__pycache__", ".venv"]);
+
+/** Coverage levels in increasing order of how far the sandbox run got. */
+export const COVERAGE_RANK: Record<string, number> = { static_only: 0, install_failed: 0, install_only: 1, startup_only: 2, full: 3 };
+export function coverageLabel(st: Statement): string { const c = st.predicate.coverage; return c ? `coverage ${c.level.replace(/_/g, " ")}${c.could_not_test.length ? ` (${c.could_not_test.length} not tested)` : ""}` : st.predicate.static_only ? "coverage static only" : "coverage not stated (older envelope)"; }
+export function coverageMeets(level: string | undefined | null, min: "any" | "install_only" | "startup_only" | "full"): boolean { return min === "any" || (COVERAGE_RANK[level ?? "static_only"] ?? 0) >= COVERAGE_RANK[min]; }
 
 /** Same canonical hash as the sandbox: sorted paths, "\0", bytes, "\0". */
 export function bundleHash(root: string): string {
@@ -108,7 +113,7 @@ export async function verifyOne(target: string, keys: Jwk[]): Promise<VerifyRepo
   const v = verifyEnvelope(env, keys);
   if (!v.ok || !v.statement) return { subject, hash, ok: false, detail: v.reason, statement: null };
   if (v.statement.subject.artifact_hash !== hash) return { subject, hash, ok: false, detail: "attestation is for a different artifact", statement: v.statement };
-  return { subject, hash, ok: true, detail: `${v.statement.predicate.label} ${v.statement.predicate.score} · engine ${v.statement.predicate.engine_version} · signed by ${v.kid}${v.statement.predicate.superseded ? " · superseded" : ""}`, statement: v.statement };
+  return { subject, hash, ok: true, detail: `${v.statement.predicate.label} ${v.statement.predicate.score} · ${coverageLabel(v.statement)} · engine ${v.statement.predicate.engine_version} · signed by ${v.kid}${v.statement.predicate.superseded ? " · superseded" : ""}`, statement: v.statement };
 }
 
 export async function writeLock(dir = process.cwd()): Promise<{ file: string; lock: Lockfile; missing: string[] }> {
@@ -144,6 +149,6 @@ export function verifyLock(lock: Lockfile): VerifyReport[] {
     const v = verifyEnvelope(e.attestation, lock.keys);
     if (!v.ok || !v.statement) return { subject: e.name, hash, ok: false, detail: v.reason, statement: null };
     if (v.statement.subject.artifact_hash !== hash) return { subject: e.name, hash, ok: false, detail: "attestation is for a different artifact", statement: v.statement };
-    return { subject: e.name, hash, ok: true, detail: `${v.statement.predicate.label} ${v.statement.predicate.score} · engine ${v.statement.predicate.engine_version} · signed by ${v.kid}`, statement: v.statement };
+    return { subject: e.name, hash, ok: true, detail: `${v.statement.predicate.label} ${v.statement.predicate.score} · ${coverageLabel(v.statement)} · engine ${v.statement.predicate.engine_version} · signed by ${v.kid}`, statement: v.statement };
   });
 }

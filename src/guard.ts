@@ -22,7 +22,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
-import { approvalCreate, approvalPoll, guardReport, guardSighting, launchCheck, resolveSkill, type GuardSessionReport } from "./api.js";
+import { coverageMeets } from "./attest.js";
+import { approvalCreate, approvalPoll, behaviorDiff, guardReport, guardSighting, launchCheck, resolveSkill, type GuardSessionReport } from "./api.js";
 import { guard, parseRunArgs, type GuardEvent, type RunOptions } from "./run.js";
 import { HOME, VERSION, clientId, readOrg, readPolicy, telemetryEnabled, type ResolveResponse } from "./state.js";
 import { mint, secretsSpecFor, type Minted } from "./exchange.js";
@@ -36,6 +37,20 @@ const GUARD_DIR = join(HOME, "guard");
 const WRAPPED = join(GUARD_DIR, "wrapped.json");
 const BASELINE = join(GUARD_DIR, "hosts.json");
 const OPAQUE = join(GUARD_DIR, "opaque.json");
+const PINS = join(GUARD_DIR, "pins.json");
+/** The version of each package last allowed to run on this machine; an update is compared against it (runtime.on_change). */
+type Pin = { semver: string; at: string; server?: string; pending?: { id: string; to: string }; acceptNext?: boolean };
+export function readPins(): Record<string, Pin> { try { return JSON.parse(readFileSync(PINS, "utf8")) as Record<string, Pin>; } catch { return {}; } }
+function writePins(p: Record<string, Pin>) { try { mkdirSync(GUARD_DIR, { recursive: true, mode: 0o700 }); writeFileSync(PINS, JSON.stringify(p, null, 2)); } catch { /* best effort */ } }
+/** `vet-skills guard approve <package>`: accept whatever version launches next for that package (personal machines only). */
+export function approvePinned(pkgOrServer: string): { ok: boolean; message: string } {
+  if (readOrg()) return { ok: false, message: "This machine is enrolled in an organization: held updates are decided by an approver in the dashboard or Slack, not here." };
+  const pins = readPins();
+  const key = Object.keys(pins).find((k) => k === pkgOrServer || k.endsWith(`:${pkgOrServer}`) || pins[k].server === pkgOrServer);
+  if (!key) return { ok: false, message: `Nothing on record for ${pkgOrServer}. Known: ${Object.keys(pins).map((k) => k.split(":").slice(1).join(":")).join(", ") || "none"}.` };
+  pins[key].acceptNext = true; writePins(pins);
+  return { ok: true, message: `The next version of ${key.split(":").slice(1).join(":")} to launch will be accepted and becomes the new baseline (currently ${pins[key].semver}). Restart the agent.` };
+}
 const LOG = join(HOME, "runtime", "guard.jsonl");
 
 export function configSpecs(opts: { home?: string; project?: string | null } = {}): ConfigSpec[] {
@@ -345,6 +360,60 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
     report.launch = "warned"; report.launch_reason = why;
     log(`⚠ launching ${a.server} although ${why} (policy runtime.blocked_versions: warn)`);
   }
+  // Update check: this package ran here before at another version. What the new one reaches for that the old one did
+  // not decides whether it just runs (allow), runs with a notice (warn), or waits for a person (hold).
+  if (semver && v) {
+    const pins = readPins(); const key = `${registry ?? ""}:${pkg}`; const pin = pins[key];
+    const setPin = () => { pins[key] = { semver, at: new Date().toISOString(), server: a.server }; writePins(pins); };
+    if (!pin) setPin();
+    else if (pin.semver !== semver && pin.acceptNext) { log(`${pkg} ${pin.semver} → ${semver} accepted (vet-skills guard approve)`); setPin(); }
+    else if (pin.semver !== semver && rt.onChange !== "allow") {
+      const d = await behaviorDiff(pkg, registry, semver, pin.semver).catch(() => null);
+      if (!d || !d.ok) { log(`${pkg} changed ${pin.semver} → ${semver}; no comparison on record${d && !d.ok && d.status !== 404 ? ` (${d.error})` : ""}, so nothing to hold on. https://killerskills.ai${v.skill.page ?? ""}`); setPin(); }
+      else if (!d.data.escalates) { log(`${pkg} ${pin.semver} → ${semver}: nothing new reached for in the sandbox${d.data.notes.length ? ` (${d.data.notes[0]})` : ""}`); setPin(); }
+      else {
+        const what = `${pkg} ${pin.semver} → ${semver} reaches for more than the version last run here: ${d.data.summary}`;
+        appendGuardLog({ kind: "update_escalates", session, server: a.server, pkg, from: pin.semver, to: semver, summary: d.data.summary, action: rt.onChange });
+        if (rt.onChange === "warn") {
+          report.launch = "warned"; report.launch_reason = what;
+          log(`⚠ ${what}. Launching (policy runtime.on_change: warn). vet-skills diff ${pkg} ${pin.semver} ${semver}`);
+          setPin();
+        } else {
+          let allowed = false; let detail = "";
+          if (org) {
+            if (pin.pending?.to === semver) {
+              const st = await approvalPoll(pin.pending.id).catch(() => null);
+              if (st && st.ok && st.data.status === "approved") { allowed = true; log(`${pkg} ${pin.semver} → ${semver} approved by ${st.data.by ?? "an approver"}`); }
+              else if (st && st.ok && st.data.status === "pending") detail = "an approver has not decided yet";
+              else if (st && st.ok && st.data.status === "denied") detail = `denied by ${st.data.by ?? "an approver"}; pin ${pkg}@${pin.semver} in the config to keep the approved version`;
+            }
+            if (!allowed && !detail) {
+              const c = await approvalCreate({ server: a.server, pkg, semver, tool: `update ${pin.semver} → ${semver}`, arg_keys: [...d.data.added.hosts.map((h) => `host:${h}`), ...d.data.added.credentialEnv.map((e) => `credential:${e}`), ...d.data.added.tools.map((x) => `tool:${x}`), ...d.data.changedTools.map((x) => `rewritten:${x}`)].slice(0, 50), arg_preview: d.data.summary.slice(0, 400), reason: "runtime.on_change: hold", session, timeout_seconds: 3600 }).catch(() => null);
+              if (c && c.ok) { pins[key] = { ...pin, pending: { id: c.data.id, to: semver } }; writePins(pins); detail = `approval requested: ${c.data.url}`; }
+              else detail = "the approval request could not be created; held until the org can be reached";
+            }
+          } else detail = `to accept it: vet-skills guard approve ${pkg}   ·   to see it: vet-skills diff ${pkg} ${pin.semver} ${semver}`;
+          if (allowed) setPin();
+          else {
+            report.launch = "refused"; report.launch_reason = `${what} (held: ${detail})`; report.exit_code = 1;
+            appendGuardLog({ kind: "launch_refused", session, server: a.server, pkg, semver, why: report.launch_reason });
+            log(`✕ holding ${a.server}: ${what}. Policy runtime.on_change: hold${source === "org" ? " (org)" : ""} — ${detail}.`);
+            await flush(true);
+            return 1;
+          }
+        }
+      }
+    }
+  }
+  // Minimum coverage: a verdict resting on less of a run than policy asks for is announced at launch and recorded, so
+  // "Verified" from a run that never reached the tools is not mistaken for a vetted server.
+  const covLevel = v?.trace_summary?.coverage?.level ?? (v?.verdict ? "static_only" : null);
+  if (v?.verdict && !coverageMeets(covLevel, rt.minCoverage)) {
+    const why = `its verdict rests on ${String(covLevel).replace(/_/g, " ")} coverage; policy runtime.min_coverage asks for ${rt.minCoverage.replace(/_/g, " ")}`;
+    if (report.launch === "ran") { report.launch = "warned"; report.launch_reason = why; }
+    appendGuardLog({ kind: "coverage_below_min", session, server: a.server, pkg, semver, level: covLevel, min: rt.minCoverage });
+    log(`⚠ ${a.server} (${pkg}${semver ? `@${semver}` : ""}): ${why}. Treat it as unvetted at runtime; the guard still records hosts and applies tool rules.`);
+  }
   // Short-lived credentials first: a policy exchange rule for a variable this server wants replaces the long-lived value
   // in our environment with a minted, scoped, minutes-long token; the broker then binds that. Failure falls back to the
   // long-lived value under the broker, and says so.
@@ -435,8 +504,26 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
       } catch (e) { log(`⚠ could not renew ${rule.var}: ${(e as Error).message}; the current token expires ${m.expiresAt.toISOString().slice(11, 16)} UTC`); }
     }
   }, 60_000); renew.unref();
+  // Live revocation: the launch check is asked again while the server runs. A version revoked (or confirmed malicious)
+  // mid-session is stopped or announced, per policy runtime.revoke_running. One check a minute, three-second budget.
+  let stop: ((reason: string) => void) | null = null;
+  opts.onStopper = (fn) => { stop = fn; };
+  let revokedSeen = false;
+  const watchEvery = Math.max(5_000, Number(process.env.VET_SKILLS_REVOKE_POLL_MS) || 60_000);
+  const watch = setInterval(async () => {
+    if (revokedSeen) return;
+    const r = await launchCheck(pkg, semver, registry).catch(() => null);
+    if (!r || !r.ok || r.data.state !== "revoked") return;
+    revokedSeen = true;
+    const why = `${pkg}${semver ? `@${semver}` : ""} was revoked while running${r.data.reason ? `: ${r.data.reason}` : ""}`;
+    report.launch_reason = why;
+    appendGuardLog({ kind: "revoked_running", session, server: a.server, pkg, semver, why, action: rt.revokeRunning });
+    if (rt.revokeRunning === "kill") { report.launch = "stopped"; stop?.(why); }
+    else { report.launch = "warned"; log(`⚠ ${why}. The server keeps running (policy runtime.revoke_running: warn); restart the agent to drop it, or set revoke_running: kill.${r.data.page ? ` https://killerskills.ai${r.data.page}` : ""}`); }
+    await flush(false).catch(() => null);
+  }, watchEvery); watch.unref();
   const code = await guard(parsed.cmd, opts);
-  clearInterval(timer); clearInterval(renew);
+  clearInterval(timer); clearInterval(renew); clearInterval(watch);
   for (const m of minted) { await m.revoke?.().catch(() => null); if (m.revoke) log(`revoked the ${m.kind.replace("_", " ")} credential minted for this session`); }
   // Baseline: the hosts this version reached on this machine, so the next session knows what is new.
   const b = readBaseline(); const cur = b[key] ?? { hosts: [], sessions: 0, last: started };

@@ -6,7 +6,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
-import { approvalDecideInstall, approvalDecideTool, approvalsPending, reviewPackCreate, reviewPackDownload, reviewPackGet, reviewPacks, reviewSetDisposition, threatsFeed, type ApiResult } from "./api.js";
+import { behaviorDiff, approvalDecideInstall, approvalDecideTool, approvalsPending, reviewPackCreate, reviewPackDownload, reviewPackGet, reviewPacks, reviewSetDisposition, threatsFeed, type ApiResult } from "./api.js";
 import { readOrg } from "./state.js";
 import { c, pad } from "./render.js";
 
@@ -161,4 +161,26 @@ export async function threatsCmd(args: string[]): Promise<number> {
   for (const i of list.slice(0, 50)) out(`${pad(i.status === "confirmed" ? c.blocked(i.status) : c.muted(i.status), 20)} ${pad(`${i.package}${i.semver ? `@${i.semver}` : ""}`, 44)} ${pad(i.registry, 8)} ${day(i.opened_at)} ${(i.kinds ?? []).join(", ")}${i.observed ? c.muted(` · ${i.observed.slice(0, 80)}`) : ""}`);
   out(c.muted(`\n${list.length} incidents · --json for the full feed, --stix for STIX 2.1 · https://killerskills.ai/threats`));
   return 0;
+}
+
+/* ------------------------------------------------------------------- diff */
+
+export async function diffCmd(args: string[]): Promise<number> {
+  const pos = args.filter((x) => !x.startsWith("--")); const json = has(args, "json");
+  const [pkg, a1, a2] = pos;
+  if (!pkg || !a1) { err("usage: vet-skills diff <package> <to>            compare with the previous scored version\n       vet-skills diff <package> <from> <to>     compare two versions   [--registry npm|pypi|…] [--json]"); return 2; }
+  const from = a2 ? a1 : null; const to = a2 ?? a1;
+  const r = await behaviorDiff(pkg, flag(args, "registry"), to, from);
+  if (!r.ok) { err(r.status === 404 ? `${c.caution("?")} no scored pair of versions to compare for ${pkg}${from ? ` ${from} → ${to}` : ` @${to}`}. Both need a verdict on record.` : `${c.blocked("✕")} ${r.error}`); return 1; }
+  const d = r.data;
+  if (json) { out(JSON.stringify(d, null, 2)); return d.escalates ? 3 : 0; }
+  out(`${c.bold(d.package)} ${d.from} → ${d.to}${d.from_verdict && d.to_verdict ? c.muted(`   ${d.from_verdict.label} ${d.from_verdict.score} → ${d.to_verdict.label} ${d.to_verdict.score}`) : ""}`);
+  out(d.escalates ? `${c.caution("!")} reaches for more than ${d.from}: ${d.summary}` : `${c.verified("✓")} nothing new reached for in the sandbox`);
+  const row = (label: string, list: string[], tone: (s: string) => string) => { if (list.length) out(`  ${pad(label, 28)} ${tone(list.slice(0, 20).join(", "))}${list.length > 20 ? ` +${list.length - 20}` : ""}`); };
+  row("+ hosts", d.added.hosts, c.caution); row("+ credential variables", d.added.credentialEnv, c.caution); row("+ credential files", d.added.credentialFiles, c.caution);
+  row("+ tools", d.added.tools, c.caution); row("~ rewritten descriptors", d.changedTools, c.caution); row("+ install scripts", d.added.installScripts, c.caution); row("+ agent-memory writes", d.added.memoryWrites, c.caution);
+  row("- hosts", d.removed.hosts, c.muted); row("- tools", d.removed.tools, c.muted); row("- credential variables", d.removed.credentialEnv, c.muted);
+  for (const n of d.notes) out(c.muted(`  note: ${n}`));
+  out(c.muted("Compared from the two recorded sandbox runs, not from source. Exit code 3 when the update escalates."));
+  return d.escalates ? 3 : 0;
 }

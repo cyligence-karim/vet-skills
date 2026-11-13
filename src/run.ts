@@ -44,6 +44,8 @@ export interface RunOptions {
   /** Decides a held tool call; resolves to true (run) or false (deny). Absent ⇒ approve behaves as deny with a notice. */ approver?: (call: { server: string; tool: string; args: Record<string, unknown>; rule: ToolRule | null }) => Promise<{ allowed: boolean; by: string; id?: string }>;
   /** Hosts the server's own code names (from the verdict's credential surface), to label a contacted host as its own. */ ownHosts?: string[];
   /** The live bindings once parsed, so the caller can rotate `value` in place (short-lived credential renewal). */ onBindings?: (bindings: SecretBinding[]) => void;
+  /** Hands the caller a function that stops the running server: pending calls are answered with the reason, later calls
+   *  are refused, the process gets SIGTERM and, 5 s later, SIGKILL. Used when a version is revoked mid-session. */ onStopper?: (stop: (reason: string) => void) => void;
 }
 
 export type HostMode = "brokered" | "tunnel" | "plain" | "opaque";
@@ -56,6 +58,7 @@ export type GuardEvent =
   | { kind: "canary"; where: string; tool: string }
   | { kind: "poison"; tool: string; summary: string }
   | { kind: "pin_fallback"; host: string }
+  | { kind: "stopped"; reason: string; pending: number }
   | { kind: "exit"; code: number | null; calls: number; denied: number; blocked: number };
 
 /** The broker side of the proxy: bound hosts are TLS-terminated and their requests rewritten. */
@@ -254,9 +257,22 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   // sees a later call before an earlier one was decided.
   let inBuf = "";
   let chain: Promise<void> = Promise.resolve();
+  let stopped: string | null = null;
+  opts.onStopper?.((reason) => {
+    if (stopped) return;
+    stopped = reason;
+    const n = pending.size;
+    for (const id of pending.keys()) refuse(id, -32000, `Server stopped by the guard: ${reason}`);
+    pending.clear();
+    emit({ kind: "stopped", reason, pending: n });
+    log(`✕ stopping ${opts.label}: ${reason}${n ? ` · ${n} pending call${n === 1 ? "" : "s"} answered with the reason` : ""}`);
+    try { child.kill("SIGTERM"); } catch { /* already gone */ }
+    setTimeout(() => { try { if (child.exitCode === null) child.kill("SIGKILL"); } catch { /* gone */ } }, 5000).unref();
+  });
   const handleLine = async (line: string) => {
     let m: { id?: number | string; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } } | null = null;
     try { m = JSON.parse(line); } catch { /* pass through */ }
+    if (stopped) { if (m?.id !== undefined && m.method) refuse(m.id, -32000, `Server stopped by the guard: ${stopped}`); return; }
     if (m?.method === "tools/call" && m.params?.name) {
       const name = m.params.name;
       const args = m.params.arguments ?? {};
@@ -309,7 +325,7 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
       record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "allowed", id: m.id, rule: rule?.match ?? "default" });
       if (m.id !== undefined) pending.set(m.id, name);
     }
-    child.stdin.write(line + "\n");
+    if (!child.stdin.destroyed) child.stdin.write(line + "\n");
   };
   process.stdin.on("data", (chunk) => {
     inBuf += chunk.toString();

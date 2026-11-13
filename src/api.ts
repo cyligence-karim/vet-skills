@@ -78,7 +78,7 @@ export interface GuardSessionReport {
   hosts: { host: string; port: number; mode: string; expected: boolean; first_seen_here: boolean }[];
   tools: { tool: string; calls: number; denied: number; approved: number }[];
   secrets: { name: string; host: string; refused: boolean; exchange?: { kind: string; scope: string; expires: string } }[];
-  canary: boolean; poison: string[]; launch: "ran" | "refused" | "warned"; launch_reason: string | null;
+  canary: boolean; poison: string[]; launch: "ran" | "refused" | "warned" | "stopped"; launch_reason: string | null;
   guard_version: string; policy_version: number | null;
   /** Per-call decisions (deny/held always; allow folded per tool and minute). Key names only. */
   decisions?: { tool: string; outcome: "allow" | "deny" | "held"; rule: string; at: string; count: number; reply_observed: boolean | null; approval_id: string | null; disposition: string | null; arg_keys: string[] }[];
@@ -195,4 +195,11 @@ export function approvalDecideTool(id: string, decision: "approved" | "denied") 
 export async function threatsFeed(stix: boolean): Promise<ApiResult<unknown>> {
   if (!stix) return call<unknown>("/api/v1/threats", {}, 20000);
   try { const res = await fetch(`${API}/api/v1/threats.stix`, { headers: { "user-agent": `vet-skills/${VERSION}` } }); const text = await res.text(); if (!res.ok) return { ok: false, status: res.status, error: res.statusText, offline: res.status >= 500 }; return { ok: true, data: text }; } catch (e) { return { ok: false, error: (e as Error).message, offline: true }; }
+}
+
+/* ---- version behavior diff ---- */
+export type DiffResult = { package: string; registry: string; from: string; to: string; added: { hosts: string[]; tools: string[]; credentialEnv: string[]; credentialFiles: string[]; installScripts: string[]; memoryWrites: string[] }; removed: { hosts: string[]; tools: string[]; credentialEnv: string[]; credentialFiles: string[] }; changedTools: string[]; escalates: boolean; comparable: boolean; notes: string[]; summary: string; from_verdict: { label: string; score: number } | null; to_verdict: { label: string; score: number } | null };
+export function behaviorDiff(pkg: string, registry: string | null | undefined, to: string, from?: string | null) {
+  const qs = new URLSearchParams({ pkg, to }); if (from) qs.set("from", from); if (registry) qs.set("registry", registry);
+  return call<DiffResult>(`/api/v1/diff?${qs}`, {}, 6000);
 }

@@ -64,6 +64,12 @@ export interface RuntimePolicy {
   newHost: "allow" | "warn" | "block";
   secrets: "broker" | "passthrough";
   blockedVersions: "refuse" | "warn";
+  /** A version revoked or confirmed malicious while its server is already running: stop the process, or only say so. */
+  revokeRunning: "warn" | "kill";
+  /** A server launching a different artifact than the one last run here, whose behavior diff adds a host, credential or tool. */
+  onChange: "allow" | "warn" | "hold";
+  /** The least sandbox coverage a verdict may rest on before the guard treats the version as unvetted (warns at launch). */
+  minCoverage: "any" | "install_only" | "startup_only" | "full";
   tools: ToolRule[];
   defaultToolAction: ToolAction;
   /** Seconds a held tool call waits for an approval before it is denied. */
@@ -91,7 +97,7 @@ export interface ExchangeRule {
 }
 export type ToolAction = "allow" | "deny" | "approve";
 export interface ToolRule { match: string; action: ToolAction; reason?: string }
-export const DEFAULT_RUNTIME: RuntimePolicy = { network: "observe", newHost: "warn", secrets: "broker", blockedVersions: "refuse", tools: [], defaultToolAction: "allow", approvalTimeoutSeconds: 300, exchange: [] };
+export const DEFAULT_RUNTIME: RuntimePolicy = { network: "observe", newHost: "warn", secrets: "broker", blockedVersions: "refuse", revokeRunning: "warn", onChange: "warn", minCoverage: "any", tools: [], defaultToolAction: "allow", approvalTimeoutSeconds: 300, exchange: [] };
 /** Tool names that change or destroy state: the strict runtime policy holds them for approval. */
 export const DESTRUCTIVE_TOOL_GLOBS = ["delete_*", "*_delete", "remove_*", "drop_*", "destroy_*", "purge_*", "force_push*", "*_force", "execute_sql", "run_sql", "run_query", "send_email", "send_message", "transfer_*", "pay_*", "deploy_*", "rotate_*", "revoke_*"];
 export type CoverageLevel = "full" | "startup_only" | "install_failed" | "install_only" | "static_only";
@@ -240,6 +246,9 @@ export function parsePolicyYaml(text: string): Policy {
     newHost: str(rt.new_host, ["allow", "warn", "block"] as const, DEFAULT_RUNTIME.newHost),
     secrets: str(rt.secrets, ["broker", "passthrough"] as const, DEFAULT_RUNTIME.secrets),
     blockedVersions: str(rt.blocked_versions, ["refuse", "warn"] as const, DEFAULT_RUNTIME.blockedVersions),
+    revokeRunning: str(rt.revoke_running, ["warn", "kill"] as const, DEFAULT_RUNTIME.revokeRunning),
+    onChange: str(rt.on_change, ["allow", "warn", "hold"] as const, DEFAULT_RUNTIME.onChange),
+    minCoverage: str(rt.min_coverage, ["any", "install_only", "startup_only", "full"] as const, DEFAULT_RUNTIME.minCoverage),
     tools,
     defaultToolAction: str(rt.default_tool_action, ["allow", "deny", "approve"] as const, DEFAULT_RUNTIME.defaultToolAction),
     approvalTimeoutSeconds: Math.min(3600, Math.max(10, num(rt.approval_timeout_seconds, DEFAULT_RUNTIME.approvalTimeoutSeconds))),
@@ -297,7 +306,7 @@ export function serializePolicyYaml(p: Policy): string {
     agents: p.agents,
     approvals: { ttl_days: p.approvals.ttlDays, blocked_exception_approvers: p.approvals.blockedExceptionApprovers },
     context: p.context ?? DEFAULT_CONTEXT,
-    runtime: { network: p.runtime.network, new_host: p.runtime.newHost, secrets: p.runtime.secrets, blocked_versions: p.runtime.blockedVersions, default_tool_action: p.runtime.defaultToolAction, approval_timeout_seconds: p.runtime.approvalTimeoutSeconds, tools: p.runtime.tools.map((t) => ({ match: t.match, action: t.action, ...(t.reason ? { reason: t.reason } : {}) })), ...(p.runtime.exchange.length ? { exchange: p.runtime.exchange.map((e) => ({ var: e.var, kind: e.kind, ...(e.host ? { host: e.host } : {}), ...(e.appId ? { app_id: e.appId } : {}), ...(e.installationId ? { installation_id: e.installationId } : {}), ...(e.repositories ? { repositories: e.repositories } : {}), ...(e.permissions ? { permissions: e.permissions } : {}), ...(e.roleArn ? { role_arn: e.roleArn } : {}), ...(e.durationSeconds ? { duration_seconds: e.durationSeconds } : {}), ...(e.sessionPolicy ? { session_policy: e.sessionPolicy } : {}), ...(e.serviceAccount ? { service_account: e.serviceAccount } : {}), ...(e.scopes ? { scopes: e.scopes } : {}) })) } : {}) },
+    runtime: { network: p.runtime.network, new_host: p.runtime.newHost, secrets: p.runtime.secrets, blocked_versions: p.runtime.blockedVersions, revoke_running: p.runtime.revokeRunning, on_change: p.runtime.onChange, min_coverage: p.runtime.minCoverage, default_tool_action: p.runtime.defaultToolAction, approval_timeout_seconds: p.runtime.approvalTimeoutSeconds, tools: p.runtime.tools.map((t) => ({ match: t.match, action: t.action, ...(t.reason ? { reason: t.reason } : {}) })), ...(p.runtime.exchange.length ? { exchange: p.runtime.exchange.map((e) => ({ var: e.var, kind: e.kind, ...(e.host ? { host: e.host } : {}), ...(e.appId ? { app_id: e.appId } : {}), ...(e.installationId ? { installation_id: e.installationId } : {}), ...(e.repositories ? { repositories: e.repositories } : {}), ...(e.permissions ? { permissions: e.permissions } : {}), ...(e.roleArn ? { role_arn: e.roleArn } : {}), ...(e.durationSeconds ? { duration_seconds: e.durationSeconds } : {}), ...(e.sessionPolicy ? { session_policy: e.sessionPolicy } : {}), ...(e.serviceAccount ? { service_account: e.serviceAccount } : {}), ...(e.scopes ? { scopes: e.scopes } : {}) })) } : {}) },
   });
 }
 

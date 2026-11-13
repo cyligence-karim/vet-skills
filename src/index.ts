@@ -56,18 +56,18 @@ import { applyRemovals, sync } from "./sync.js";
 import { fetchKeys, readLock, verifyLock, verifyOne, writeLock, LOCKFILE } from "./attest.js";
 import { observe, pruneSessions, readDeviations, readAllows, recordPrompt, revokeAllow } from "./runtime.js";
 import { plantCanaries, readCanaries, removeCanaries } from "./canary.js";
-import { execGuarded, guardStatus, installGuard, parseExecArgs, uninstallGuard } from "./guard.js";
+import { approvePinned, execGuarded, guardStatus, installGuard, parseExecArgs, uninstallGuard } from "./guard.js";
 import { guardPosture } from "./sync.js";
 import { funnelGuardInstall } from "./api.js";
 import { homedir } from "node:os";
 import { c } from "./render.js";
-import { approvalsCmd, reviewCmd, threatsCmd } from "./org.js";
+import { approvalsCmd, diffCmd, reviewCmd, threatsCmd } from "./org.js";
 
 // `run` and `guard exec` own everything after them (their own flags, then `--` and the server command); the shared parser never sees them.
 const RUN_AT = process.argv.indexOf("run", 2);
 const GUARD_EXEC = process.argv[2] === "guard" && process.argv[3] === "exec";
 /** review / approvals / threats take their own flags (--month, --from, --by …); they parse process.argv themselves. */
-const ORG_CMD = ["review", "approvals", "threats"].includes(process.argv[2] ?? "");
+const ORG_CMD = ["review", "approvals", "threats", "diff"].includes(process.argv[2] ?? "");
 const { values, positionals } = parseArgs({
   args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", "exec"] : ORG_CMD ? [process.argv[2]] : process.argv.slice(2),
   allowPositionals: true,
@@ -117,6 +117,8 @@ Get started:
   vet-skills review [list|create|show|disposition|download]   access review packs for the org (approver); verify <pack.zip> needs no account
   vet-skills approvals [list|approve <id>|deny <id>]   pending install requests and held tool calls, decided from the terminal (approver)
   vet-skills threats [--json|--stix]    the confirmed-incident feed
+  vet-skills diff <pkg> [<from>] <to>   what one version did in the sandbox that another did not (exit 3 when it reaches for more)
+  vet-skills guard approve <pkg>        accept a held update on a personal machine (runtime.on_change: hold)
 
 Docs: https://killerskills.ai/docs/cli
 `;
@@ -186,12 +188,17 @@ async function main(): Promise<number> {
     case "review": return reviewCmd(process.argv[3], process.argv.slice(4));
     case "approvals": return approvalsCmd(process.argv[3], process.argv.slice(4));
     case "threats": return threatsCmd(process.argv.slice(3));
+    case "diff": return diffCmd(process.argv.slice(3));
     case "guard": {
       const sub = rest[0];
       if (sub === "exec") {
         const a = parseExecArgs(process.argv.slice(4));
         if ("error" in a) { console.error(a.error); return 2; }
         return execGuarded(a);
+      }
+      if (sub === "approve") {
+        if (!rest[1]) { console.error("usage: vet-skills guard approve <package>"); return 2; }
+        const r = approvePinned(rest[1]); console.log(r.ok ? `${c.verified("✓")} ${r.message}` : `${c.blocked("✕")} ${r.message}`); return r.ok ? 0 : 1;
       }
       const project = values.project ? process.cwd() : null;
       if (sub === "install" || sub === undefined) {
