@@ -5,12 +5,14 @@
  * ./.claude/skills/<name>; anything we cannot find on disk is reported as
  * already gone rather than left pending forever.
  */
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { confirmRemoval, report, type ReportResponse } from "./api.js";
+import { confirmRemoval, discoverReport, report, type ReportResponse } from "./api.js";
+import { discoverLocal } from "./discover.js";
+import { componentsForSync } from "./inventory.js";
 import { installGuard, wrappedServers } from "./guard.js";
-import { VERSION, readOrg } from "./state.js";
+import { HOME, VERSION, readOrg } from "./state.js";
 
 export function skillDirs(name: string): string[] {
   const bare = name.replace(/^.*\//, "").replace(/@.*$/, "");
@@ -52,7 +54,19 @@ export async function sync(log: (l: string) => void = () => {}): Promise<{ ok: b
     const n = touched.reduce((k, t) => k + t.wrapped.length, 0);
     if (n) { log(`${readOrg()?.slug ?? "your org"} requires the guard: ${n} MCP server${n === 1 ? "" : "s"} now run under it (restart the agents to pick it up)`); await report({ installed: [], removed: [], hook_version: VERSION, guard: guardPosture() }).catch(() => null); }
   }
+  await syncInventory();
   return { ok: true, removed };
+}
+
+const INVENTORY_STAMP = join(HOME, "inventory-synced");
+/** The machine's inventory goes to the org with a sync, at most every six hours (the hook syncs after every decision). Names only. */
+export async function syncInventory(force = false): Promise<boolean> {
+  try {
+    if (!force) { try { if (Date.now() - statSync(INVENTORY_STAMP).mtimeMs < 6 * 3600_000) return false; } catch { /* never synced */ } }
+    const r = await discoverReport(componentsForSync(discoverLocal()), true);
+    if (r.ok) { mkdirSync(HOME, { recursive: true, mode: 0o700 }); writeFileSync(INVENTORY_STAMP, new Date().toISOString()); }
+    return r.ok;
+  } catch { return false; }
 }
 
 /** How many stdio MCP servers on this machine run under the guard, and in which clients. */

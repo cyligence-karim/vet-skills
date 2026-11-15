@@ -235,6 +235,7 @@ judges intent: the rule is the match, and it is printed.
 ## See what is already configured
 
 ```
+vet-skills inventory           # per agent: servers (local and remote), guarded or not, verdicts, credential names, and the fix for each finding
 vet-skills discover            # every MCP server, skill, plugin and hook on this machine, with verdicts
 ```
 
@@ -340,6 +341,7 @@ prompts, environment variables, or file contents. `vet-skills leave` reverts.
 | `policy show` / `policy set <file>` | Personal policy. |
 | `block <skill> [--reason]` | Personal block list. |
 | `status` | Org, policy version, cache, pending approvals; syncs policy. |
+| `inventory [--project] [--json]` | Per agent: every MCP server, guarded or not, verdict for the version in use, credential names, Claude skills, fix lines. Read-only. |
 | `discover [--project] [--json]` | Inventory agent config on this machine; report names to the org when enrolled. |
 | `mcp` | Run as an MCP server over stdio (`check_skill`, `search_skills`). |
 | `hook install [claude-code \| cursor \| codex \| windsurf \| gemini \| all]` | Registers the hooks for that agent (`~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/hooks.json`, `~/.codeium/windsurf/hooks.json`, `~/.gemini/settings.json`). |

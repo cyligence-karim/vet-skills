@@ -15,7 +15,9 @@
  *   vet-skills policy show|set <file>     view or replace the local policy
  *   vet-skills block <skill> [--reason]   add to the personal block list
  *   vet-skills status                     org, policy version, last report, cache size
- *   vet-skills discover [--project] [--json] every MCP server, skill, plugin and hook configured on this machine
+ *   vet-skills inventory [--project] [--json] per agent: MCP servers (local and remote), guarded or not, verdicts, credential names, skills, and the fix for each finding
+ *   vet-skills inventory [--project] [--json] what your agents can reach: servers, guarded or not, verdicts, credential names
+  vet-skills discover [--project] [--json] every MCP server, skill, plugin and hook configured on this machine
  *   vet-skills mcp                        run as an MCP server so agents can check skills themselves
   vet-skills telemetry on|off|status    anonymous usage + field signals (off for enrolled machines; VET_SKILLS_TELEMETRY=0 also works)
   vet-skills bug                        report a bug (opens the form with your CLI version and last decision filled in)
@@ -43,6 +45,7 @@ import { parsePolicyYaml, serializePolicyYaml } from "./policy/index.js";
 import { check, renderCheck, renderOutcome } from "./check.js";
 import { enroll, report, detonate, publish, discoverReport, resolveSkill } from "./api.js";
 import { discoverLocal } from "./discover.js";
+import { buildInventory, componentsForSync, renderInventory } from "./inventory.js";
 import { fetchTarget, tarDir } from "./try.js";
 import { guard, parseRunArgs } from "./run.js";
 import { serveMcp } from "./mcp.js";
@@ -502,6 +505,18 @@ async function main(): Promise<number> {
       return 0;
     }
 
+    case "inventory": {
+      // Read-only: lists what is configured and what to do about it. Nothing is written to any config.
+      const comps = discoverLocal({ project: values.project ? process.cwd() : undefined });
+      const inv = await buildInventory({ components: comps });
+      if (values.json) console.log(JSON.stringify(inv, null, 2));
+      else if (!values.quiet) console.log(renderInventory(inv));
+      if (readOrg()) {
+        const r = await discoverReport(componentsForSync(comps));
+        if (!values.json && !values.quiet) console.log(r.ok ? `\n${c.verified("✓")} Reported to ${readOrg()!.slug} (names only) · ${API}${r.data.dashboard}` : c.caution(`\nreport failed: ${r.error}`));
+      } else if (!values.json && !values.quiet) console.log(c.muted("\nVerdicts were looked up by package name and version; nothing else about this machine was sent anywhere."));
+      return 0;
+    }
     case "discover": {
       const comps = discoverLocal({ project: values.project ? process.cwd() : undefined });
       if (values.json) { console.log(JSON.stringify(comps, null, 2)); }

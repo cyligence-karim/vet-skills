@@ -17,7 +17,7 @@ test(".mcp.json: stdio and remote servers, names only, no secrets", () => {
   const cs = parseAgentConfig(".mcp.json", text);
   assert.equal(cs.length, 4);
   const gh = cs.find((c) => c.name === "github")!;
-  assert.deepEqual(gh.package, { registry: "npm", name: "@modelcontextprotocol/server-github" });
+  assert.deepEqual(gh.package, { registry: "npm", name: "@modelcontextprotocol/server-github", version: "1.2.0" });
   assert.deepEqual(gh.envKeys, ["GITHUB_PERSONAL_ACCESS_TOKEN"]);
   const lin = cs.find((c) => c.name === "linear")!;
   assert.equal(lin.urlHost, "mcp.linear.app"); assert.deepEqual(lin.headerKeys, ["Authorization"]);
@@ -76,4 +76,21 @@ test("discover: Zed, Amp, OpenCode, Copilot, Kiro, Qwen, Cline and Continue conf
   assert.equal(parseAgentConfig(".cline/data/settings/cline_mcp_settings.json", JSON.stringify({ mcpServers: { b: { command: "npx", args: ["b"] } } }), "user")[0].agent, "cline");
   const cont = parseAgentConfig(".continue/config.yaml", `name: my\nversion: 0.0.1\nschema: v1\nmodels:\n  - name: gpt\nmcpServers:\n  - name: Playwright\n    command: npx\n    args:\n      - "-y"\n      - "@playwright/mcp@latest"\n    env:\n      TOKEN: \${{ secrets.TOKEN }}\n  - name: remote\n    type: sse\n    url: https://mcp.example/sse\n  - name: inline\n    command: uvx\n    args: ["weather-mcp"]\ncontext:\n  - provider: code\n`, "user");
   assert.deepEqual(cont.map((c) => [c.agent, c.name, c.transport, c.package?.name ?? c.urlHost, c.envKeys]), [["continue", "Playwright", "stdio", "@playwright/mcp", ["TOKEN"]], ["continue", "remote", "http", "mcp.example", []], ["continue", "inline", "stdio", "weather-mcp", []]]);
+});
+
+test("an entry the guard wraps is described by the command it wraps", () => {
+  const cfg = { mcpServers: {
+    gh: { command: "/opt/homebrew/bin/vet-skills", args: ["guard", "exec", "--server", "gh", "--client", "cursor", "--", "npx", "-y", "@modelcontextprotocol/server-github"], env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" } },
+    viaNpx: { command: "npx", args: ["-y", "vet-skills@0.11.0", "guard", "exec", "--server", "viaNpx", "--client", "cursor", "--", "uvx", "mcp-server-fetch==1.2.0"] },
+    plain: { command: "npx", args: ["-y", "some-mcp@^2"], env: { API_KEY: "abcd1234efgh5678" } },
+    remote: { type: "sse", url: "https://mcp.example.com/sse", headers: { Authorization: "Bearer ${TOKEN}" } },
+  } };
+  const comps = parseAgentConfig(".cursor/mcp.json", JSON.stringify(cfg));
+  const by = Object.fromEntries(comps.map((c) => [c.name, c]));
+  assert.deepEqual([by.gh.guarded, by.gh.command, by.gh.package], [true, "npx", { registry: "npm", name: "@modelcontextprotocol/server-github" }]);
+  assert.deepEqual([by.viaNpx.guarded, by.viaNpx.command, by.viaNpx.package], [true, "uvx", { registry: "pypi", name: "mcp-server-fetch", version: "1.2.0" }]);
+  assert.deepEqual([by.plain.guarded, by.plain.package, by.plain.literalKeys], [false, { registry: "npm", name: "some-mcp" }, ["API_KEY"]]);
+  assert.equal(by.gh.literalKeys, undefined, "a ${REFERENCE} is not a literal");
+  assert.deepEqual([by.remote.transport, by.remote.remoteKind, by.remote.literalKeys], ["http", "sse", undefined]);
+  assert.ok(!JSON.stringify(comps).includes("abcd1234efgh5678"));
 });

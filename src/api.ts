@@ -157,10 +157,10 @@ export function sendFieldSignal(events: { skill: string; semver: string | null; 
 }
 
 /** What `vet-skills discover` found on this machine (names only; enrolled machines only). */
-export function discoverReport(components: unknown[]) {
+export function discoverReport(components: unknown[], auto = false) {
   const org = readOrg();
   if (!org) return Promise.resolve<ApiResult<{ ok: true; components: number; dashboard: string }>>({ ok: false, error: "not joined", offline: false });
-  return call<{ ok: true; components: number; dashboard: string }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/discover`, { method: "POST", body: JSON.stringify({ components }), headers: orgHeaders() }, 15000);
+  return call<{ ok: true; components: number; dashboard: string }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/discover`, { method: "POST", body: JSON.stringify({ components, ...(auto ? { auto: true } : {}) }), headers: orgHeaders() }, 15000);
 }
 
 /** The public repo scan, for installs that point straight at GitHub (no registry verdict exists for those). */

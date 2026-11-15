@@ -22,8 +22,14 @@ export interface Component {
   /** Agent the file belongs to. */
   agent: "claude_code" | "cursor" | "vscode" | "windsurf" | "claude_desktop" | "gemini_cli" | "codex" | "grok" | "copilot" | "kiro" | "qwen" | "cline" | "zed" | "amp" | "opencode" | "continue" | "any";
   transport?: "stdio" | "http";
-  /** The package a stdio server runs, when it is a registry package (npx / uvx / docker). */
-  package?: { registry: "npm" | "pypi" | "docker"; name: string };
+  /** Remote servers only: Streamable HTTP or the older HTTP+SSE, when the config says which. */
+  remoteKind?: "http" | "sse";
+  /** The package a stdio server runs, when it is a registry package (npx / uvx / docker). `version` only when the config pins an exact one. */
+  package?: { registry: "npm" | "pypi" | "docker"; name: string; version?: string };
+  /** MCP servers: true when the entry launches through `vet-skills guard exec` (the original command is what the other fields describe). */
+  guarded?: boolean;
+  /** MCP servers: names of credential-like env vars or headers whose value is written into the config as a literal, not a ${REFERENCE}. Names only. */
+  literalKeys?: string[];
   /** Executable for stdio servers and hooks: "npx", "node", "python", "./bin/x" (never its arguments). */
   command?: string;
   /** Remote servers: host only. */
@@ -108,6 +114,22 @@ const isObj = (v: unknown): v is Json => !!v && typeof v === "object" && !Array.
 const str = (v: unknown) => (typeof v === "string" ? v : null);
 const keysOf = (v: unknown) => (isObj(v) ? Object.keys(v).filter((k) => /^[\w.-]{1,120}$/.test(k)).slice(0, 50) : []);
 
+const SECRET_NAME = /(TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|AUTH)/i;
+/** Credential-like names whose value is a literal in the file (not ${VAR}, $VAR, env:VAR or an <angle-bracket> placeholder). The value itself is never returned. */
+function literalCredentialKeys(...maps: unknown[]): string[] {
+  const out: string[] = [];
+  for (const m of maps) {
+    if (!isObj(m)) continue;
+    for (const [k, v] of Object.entries(m)) {
+      if (!/^[\w.-]{1,120}$/.test(k) || !SECRET_NAME.test(k) || typeof v !== "string") continue;
+      const val = v.replace(/^(Bearer|Basic|token)\s+/i, "").trim();
+      if (val.length < 8 || /\$\{|\$[A-Z_][A-Z0-9_]*|^env:|^<.*>$|^(your|xxx|changeme|placeholder)/i.test(val)) continue;
+      out.push(k);
+    }
+  }
+  return [...new Set(out)].slice(0, 20);
+}
+
 /** Strip comments and trailing commas: VS Code and Cursor configs are JSONC. */
 function parseJsonc(text: string): unknown {
   try { return JSON.parse(text); } catch { /* fall through */ }
@@ -116,16 +138,31 @@ function parseJsonc(text: string): unknown {
 }
 
 /** The registry package a stdio command runs: `npx -y @scope/pkg@1.2` → npm @scope/pkg; `uvx pkg` → pypi; `docker run … mcp/x` → docker. */
+/** The original command line of an entry `vet-skills guard install` rewrote (`vet-skills guard exec --server x --client y -- npx -y pkg`), or null. */
+export function unwrapGuardCommand(command: string, args: string[]): { command: string; args: string[] } | null {
+  if (!/(^|[\\/])(vet-skills|npx)(\.cmd|\.exe)?$/.test(command)) return null;
+  const g = args.indexOf("guard");
+  if (g < 0 || args[g + 1] !== "exec") return null;
+  const i = args.indexOf("--", g);
+  if (i < 0 || i === args.length - 1) return null;
+  return { command: args[i + 1], args: args.slice(i + 2) };
+}
+
+const EXACT = /^\d+\.\d+\.\d+[\w.+-]*$/;
 export function stdioPackage(command: string, args: string[]): Component["package"] | undefined {
   const bin = command.split(/[\\/]/).pop()?.replace(/\.(cmd|exe)$/i, "") ?? "";
   const strip = (s: string) => s.replace(/(.)@[^@/]+$/, "$1");
   if (/^(npx|bunx|pnpx)$/.test(bin) || (bin === "pnpm" && args[0] === "dlx")) {
     const pkg = args.find((a) => !a.startsWith("-") && a !== "dlx" && a !== "exec");
-    return pkg && /^(@[\w.-]+\/)?[\w.-]+(@[\w.^~<>=*-]+)?$/.test(pkg) ? { registry: "npm", name: strip(pkg) } : undefined;
+    if (!pkg || !/^(@[\w.-]+\/)?[\w.-]+(@[\w.^~<>=*+-]+)?$/.test(pkg)) return undefined;
+    const ver = pkg.match(/.@([^@/]+)$/)?.[1];
+    return { registry: "npm", name: strip(pkg), ...(ver && EXACT.test(ver) ? { version: ver } : {}) };
   }
   if (/^(uvx|pipx)$/.test(bin) || (bin === "uv" && args[0] === "tool")) {
     const pkg = args.find((a) => !a.startsWith("-") && !["run", "tool"].includes(a));
-    return pkg && /^[\w.\-[\]]+(==[\w.]+)?$/.test(pkg) ? { registry: "pypi", name: pkg.toLowerCase().replace(/\[.*\]$/, "").replace(/==.*$/, "").replace(/_/g, "-") } : undefined;
+    if (!pkg || !/^[\w.\-[\]]+(==[\w.]+)?$/.test(pkg)) return undefined;
+    const ver = pkg.match(/==([\w.]+)$/)?.[1];
+    return { registry: "pypi", name: pkg.toLowerCase().replace(/==.*$/, "").replace(/\[.*\]$/, "").replace(/_/g, "-"), ...(ver ? { version: ver } : {}) };
   }
   if (bin === "docker") {
     const img = args.find((a, i) => i > 0 && !a.startsWith("-") && /^([\w.-]+\.[\w]+\/)?[\w.-]+\/[\w.-]+(:[\w.-]+)?$/.test(a) && !/^-/.test(args[i - 1] ?? ""));
@@ -151,12 +188,17 @@ function serverComponents(servers: unknown, path: string, scope: Component["scop
     const args = cmdArr ? cmdArr.slice(1) : Array.isArray(raw.args) ? raw.args.filter((a): a is string => typeof a === "string") : [];
     const envKeys = keysOf(raw.env ?? raw.environment);
     const headerKeys = keysOf(raw.headers);
-    if (url) out.push({ kind: "mcp_server", name, path, scope, agent, transport: "http", urlHost: hostOf(url), envKeys, headerKeys });
+    const literal = literalCredentialKeys(raw.env ?? raw.environment, raw.headers);
+    const lit = literal.length ? { literalKeys: literal } : {};
+    if (url) out.push({ kind: "mcp_server", name, path, scope, agent, transport: "http", remoteKind: str(raw.type) === "sse" || str(raw.transport) === "sse" || /\/sse\/?(\?|$)/.test(url) ? "sse" : "http", urlHost: hostOf(url), envKeys, headerKeys, ...lit });
     else if (command) {
       // A command written as one string ("npx -y pkg") is split for package detection; only the binary is kept.
-      const parts = args.length ? [command, ...args] : command.split(/\s+/);
+      let parts = args.length ? [command, ...args] : command.split(/\s+/);
+      // An entry the guard wraps is described by the command it wraps, and marked as guarded.
+      const inner = unwrapGuardCommand(parts[0], parts.slice(1));
+      if (inner) parts = [inner.command, ...inner.args];
       const bin = parts[0];
-      out.push({ kind: "mcp_server", name, path, scope, agent, transport: "stdio", command: bin.split(/[\\/]/).pop(), package: stdioPackage(bin, parts.slice(1)), envKeys, headerKeys });
+      out.push({ kind: "mcp_server", name, path, scope, agent, transport: "stdio", command: bin.split(/[\\/]/).pop(), package: stdioPackage(bin, parts.slice(1)), envKeys, headerKeys, guarded: !!inner, ...lit });
     }
   }
   return out;
@@ -203,8 +245,12 @@ function codexToml(text: string, path: string, scope: Component["scope"], agent:
       const args = [...(body.match(/^\s*args\s*=\s*\[([^\]]*)\]/m)?.[1] ?? "").matchAll(/"([^"]*)"/g)].map((m) => m[1]);
       const url = body.match(/^\s*url\s*=\s*"([^"]+)"/m)?.[1] ?? null;
       const envKeys = [...(body.match(/^\s*env\s*=\s*\{([^}]*)\}/m)?.[1] ?? "").matchAll(/([\w.-]+)\s*=/g)].map((m) => m[1]);
-      if (url) out.push({ kind: "mcp_server", name: head[2], path, scope, agent, transport: "http", urlHost: hostOf(url), envKeys, headerKeys: [] });
-      else if (command) out.push({ kind: "mcp_server", name: head[2], path, scope, agent, transport: "stdio", command: command.split(/[\\/]/).pop(), package: stdioPackage(command, args), envKeys, headerKeys: [] });
+      if (url) out.push({ kind: "mcp_server", name: head[2], path, scope, agent, transport: "http", remoteKind: /\/sse\/?(\?|$)/.test(url) ? "sse" : "http", urlHost: hostOf(url), envKeys, headerKeys: [] });
+      else if (command) {
+        const inner = unwrapGuardCommand(command, args);
+        const [bin, rest] = inner ? [inner.command, inner.args] : [command, args];
+        out.push({ kind: "mcp_server", name: head[2], path, scope, agent, transport: "stdio", command: bin.split(/[\\/]/).pop(), package: stdioPackage(bin, rest), envKeys, headerKeys: [], guarded: !!inner });
+      }
     }
     const envTable = b.match(/^mcp_servers\.("?)([\w.-]+)\1\.env\]/);
     if (envTable) {
