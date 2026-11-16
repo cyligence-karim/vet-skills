@@ -248,6 +248,9 @@ judges intent: the rule is the match, and it is printed.
 ```
 vet-skills secrets migrate     # move credentials written in agent configs into the guard's store (asks once; --dry-run to look)
 vet-skills prove               # read-only: no MCP credential left in agent configs, agent environments or guard files
+vet-skills inventory --fix           # then offer to fix what it can: guard install and secrets migrate, one question
+vet-skills review-pack --since 30d   # an access-review pack for this machine, no account
+vet-skills guard summary --markdown  # what the guard recorded, for a CI job
 vet-skills policy test strict.yaml   # replay recorded tool calls against a proposed policy; changes nothing
 vet-skills policy suggest            # a starting policy from observed use, each rule with its evidence
 vet-skills inventory --credentials   # by credential: for each name, every server that is handed it
@@ -359,7 +362,7 @@ prompts, environment variables, or file contents. `vet-skills leave` reverts.
 | `status` | Org, policy version, cache, pending approvals; syncs policy. |
 | `secrets migrate [--dry-run] [--yes]` · `secrets list` · `secrets set <key>` · `secrets rm <key>` | The guard's credential store: keychain (macOS), Secret Service (Linux), DPAPI (Windows), encrypted file otherwise. |
 | `prove [--json]` | Read-only check that no MCP credential sits in an agent config, a running agent's environment or the guard's files. |
-| `inventory [--project] [--json]` | Per agent: every MCP server, guarded or not, verdict for the version in use, credential names, Claude skills, fix lines. Read-only. |
+| `inventory [--project] [--json]` | Per agent: every MCP server, guarded or not, verdict for the version in use, credential names, installed skills (Claude Code and the agents that read `.agents/skills` or their own skills directory), fix lines. Read-only without `--fix`. |
 | `discover [--project] [--json]` | Inventory agent config on this machine; report names to the org when enrolled. |
 | `mcp` | Run as an MCP server over stdio (`check_skill`, `search_skills`). |
 | `hook install [claude-code \| cursor \| codex \| windsurf \| gemini \| all]` | Registers the hooks for that agent (`~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/hooks.json`, `~/.codeium/windsurf/hooks.json`, `~/.gemini/settings.json`). |

@@ -19,7 +19,10 @@
  *   vet-skills secrets migrate [--dry-run] [--yes]   move credentials written in agent configs into the guard's store; list | set <key> | rm <key>
   vet-skills policy test <file> [--since 30d] [--org-wide]   replay recorded activity against a proposed policy; changes nothing
   vet-skills policy suggest [--since 30d] [--out file]      a starting policy from observed use, each rule with its evidence
+  vet-skills guard summary [--since 2h] [--markdown] [--fail-on denied|unexpected-host|refused|any]   what the guard recorded, for a CI job
+  vet-skills review-pack [--since 30d] [--out dir]   an access-review pack for this machine: inventory, policy, credentials, activity, PDF; verify <dir>
   vet-skills prove [--json]                 check that no MCP credential sits in an agent config, a running agent's environment or the guard's files
+  vet-skills inventory --fix [--yes]        then offer to fix what it can: guard install and secrets migrate, one question
   vet-skills inventory --credentials        the same, by credential: for each name, every server that is handed it
   vet-skills inventory [--project] [--json] what your agents can reach: servers, guarded or not, verdicts, credential names
   vet-skills discover [--project] [--json] every MCP server, skill, plugin and hook configured on this machine
@@ -71,7 +74,9 @@ import { homedir } from "node:os";
 import { c } from "./render.js";
 import { approveRemote, execRemote } from "./remote.js";
 import { SecretStore } from "./store.js";
-import { proveCmd, secretsCmd } from "./secrets.js";
+import { fixCmd, proveCmd, secretsCmd } from "./secrets.js";
+import { summaryCmd } from "./summary.js";
+import { reviewPackCmd } from "./localpack.js";
 import { policySuggestCmd, policyTestCmd } from "./policytest.js";
 import { approvalsCmd, diffCmd, reviewCmd, threatsCmd } from "./org.js";
 
@@ -84,7 +89,7 @@ const { values, positionals } = parseArgs({
   args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", process.argv[3]] : ORG_CMD ? [process.argv[2]] : process.argv.slice(2),
   allowPositionals: true,
   options: {
-    "dry-run": { type: "boolean" }, since: { type: "string" }, out: { type: "string" }, "org-wide": { type: "boolean" }, credentials: { type: "boolean" }, token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
+    "dry-run": { type: "boolean" }, markdown: { type: "boolean" }, "fail-on": { type: "string" }, fix: { type: "boolean" }, since: { type: "string" }, out: { type: "string" }, "org-wide": { type: "boolean" }, credentials: { type: "boolean" }, token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
     json: { type: "boolean" }, ci: { type: "boolean" }, email: { type: "string" }, help: { type: "boolean", short: "h" }, project: { type: "boolean" }, quiet: { type: "boolean", short: "q" }, version: { type: "boolean", short: "v" }, agent: { type: "string" }, publisher: { type: "string" }, registry: { type: "string" },
   },
 });
@@ -237,7 +242,8 @@ async function main(): Promise<number> {
         return 0;
       }
       if (sub === "status") { for (const l of guardStatus({ project })) console.log(l); return 0; }
-      console.error("usage: vet-skills guard install|uninstall|status [--project]"); return 1;
+      if (sub === "summary") return summaryCmd({ since: values.since, markdown: !!values.markdown, json: !!values.json, failOn: values["fail-on"] });
+      console.error("usage: vet-skills guard install|uninstall|status|summary [--project]"); return 1;
     }
 
     case "try": {
@@ -520,6 +526,7 @@ async function main(): Promise<number> {
     }
 
     case "secrets": return secretsCmd(rest, { yes: !!values.yes, json: !!values.json, project: !!values.project, dryRun: process.argv.includes("--dry-run") });
+    case "review-pack": return reviewPackCmd(rest, { since: values.since, out: values.out, json: !!values.json, project: !!values.project });
     case "prove": return proveCmd({ json: !!values.json, project: !!values.project });
     case "inventory": {
       // Read-only: lists what is configured and what to do about it. Nothing is written to any config.
@@ -531,6 +538,8 @@ async function main(): Promise<number> {
         const r = await discoverReport(componentsForSync(comps));
         if (!values.json && !values.quiet) console.log(r.ok ? `\n${c.verified("✓")} Reported to ${readOrg()!.slug} (names only) · ${API}${r.data.dashboard}` : c.caution(`\nreport failed: ${r.error}`));
       } else if (!values.json && !values.quiet) console.log(c.muted("\nVerdicts were looked up by package name and version; nothing else about this machine was sent anywhere."));
+      // Without --fix this command writes nothing. With it, the two fixes it can make are shown and applied after one question.
+      if (values.fix) return fixCmd({ yes: !!values.yes, project: !!values.project });
       return 0;
     }
     case "discover": {

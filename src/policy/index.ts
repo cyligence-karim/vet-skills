@@ -503,3 +503,5 @@ export * from "./secrets.js";
 export * from "./lure-lite.js";
 export * from "./hidden.js";
 export * from "./replay.js";
+export * from "./themes.js";
+export { Pdf } from "./pdf.js";

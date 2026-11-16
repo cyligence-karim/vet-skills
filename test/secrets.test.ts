@@ -141,3 +141,24 @@ test("agent processes are recognized by app bundle on macOS and by binary name e
   for (const c of ["/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper", "/Applications/Visual Studio Code.app/Contents/MacOS/Electron", "/Applications/Cursor.app/Contents/MacOS/Cursor", "claude", "/usr/local/bin/codex", "gemini", "C:\\Users\\k\\cursor.exe"]) assert.ok(isAgentProcess(c), c);
   for (const c of ["node", "/usr/bin/security", "/Applications/Slack.app/Contents/MacOS/Slack", "/usr/sbin/coreaudiod", "encoder"]) assert.ok(!isAgentProcess(c), c);
 });
+
+test("inventory --fix: one plan, one question, both fixes; without a terminal it needs --yes", () => {
+  machine();
+  uninstallGuard({ home });
+  for (const k of new SecretStore().list()) new SecretStore().delete(k.key);
+  machine();
+  const run = (...args: string[]) => spawnSync("node", [join(import.meta.dirname, "../dist/index.js"), ...args], { encoding: "utf8", env: { ...process.env, HOME: home, USERPROFILE: home, VET_SKILLS_HOME: vsHome, VET_SKILLS_STORE: "file", KILLERSKILLS_API: "http://127.0.0.1:9", NODE_TEST_CONTEXT: undefined } as NodeJS.ProcessEnv });
+  const plain = run("inventory");
+  assert.match(plain.stdout, /`vet-skills inventory --fix` does the guard install and the credential move for you/);
+  assert.ok(readFileSync(claudeCfg, "utf8").includes(GH), "inventory alone writes nothing");
+  const noTty = run("inventory", "--fix");
+  assert.equal(noTty.status, 2);
+  assert.match(noTty.stdout, /What --fix will do:[\s\S]*put under the guard\s+github, openai, fs\s+\(claude-code, ~\/\.claude\.json\)[\s\S]*move to the store\s+github · GITHUB_PERSONAL_ACCESS_TOKEN/);
+  assert.ok(readFileSync(claudeCfg, "utf8").includes(GH), "nothing is written before the answer");
+  const yes = run("inventory", "--fix", "--yes");
+  assert.equal(yes.status, 0, yes.stdout + yes.stderr);
+  assert.match(yes.stdout, /✓ 5 servers put under the guard, 3 credentials moved to the store/);
+  for (const f of [claudeCfg, codexCfg, cursorCfg]) for (const v of all) assert.ok(!readFileSync(f, "utf8").includes(v));
+  for (const v of all) assert.ok(!yes.stdout.includes(v) && !noTty.stdout.includes(v), "a value is never printed");
+  assert.match(run("inventory", "--fix", "--yes").stdout, /Nothing here that `--fix` can fix by itself/);
+});

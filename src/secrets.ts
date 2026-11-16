@@ -226,7 +226,7 @@ export function prove(opts: Opts & { processes?: { pid: number; name: string; en
 
 /* ------------------------------------------------------------------ cli */
 
-const ask = (q: string) => new Promise<string>((res) => { const rl = createInterface({ input: process.stdin, output: process.stderr }); rl.question(q, (a) => { rl.close(); res(a.trim()); }); });
+export const ask = (q: string) => new Promise<string>((res) => { const rl = createInterface({ input: process.stdin, output: process.stderr }); rl.question(q, (a) => { rl.close(); res(a.trim()); }); });
 function readSecret(prompt: string): Promise<string> {
   if (!process.stdin.isTTY) return new Promise((res) => { let b = ""; process.stdin.on("data", (d) => (b += d)); process.stdin.on("end", () => res(b.replace(/\r?\n$/, ""))); });
   return new Promise((res) => {
@@ -274,6 +274,34 @@ export async function secretsCmd(argv: string[], flags: { yes?: boolean; json?: 
     return r.failed.length ? 1 : 0;
   }
   console.error("usage: vet-skills secrets migrate [--dry-run] [--yes] [--project] | list | set <key> | rm <key>"); return 2;
+}
+
+/**
+ * `vet-skills inventory --fix`: the two fixes inventory can make itself, behind one question. Credentials written in
+ * configs move to the guard's store (secrets migrate), and every server the guard can wrap is put under it (guard
+ * install). Everything else inventory reports (a blocked verdict, a missing verdict, a lure) is left for a person.
+ */
+export interface FixPlan { toGuard: { file: string; client: string; servers: string[]; remote: string[] }[]; toMove: Candidate[]; manual: MigratePlan["manual"] }
+export function planFix(opts: Opts = {}): FixPlan {
+  const m = planMigration(opts);
+  const g = installGuard({ home: opts.home, project: opts.project, dryRun: true }).filter((t) => t.wrapped.length);
+  return { toGuard: g.map((t) => ({ file: t.file, client: t.client, servers: t.wrapped, remote: t.remote ?? [] })), toMove: m.candidates, manual: m.manual };
+}
+export async function fixCmd(flags: { yes?: boolean; project?: boolean }): Promise<number> {
+  const project = flags.project ? process.cwd() : null; const store = new SecretStore();
+  const plan = planFix({ project, store });
+  const servers = plan.toGuard.reduce((n, t) => n + t.servers.length, 0);
+  if (!servers && !plan.toMove.length) { console.log("\nNothing here that `--fix` can fix by itself. The findings above that remain need a person."); return 0; }
+  console.log("\nWhat --fix will do:");
+  for (const t of plan.toGuard) console.log(`  put under the guard   ${t.servers.join(", ")}  (${t.client}, ${short(t.file)})`);
+  for (const c of plan.toMove) console.log(`  move to the store     ${c.server} · ${c.name}  (${c.from === "environment" ? "from this shell's environment" : short(c.file)})`);
+  for (const m of plan.manual) console.log(`  left for you          ${m.server} · ${m.name}: ${m.why}`);
+  console.log(`\nConfigs are backed up first (with credential values removed). The guard starts by recording: nothing is blocked until a policy says so. \`vet-skills guard uninstall\` puts every config back, values included.`);
+  if (!flags.yes) { if (!process.stdin.isTTY) { console.error("\nNot a terminal: re-run with --yes to apply."); return 2; } if (!/^y(es)?$/i.test(await ask("\nApply? [y/N] "))) { console.log("Nothing was changed."); return 0; } }
+  const r = applyMigration({ project, store });
+  for (const f of r.failed) console.log(`✕ ${f.name}: ${f.why}; left as it was`);
+  console.log(`\n✓ ${r.guarded} server${r.guarded === 1 ? "" : "s"} put under the guard, ${r.moved} credential${r.moved === 1 ? "" : "s"} moved to the store. Restart your agents, then run \`vet-skills prove\`.`);
+  return r.failed.length ? 1 : 0;
 }
 
 export function proveCmd(flags: { json?: boolean; project?: boolean }): number {

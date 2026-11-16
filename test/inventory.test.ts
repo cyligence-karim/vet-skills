@@ -95,3 +95,19 @@ test("an empty machine gets a next step, not an empty table", async () => {
   const inv = await buildInventory({ components: [], lookup, pins: {}, probeVersions: false });
   assert.match(renderInventory(inv), /Nothing is configured yet/);
 });
+
+test("skills in other agents' directories are listed under the agent that reads them", async () => {
+  const home = mkdtempSync(join(tmpdir(), "vs-inv-skills-"));
+  const proj = mkdtempSync(join(tmpdir(), "vs-inv-proj-"));
+  const put = (root: string, rel: string, name: string) => { mkdirSync(join(root, rel, name), { recursive: true }); writeFileSync(join(root, rel, name, "SKILL.md"), `---\nname: ${name}\ndescription: test\n---\n# ${name}\n`); };
+  put(home, ".claude/skills", "pdf-tools"); put(home, ".agents/skills", "release-notes"); put(home, ".cursor/skills", "refactor"); put(home, ".gemini/skills", "triage");
+  put(home, ".config/opencode/skills", "db-migrate"); put(home, ".codeium/windsurf/skills", "ui-review"); put(proj, ".kiro/skills", "spec-writer"); put(proj, ".agents/skills", "release-notes");
+  const inv = await buildInventory({ home, project: proj, lookup: async (q) => (q === "pdf-tools" ? { label: "verified" as const, version: "1.0.0", page: "/p" } : null), pins: {}, probeVersions: false });
+  const by = Object.fromEntries(inv.agents.map((a) => [a.agent, a.skills.map((s) => `${s.name}:${s.scope}:${s.verdict?.label ?? "none"}`)]));
+  assert.deepEqual(by, {
+    claude_code: ["pdf-tools:user:verified"], cursor: ["refactor:user:none"], windsurf: ["ui-review:user:none"], gemini_cli: ["triage:user:none"],
+    kiro: ["spec-writer:project:none"], opencode: ["db-migrate:user:none"], shared_skills: ["release-notes:user:none", "release-notes:project:none"],
+  });
+  assert.equal(inv.totals.skills, 8);
+  assert.match(renderInventory(inv), /Shared skills \(\.agents\/skills: Codex CLI, Cursor, Gemini CLI, Copilot, OpenCode, Cline, Amp, Zed\)/);
+});

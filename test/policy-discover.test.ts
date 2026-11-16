@@ -94,3 +94,17 @@ test("an entry the guard wraps is described by the command it wraps", () => {
   assert.deepEqual([by.remote.transport, by.remote.remoteKind, by.remote.literalKeys], ["http", "sse", undefined]);
   assert.ok(!JSON.stringify(comps).includes("abcd1234efgh5678"));
 });
+
+test("skills are attributed to the agent whose directory they sit in", async () => {
+  const { skillAgent, isAgentConfigPath, parseAgentConfig: parse } = await import("../src/discover.ts");
+  const cases: [string, string][] = [
+    [".claude/skills/pdf/SKILL.md", "claude_code"], [".agents/skills/review/SKILL.md", "any"], [".config/agents/skills/review/SKILL.md", "amp"],
+    [".cursor/skills/x/SKILL.md", "cursor"], [".gemini/skills/x/SKILL.md", "gemini_cli"], [".copilot/skills/x/SKILL.md", "copilot"],
+    [".config/opencode/skills/x/SKILL.md", "opencode"], [".codeium/windsurf/skills/x/SKILL.md", "windsurf"], ["repo/.windsurf/skills/x/SKILL.md", "windsurf"],
+    [".kiro/skills/x/SKILL.md", "kiro"], [".qwen/skills/x/SKILL.md", "qwen"], [".continue/skills/x/SKILL.md", "continue"],
+  ];
+  for (const [path, agent] of cases) { assert.equal(skillAgent(path), agent, path); assert.ok(isAgentConfigPath(path), path); }
+  assert.ok(!isAgentConfigPath("docs/skills/x/SKILL.md"), "a skills folder that no agent reads is not picked up");
+  const c = parse(".agents/skills/release-notes/SKILL.md", "---\nname: release-notes\ndescription: d\n---\nbody");
+  assert.deepEqual([c[0].kind, c[0].name, c[0].agent], ["skill", "release-notes", "any"]);
+});

@@ -1,0 +1,81 @@
+# Runs in the public repo on every push: builds vet-skills from source, puts a fixture MCP server under the guard with
+# the action a customer would use, drives a scripted agent session through it, and checks the summary.
+name: guard in CI
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build vet-skills from this commit
+        run: npm ci && npm run build && npm install --global .
+      - name: A project with one MCP server, and a policy that denies deletes
+        run: |
+          mkdir -p "$RUNNER_TEMP/proj" && cd "$RUNNER_TEMP/proj"
+          cat > server.js <<'JS'
+          const rl = require("readline").createInterface({ input: process.stdin });
+          const out = (o) => console.log(JSON.stringify(o));
+          rl.on("line", (l) => { const m = JSON.parse(l);
+            if (m.method === "initialize") out({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1.0.0" } } });
+            else if (m.method === "tools/list") out({ jsonrpc: "2.0", id: m.id, result: { tools: [{ name: "list_items", inputSchema: { type: "object" } }, { name: "delete_item", inputSchema: { type: "object" } }] } });
+            else if (m.method === "tools/call") out({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: "ok " + m.params.name }] } }); });
+          JS
+          printf '{ "mcpServers": { "fixture": { "command": "node", "args": ["%s/server.js"], "env": { "FIXTURE_API_TOKEN": "${FIXTURE_API_TOKEN}" } } } }\n' "$PWD" > .mcp.json
+          printf 'name: ci\nversion: 1\nruntime:\n  tools:\n    - match: "delete_*"\n      action: deny\n      reason: no deletes from CI\n' > policy.yaml
+      - name: Guard
+        id: guard
+        uses: ./action/guard
+        with:
+          version: none
+          policy: ${{ runner.temp }}/proj/policy.yaml
+          working-directory: ${{ runner.temp }}/proj
+      - name: Run a scripted agent session through the wrapped server
+        working-directory: ${{ runner.temp }}/proj
+        env:
+          FIXTURE_API_TOKEN: not-a-real-token-123456
+        run: |
+          cat > agent.js <<'JS'
+          const { spawn } = require("child_process");
+          const e = JSON.parse(require("fs").readFileSync(".mcp.json", "utf8")).mcpServers.fixture;
+          if (!e.args.includes("guard") || !e.args.includes("exec")) { console.error("the server is not under the guard:", JSON.stringify(e)); process.exit(1); }
+          const c = spawn(e.command, e.args, { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, ...Object.fromEntries(Object.entries(e.env || {}).map(([k, v]) => [k, String(v).replace(/\$\{(\w+)\}/g, (_m, n) => process.env[n] || "")])) } });
+          let out = ""; c.stdout.on("data", (d) => (out += d));
+          const send = (o) => c.stdin.write(JSON.stringify(o) + "\n");
+          send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "ci", version: "1" } } });
+          send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+          send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_items", arguments: { q: "x" } } });
+          send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "delete_item", arguments: { id: "1" } } });
+          setTimeout(() => c.stdin.end(), 3000);
+          c.on("close", () => {
+            const lines = out.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+            const ok = lines.find((l) => l.id === 3)?.result?.content?.[0]?.text === "ok list_items";
+            const denied = /denied/.test(lines.find((l) => l.id === 4)?.error?.message || "");
+            console.log(JSON.stringify({ ok, denied }));
+            process.exit(ok && denied ? 0 : 1);
+          });
+          JS
+          node agent.js
+      - name: Summary (informational)
+        uses: ./action/guard-summary
+      - name: Summary with fail-on denied must fail the step
+        id: strict
+        continue-on-error: true
+        uses: ./action/guard-summary
+        with:
+          fail-on: denied
+      - name: Check
+        working-directory: ${{ runner.temp }}/proj
+        run: |
+          test "${{ steps.guard.outputs.wrapped }}" = "1"
+          test "${{ steps.strict.outcome }}" = "failure"
+          vet-skills guard summary --json | node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8")); if (s.sessions!==1||s.calls.total!==2||s.calls.allowed!==1||s.calls.denied!==1) { console.error(JSON.stringify(s)); process.exit(1); } console.log("guard summary ok:", JSON.stringify(s.calls));'
+          vet-skills prove --project

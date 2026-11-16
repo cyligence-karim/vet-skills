@@ -1,0 +1,35 @@
+name: "KillerSkills guard summary"
+description: "Write what the vet-skills guard recorded in this job to the job summary, and optionally fail the job on denied calls, unexpected hosts or refused launches."
+author: "Cyligence, LLC"
+branding:
+  icon: shield
+  color: green
+inputs:
+  since:
+    description: "How far back to summarize (for example 2h, 30m is not supported: use hours or days)."
+    required: false
+    default: "6h"
+  fail-on:
+    description: "Fail the job when this happened: denied, unexpected-host, refused, any, or none."
+    required: false
+    default: "none"
+outputs:
+  json:
+    description: "Path to the summary as JSON."
+    value: ${{ steps.summary.outputs.json }}
+runs:
+  using: composite
+  steps:
+    - name: Guard summary
+      id: summary
+      shell: bash
+      env:
+        KS_SINCE: ${{ inputs.since }}
+        KS_FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set -uo pipefail
+        json="${RUNNER_TEMP}/vet-skills-guard-summary.json"
+        vet-skills guard summary --since "$KS_SINCE" --json > "$json" || true
+        echo "json=${json}" >> "$GITHUB_OUTPUT"
+        vet-skills guard summary --since "$KS_SINCE" --markdown >> "$GITHUB_STEP_SUMMARY" || true
+        vet-skills guard summary --since "$KS_SINCE" --fail-on "$KS_FAIL_ON"

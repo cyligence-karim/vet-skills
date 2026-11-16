@@ -15,7 +15,7 @@ import { c, pad } from "./render.js";
 
 export const AGENT_LABEL: Record<string, string> = {
   claude_code: "Claude Code", claude_desktop: "Claude Desktop", cursor: "Cursor", vscode: "VS Code", windsurf: "Windsurf", gemini_cli: "Gemini CLI", codex: "Codex CLI",
-  grok: "Grok CLI", copilot: "Copilot CLI", kiro: "Kiro", qwen: "Qwen Code", cline: "Cline", zed: "Zed", amp: "Amp", opencode: "OpenCode", continue: "Continue", any: "Other",
+  grok: "Grok CLI", copilot: "Copilot CLI", kiro: "Kiro", qwen: "Qwen Code", cline: "Cline", zed: "Zed", amp: "Amp", opencode: "OpenCode", continue: "Continue", shared_skills: "Shared skills (.agents/skills: Codex CLI, Cursor, Gemini CLI, Copilot, OpenCode, Cline, Amp, Zed)", any: "Other",
 };
 /** Agents with a command-line binary that answers `--version` quickly. Desktop apps are reported without a version. */
 const VERSION_BIN: Record<string, string> = { claude_code: "claude", codex: "codex", gemini_cli: "gemini", grok: "grok", copilot: "copilot", qwen: "qwen", cursor: "cursor", amp: "amp", opencode: "opencode", kiro: "kiro" };
@@ -114,7 +114,7 @@ export async function buildInventory(opts: { home?: string; project?: string; co
 
   await Promise.all(comps.filter((x) => x.kind === "skill").slice(0, 100).map(async (x) => {
     const v = await once(x.name);
-    agentOf(x.agent === "any" ? "claude_code" : x.agent).skills.push({ name: x.name, file: x.path, scope: x.scope, verdict: v ? { ...v, exact: false } : null, fixes: v?.label === "blocked" ? [`blocked verdict: remove ${x.path}`] : v ? [] : ["no verdict: this skill is not in a registry KillerSkills tests"] });
+    agentOf(x.agent === "any" ? "shared_skills" : x.agent).skills.push({ name: x.name, file: x.path, scope: x.scope, verdict: v ? { ...v, exact: false } : null, fixes: v?.label === "blocked" ? [`blocked verdict: remove ${x.path}`] : v ? [] : ["no verdict: this skill is not in a registry KillerSkills tests"] });
   }));
 
   if (opts.probeVersions !== false) await Promise.all([...byAgent.values()].map(async (a) => { const bin = VERSION_BIN[a.agent]; if (bin) a.version = await agentVersion(bin); }));
@@ -178,6 +178,7 @@ export function renderInventory(inv: Inventory): string {
   }
   out.push("", `${plural(t.servers, "MCP server")} in ${plural(t.agents, "agent")}: ${t.guarded} guarded, ${t.not_guarded} not guarded, ${t.remote} remote · ${t.no_verdict} with no verdict · ${t.blocked} blocked · ${plural(t.plaintext, "credential")} written in a config · ${plural(t.skills, "skill")}`);
   out.push(`${c.bold("Next:")} ${nextStep(inv)}`);
+  if (t.not_guarded || t.plaintext || inv.agents.some((a) => a.servers.some((s) => s.transport !== "stdio" && !s.guarded && s.credentials.length))) out.push(c.muted("`vet-skills inventory --fix` does the guard install and the credential move for you, after one question."));
   return out.join("\n");
 }
 

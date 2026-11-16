@@ -1,0 +1,71 @@
+name: "KillerSkills guard"
+description: "Put the MCP servers an agent will use in this job under the vet-skills guard: tool rules, credential handling and a record of every tool call."
+author: "Cyligence, LLC"
+branding:
+  icon: shield
+  color: green
+inputs:
+  version:
+    description: "vet-skills npm version to install. Use 'none' when vet-skills is already on PATH."
+    required: false
+    default: "latest"
+  org:
+    description: "Org slug to enroll this runner in for the job (needs org-token). CI runners do not use a seat. Without it the guard runs with the policy file, or its default."
+    required: false
+    default: ""
+  org-token:
+    description: "KillerSkills org enroll token (store it as a secret)."
+    required: false
+    default: ""
+  policy:
+    description: "Path to a policy file to apply for the job when no org is given."
+    required: false
+    default: ""
+  project:
+    description: "Wrap the MCP configs in the working directory (.mcp.json, .cursor/mcp.json, .vscode/mcp.json) as well as the runner's home."
+    required: false
+    default: "true"
+  working-directory:
+    description: "The project directory whose MCP configs to wrap."
+    required: false
+    default: "."
+  remote:
+    description: "Bridge remote servers that carry a credential header (moves the header value into the guard's store for the job)."
+    required: false
+    default: "true"
+outputs:
+  wrapped:
+    description: "How many servers were put under the guard."
+    value: ${{ steps.guard.outputs.wrapped }}
+runs:
+  using: composite
+  steps:
+    - name: Put MCP servers under the guard
+      id: guard
+      shell: bash
+      env:
+        KS_VERSION: ${{ inputs.version }}
+        KS_ORG: ${{ inputs.org }}
+        KS_ORG_TOKEN: ${{ inputs.org-token }}
+        KS_POLICY: ${{ inputs.policy }}
+        KS_PROJECT: ${{ inputs.project }}
+        KS_REMOTE: ${{ inputs.remote }}
+        KS_DIR: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        cd "$KS_DIR"
+        if [ "$KS_VERSION" != "none" ]; then npm install --global --silent "vet-skills@${KS_VERSION}"; fi
+        command -v vet-skills >/dev/null || { echo "::error::vet-skills is not on PATH"; exit 1; }
+        # A runner has no keychain: the guard's store is its encrypted file, gone with the runner.
+        echo "VET_SKILLS_STORE=file" >> "$GITHUB_ENV"; export VET_SKILLS_STORE=file
+        if [ "$KS_REMOTE" != "true" ]; then echo "VET_SKILLS_GUARD_REMOTE=0" >> "$GITHUB_ENV"; export VET_SKILLS_GUARD_REMOTE=0; fi
+        if [ -n "$KS_ORG" ] && [ -n "$KS_ORG_TOKEN" ]; then
+          vet-skills join "$KS_ORG" --token "$KS_ORG_TOKEN" --email "ci@${GITHUB_REPOSITORY_OWNER}.github" --ci >/dev/null 2>&1 || echo "::warning::could not join org $KS_ORG; the guard runs with its local policy"
+        elif [ -n "$KS_POLICY" ]; then
+          vet-skills policy set "$KS_POLICY"
+        fi
+        args=(guard install); [ "$KS_PROJECT" = "true" ] && args+=(--project)
+        out="$(vet-skills "${args[@]}")"; echo "$out"
+        n="$(printf '%s\n' "$out" | grep -c 'now run under the guard' || true)"
+        echo "wrapped=${n}" >> "$GITHUB_OUTPUT"
+        if [ "$n" = "0" ]; then echo "::notice::vet-skills guard: no MCP server config was found to wrap. Run this step after the config your agent reads is in place."; fi

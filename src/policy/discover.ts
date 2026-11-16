@@ -47,6 +47,9 @@ const PROJECT_FILES: { re: RegExp; agent: Component["agent"] }[] = [
   { re: /(^|\/)\.mcp\.json$/, agent: "claude_code" },
   { re: /(^|\/)\.claude\/settings(\.local)?\.json$/, agent: "claude_code" },
   { re: /(^|\/)\.claude\/skills\/[^/]+\/SKILL\.md$/i, agent: "claude_code" },
+  // Agent Skills (SKILL.md folders) for the other agents. `.agents/skills` is the directory Codex CLI, Cursor, Gemini CLI,
+  // Copilot, OpenCode, Cline, Amp and Zed share in a project; each also has its own directory in the user's home.
+  { re: /(^|\/)(\.config\/agents|\.agents|\.cursor|\.gemini|\.copilot|\.config\/opencode|\.codeium\/windsurf|\.windsurf|\.kiro|\.qwen|\.continue)\/skills\/[^/]+\/SKILL\.md$/i, agent: "any" },
   { re: /(^|\/)\.claude\/(commands|agents)\/[^/]+\.md$/i, agent: "claude_code" },
   { re: /(^|\/)\.cursor\/mcp\.json$/, agent: "cursor" },
   { re: /(^|\/)\.cursor\/rules\/[^/]+\.mdc?$/, agent: "cursor" },
@@ -94,7 +97,28 @@ export const USER_CONFIG_FILES: { path: string; agent: Component["agent"] }[] = 
   { path: "AppData/Roaming/Claude/claude_desktop_config.json", agent: "claude_desktop" },
 ];
 /** Directories on a laptop whose immediate subfolders are skills (each with a SKILL.md). */
-export const USER_SKILL_DIRS = [".claude/skills"];
+export const SKILL_DIRS: { dir: string; agent: Component["agent"]; scope: "user" | "project" | "both" }[] = [
+  { dir: ".claude/skills", agent: "claude_code", scope: "both" },
+  { dir: ".agents/skills", agent: "any", scope: "both" },
+  { dir: ".config/agents/skills", agent: "amp", scope: "user" },
+  { dir: ".cursor/skills", agent: "cursor", scope: "user" },
+  { dir: ".gemini/skills", agent: "gemini_cli", scope: "user" },
+  { dir: ".copilot/skills", agent: "copilot", scope: "user" },
+  { dir: ".config/opencode/skills", agent: "opencode", scope: "user" },
+  { dir: ".codeium/windsurf/skills", agent: "windsurf", scope: "user" },
+  { dir: ".windsurf/skills", agent: "windsurf", scope: "project" },
+  { dir: ".kiro/skills", agent: "kiro", scope: "both" },
+  { dir: ".qwen/skills", agent: "qwen", scope: "both" },
+  { dir: ".continue/skills", agent: "continue", scope: "both" },
+];
+export const USER_SKILL_DIRS = SKILL_DIRS.filter((d) => d.scope !== "project").map((d) => d.dir);
+/** Which agent reads the skill at this path. `any` is the shared `.agents/skills` directory. */
+export function skillAgent(path: string): Component["agent"] {
+  const p = path.replace(/\\/g, "/");
+  // Longest directory first, so `.config/agents/skills` is not taken for `.agents/skills`.
+  for (const d of [...SKILL_DIRS].sort((a, b) => b.dir.length - a.dir.length)) if (new RegExp(`(^|/)${d.dir.replace(/[.\/]/g, "\\$&")}/[^/]+/SKILL\\.md$`, "i").test(p)) return d.agent;
+  return "claude_code";
+}
 
 export function isAgentConfigPath(path: string): boolean {
   return PROJECT_FILES.some((f) => f.re.test(path));
@@ -297,7 +321,7 @@ export function parseAgentConfig(path: string, text: string, scope: Component["s
   const p = path.replace(/\\/g, "/");
   const agent = agentFor(p);
   const base = p.split("/").pop() ?? p;
-  if (/\/SKILL\.md$/i.test(p)) return [{ kind: "skill", name: skillName(p, text), path: p, scope, agent: "claude_code", envKeys: [], headerKeys: [] }];
+  if (/\/SKILL\.md$/i.test(p)) return [{ kind: "skill", name: skillName(p, text), path: p, scope, agent: skillAgent(p), envKeys: [], headerKeys: [] }];
   if (/\.(md|mdc)$/i.test(p) || /^\.(cursorrules|windsurfrules|clinerules)$/.test(base)) {
     const kind = /\/\.claude\/commands\//.test(`/${p}`) ? "slash command" : /\/\.claude\/agents\//.test(`/${p}`) ? "subagent" : "instructions";
     return [{ kind: "instructions", name: kind === "instructions" ? base : `${kind}: ${base.replace(/\.md$/i, "")}`, path: p, scope, agent, envKeys: [], headerKeys: [], detail: `${text.length.toLocaleString("en-US")} characters` }];

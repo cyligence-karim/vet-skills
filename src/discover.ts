@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { USER_CONFIG_FILES, USER_SKILL_DIRS, findSecrets, hiddenTextFindings, isAgentConfigPath, localLureFindings, parseAgentConfig, type Component, type LocalFile } from "./policy/index.js";
+import { USER_CONFIG_FILES, SKILL_DIRS, USER_SKILL_DIRS, findSecrets, hiddenTextFindings, isAgentConfigPath, localLureFindings, parseAgentConfig, type Component, type LocalFile } from "./policy/index.js";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 
@@ -38,10 +38,10 @@ export function discoverLocal(opts: { home?: string; project?: string } = {}): C
   }
   if (opts.project) {
     for (const rel of walk(opts.project, "", 0)) { const text = read(join(opts.project, rel)); if (text !== null) { out.push(...parseAgentConfig(rel, text, "project")); out.push(...secretComponent(rel, text, "project")); out.push(...hiddenComponent(rel, text, "project")); } }
-    for (const dir of [".claude/skills", "skills"]) for (const name of safeList(join(opts.project, dir))) out.push(...lureComponent(join(opts.project, dir, name), `${dir}/${name}`, "project"));
+    for (const dir of [...SKILL_DIRS.filter((d) => d.scope !== "user").map((d) => d.dir), "skills"]) for (const name of safeList(join(opts.project, dir))) out.push(...lureComponent(join(opts.project, dir, name), `${dir}/${name}`, "project"));
   }
   const seen = new Set<string>();
-  return out.filter((c) => { const k = `${c.kind}|${c.name}|${c.path}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  return out.filter((c) => { const k = `${c.kind}|${c.name}|${c.scope}|${c.path}`; if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
 /** Hidden instructions in a file the agent reads (invisible Unicode, hidden HTML, imperative comments). Titles and lines only. */
