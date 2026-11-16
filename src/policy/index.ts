@@ -94,6 +94,31 @@ export interface ExchangeRule {
   roleArn?: string; durationSeconds?: number; sessionPolicy?: string;
   /** gcp_impersonate: the service account and scopes; lifetime in seconds (≤ 3600). */
   serviceAccount?: string; scopes?: string[];
+  /**
+   * `session` (default): one token per launch. `per_tool`: the server works with a read-only token, and the guard swaps
+   * in a write-capable one only while a tool call classed as a write is in flight. The read variant is derived per kind
+   * (github_app: every permission lowered to read; aws_sts: the ReadOnlyAccess managed policy as a session policy;
+   * gcp_impersonate: the cloud-platform.read-only scope) unless the fields below say otherwise.
+   */
+  scope?: "session" | "per_tool";
+  readPermissions?: Record<string, string>; readPolicyArns?: string[]; readScopes?: string[];
+  /** Globs that override the classification of a tool call for this credential. */
+  writeTools?: string[]; readTools?: string[];
+}
+const READ_VERB = /^(get|list|search|read|fetch|describe|find|show|view|count|check|status|whoami|diff|log|lookup|resolve|inspect|head|stat|ls|cat|browse|preview|export|download)([_\-A-Z]|$)/;
+const toolGlob = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
+/**
+ * Is a tool call a read or a write, for choosing which credential it runs with? In order: the exchange rule's own
+ * read_tools / write_tools globs; the MCP annotation the server declared (readOnlyHint); the tool's name (a leading
+ * read verb such as get_, list_, search_). Anything else is a write. This is a classification by declaration and
+ * name, not by what the call does: a tool named get_report that deletes rows is classed as a read.
+ */
+export function toolClass(name: string, annotations?: { readOnlyHint?: boolean } | null, rule?: Pick<ExchangeRule, "writeTools" | "readTools">): "read" | "write" {
+  const bare = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+  if (rule?.writeTools?.some((g) => toolGlob(g).test(bare))) return "write";
+  if (rule?.readTools?.some((g) => toolGlob(g).test(bare))) return "read";
+  if (annotations && typeof annotations.readOnlyHint === "boolean") return annotations.readOnlyHint ? "read" : "write";
+  return READ_VERB.test(bare) ? "read" : "write";
 }
 export type ToolAction = "allow" | "deny" | "approve";
 export interface ToolRule { match: string; action: ToolAction; reason?: string }
@@ -264,6 +289,11 @@ export function parsePolicyYaml(text: string): Policy {
       if (o.permissions && typeof o.permissions === "object") r.permissions = Object.fromEntries(Object.entries(o.permissions as Record<string, unknown>).filter(([, v]) => typeof v === "string").map(([k, v]) => [k, String(v)]).slice(0, 50));
       if (sv("role_arn")) r.roleArn = sv("role_arn"); if (typeof o.duration_seconds === "number") r.durationSeconds = Math.min(3600, Math.max(900, o.duration_seconds)); if (sv("session_policy")) r.sessionPolicy = typeof o.session_policy === "string" ? (o.session_policy as string).slice(0, 4000) : undefined;
       if (sv("service_account")) r.serviceAccount = sv("service_account"); if (Array.isArray(o.scopes)) r.scopes = o.scopes.map(String).slice(0, 20);
+      if (o.scope === "per_tool") r.scope = "per_tool";
+      if (o.read_permissions && typeof o.read_permissions === "object") r.readPermissions = Object.fromEntries(Object.entries(o.read_permissions as Record<string, unknown>).filter(([, v]) => typeof v === "string").map(([k, v]) => [k, String(v)]).slice(0, 50));
+      const list = (k: string, max: number) => (Array.isArray(o[k]) ? (o[k] as unknown[]).map(String).filter((x) => x.length <= 300).slice(0, max) : undefined);
+      if (list("read_policy_arns", 10)) r.readPolicyArns = list("read_policy_arns", 10); if (list("read_scopes", 20)) r.readScopes = list("read_scopes", 20);
+      if (list("write_tools", 100)) r.writeTools = list("write_tools", 100); if (list("read_tools", 100)) r.readTools = list("read_tools", 100);
       return [r];
     }).slice(0, 50) : [],
   };
@@ -306,7 +336,7 @@ export function serializePolicyYaml(p: Policy): string {
     agents: p.agents,
     approvals: { ttl_days: p.approvals.ttlDays, blocked_exception_approvers: p.approvals.blockedExceptionApprovers },
     context: p.context ?? DEFAULT_CONTEXT,
-    runtime: { network: p.runtime.network, new_host: p.runtime.newHost, secrets: p.runtime.secrets, blocked_versions: p.runtime.blockedVersions, revoke_running: p.runtime.revokeRunning, on_change: p.runtime.onChange, min_coverage: p.runtime.minCoverage, default_tool_action: p.runtime.defaultToolAction, approval_timeout_seconds: p.runtime.approvalTimeoutSeconds, tools: p.runtime.tools.map((t) => ({ match: t.match, action: t.action, ...(t.reason ? { reason: t.reason } : {}) })), ...(p.runtime.exchange.length ? { exchange: p.runtime.exchange.map((e) => ({ var: e.var, kind: e.kind, ...(e.host ? { host: e.host } : {}), ...(e.appId ? { app_id: e.appId } : {}), ...(e.installationId ? { installation_id: e.installationId } : {}), ...(e.repositories ? { repositories: e.repositories } : {}), ...(e.permissions ? { permissions: e.permissions } : {}), ...(e.roleArn ? { role_arn: e.roleArn } : {}), ...(e.durationSeconds ? { duration_seconds: e.durationSeconds } : {}), ...(e.sessionPolicy ? { session_policy: e.sessionPolicy } : {}), ...(e.serviceAccount ? { service_account: e.serviceAccount } : {}), ...(e.scopes ? { scopes: e.scopes } : {}) })) } : {}) },
+    runtime: { network: p.runtime.network, new_host: p.runtime.newHost, secrets: p.runtime.secrets, blocked_versions: p.runtime.blockedVersions, revoke_running: p.runtime.revokeRunning, on_change: p.runtime.onChange, min_coverage: p.runtime.minCoverage, default_tool_action: p.runtime.defaultToolAction, approval_timeout_seconds: p.runtime.approvalTimeoutSeconds, tools: p.runtime.tools.map((t) => ({ match: t.match, action: t.action, ...(t.reason ? { reason: t.reason } : {}) })), ...(p.runtime.exchange.length ? { exchange: p.runtime.exchange.map((e) => ({ var: e.var, kind: e.kind, ...(e.host ? { host: e.host } : {}), ...(e.appId ? { app_id: e.appId } : {}), ...(e.installationId ? { installation_id: e.installationId } : {}), ...(e.repositories ? { repositories: e.repositories } : {}), ...(e.permissions ? { permissions: e.permissions } : {}), ...(e.roleArn ? { role_arn: e.roleArn } : {}), ...(e.durationSeconds ? { duration_seconds: e.durationSeconds } : {}), ...(e.sessionPolicy ? { session_policy: e.sessionPolicy } : {}), ...(e.serviceAccount ? { service_account: e.serviceAccount } : {}), ...(e.scopes ? { scopes: e.scopes } : {}), ...(e.scope === "per_tool" ? { scope: "per_tool" } : {}), ...(e.readPermissions ? { read_permissions: e.readPermissions } : {}), ...(e.readPolicyArns ? { read_policy_arns: e.readPolicyArns } : {}), ...(e.readScopes ? { read_scopes: e.readScopes } : {}), ...(e.writeTools ? { write_tools: e.writeTools } : {}), ...(e.readTools ? { read_tools: e.readTools } : {}) })) } : {}) },
   });
 }
 

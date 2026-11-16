@@ -46,6 +46,9 @@ export interface RunOptions {
   /** The live bindings once parsed, so the caller can rotate `value` in place (short-lived credential renewal). */ onBindings?: (bindings: SecretBinding[]) => void;
   /** Hands the caller a function that stops the running server: pending calls are answered with the reason, later calls
    *  are refused, the process gets SIGTERM and, 5 s later, SIGKILL. Used when a version is revoked mid-session. */ onStopper?: (stop: (reason: string) => void) => void;
+  /** Per-tool credentials: see RelayOptions.beforeCall / afterCall, and the tool list as the server declared it. */
+  beforeCall?: (tool: string, id: number | string | undefined) => Promise<string | null>; afterCall?: (tool: string, id: number | string) => void;
+  onTools?: (tools: { name?: string; annotations?: { readOnlyHint?: boolean } }[]) => void;
 }
 
 export type HostMode = "brokered" | "tunnel" | "plain" | "opaque";
@@ -243,10 +246,10 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   const child = spawn(launch[0], launch.slice(1), { stdio: ["pipe", "pipe", "inherit"], env });
   // agent → server through the relay (relay.ts): lines are handled in order, and a held call parks the queue behind it
   // so the server never sees a later call before an earlier one was decided.
-  const relay = createRelay({ label: opts.label, deny: opts.deny, toolRules: opts.toolRules, defaultToolAction: opts.defaultToolAction, approver: opts.approver }, {
+  const relay = createRelay({ label: opts.label, deny: opts.deny, toolRules: opts.toolRules, defaultToolAction: opts.defaultToolAction, approver: opts.approver, beforeCall: opts.beforeCall, afterCall: opts.afterCall }, {
     toServer: (line) => { if (!child.stdin.destroyed) child.stdin.write(line + "\n"); },
     toAgent: (line) => { process.stdout.write(line + "\n"); },
-    log, emit,
+    log, emit, onTools: opts.onTools,
   });
   opts.onStopper?.((reason) => {
     if (relay.stopped) return;

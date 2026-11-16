@@ -167,7 +167,7 @@ function agentProcesses(): { ok: boolean; why?: string; procs: { pid: number; na
     const comm = m[3]; if (!isAgentProcess(comm) || /vet-skills/.test(comm)) continue;
     let env = "";
     if (os === "linux") { try { env = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").join("\n"); } catch { unreadable++; continue; } }
-    else { const r = spawnSync("ps", ["eww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 }); if (r.status !== 0) { unreadable++; continue; } env = r.stdout.replace(/ (?=[A-Za-z_][A-Za-z0-9_]*=)/g, "\n"); }
+    else { const r = spawnSync("ps", ["eww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 }); if (r.status !== 0 || !/ (PATH|HOME|USER)=/.test(r.stdout)) { unreadable++; continue; } env = r.stdout.replace(/ (?=[A-Za-z_][A-Za-z0-9_]*=)/g, "\n"); }
     procs.push({ pid, name: (comm.match(/([^/]+)\.app\//)?.[1] ?? comm.split(/[\\/]/).pop()!).slice(0, 40), env });
   }
   return { ok: true, why: unreadable ? `${unreadable} agent process${unreadable === 1 ? "" : "es"} whose environment the OS would not show` : undefined, procs };

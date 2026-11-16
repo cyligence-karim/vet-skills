@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { discoverLocal } from "../src/discover.ts";
-import { buildInventory, componentsForSync, nextStep, renderInventory } from "../src/inventory.ts";
+import { buildInventory, componentsForSync, nextStep, renderInventory, renderReach } from "../src/inventory.ts";
 
 const DECOY_GH = "ghp_" + "Kd9".repeat(12);
 const DECOY_HEADER = "sk-decoy-" + "x7".repeat(20);
@@ -62,6 +62,9 @@ test("inventory lists every server of every agent with its transport and guarded
   assert.deepEqual(by.linear.plaintext, ["Authorization"], "a literal bearer header counts even when no pattern knows the token");
   assert.deepEqual(inv.totals, { agents: 3, servers: 6, guarded: 2, not_guarded: 2, remote: 2, no_verdict: 1, blocked: 0, plaintext: 2, skills: 1 });
   assert.equal(inv.agents[0].skills[0].name, "pdf-tools");
+  // Reach: each credential name, and every server handed it. Non-credential names (none here) are left out.
+  assert.deepEqual(inv.credentials.map((k) => [k.name, k.uses.map((u) => `${u.agent}/${u.server}/${u.guarded ? "guarded" : "open"}${u.plaintext ? "/plaintext" : ""}`)]), [["Authorization", ["Claude Code/linear/open/plaintext"]], ["GITHUB_PERSONAL_ACCESS_TOKEN", ["Claude Code/github/guarded/plaintext"]], ["SUPABASE_ACCESS_TOKEN", ["Claude Code/supabase/open"]]]);
+  assert.match(renderReach(inv), /GITHUB_PERSONAL_ACCESS_TOKEN/); assert.ok(!renderReach(inv).includes(DECOY_GH));
   assert.match(nextStep(inv), /vet-skills secrets migrate/);
   assert.equal(readFileSync(join(home, ".claude.json"), "utf8"), before, "read-only: the config is untouched");
 });

@@ -7,7 +7,7 @@
  * nothing is sent anywhere on a machine that is not enrolled, apart from verdict lookups by package name and version.
  */
 import { execFile } from "node:child_process";
-import type { Component } from "./policy/index.js";
+import { classifyCredential, type Component } from "./policy/index.js";
 import { resolveSkill } from "./api.js";
 import { discoverLocal } from "./discover.js";
 import { readPins } from "./guard.js";
@@ -46,6 +46,8 @@ export interface Inventory {
   agents: InventoryAgent[];
   /** Files with a pasted credential that no listed server accounts for, installer lures and hidden instructions. */
   other_findings: { kind: string; file: string; detail: string; fix: string }[];
+  /** Credential reach: for each credential name, every server on this machine that is handed it. */
+  credentials: { name: string; class: string; uses: { agent: string; server: string; transport: string; guarded: boolean; plaintext: boolean; verdict: string | null }[] }[];
   totals: { agents: number; servers: number; guarded: number; not_guarded: number; remote: number; no_verdict: number; blocked: number; plaintext: number; skills: number };
 }
 
@@ -126,8 +128,15 @@ export async function buildInventory(opts: { home?: string; project?: string; co
   const agents = [...byAgent.values()].sort((a, b) => order.indexOf(a.agent) - order.indexOf(b.agent));
   for (const a of agents) { a.servers.sort((x, y) => x.name.localeCompare(y.name) || x.file.localeCompare(y.file)); a.skills.sort((x, y) => x.name.localeCompare(y.name)); }
   const servers = agents.flatMap((a) => a.servers);
+  const reach = new Map<string, Inventory["credentials"][number]>();
+  for (const a of agents) for (const sv of a.servers) for (const name of sv.credentials) {
+    const cls = classifyCredential(name); if (!cls) continue;
+    const e = reach.get(name) ?? { name, class: cls, uses: [] }; reach.set(name, e);
+    e.uses.push({ agent: a.label, server: sv.name, transport: sv.transport, guarded: sv.guarded, plaintext: sv.plaintext.includes(name), verdict: sv.verdict?.label ?? null });
+  }
   return {
     generated_at: new Date().toISOString(), agents, other_findings: other,
+    credentials: [...reach.values()].sort((x, y) => y.uses.length - x.uses.length || x.name.localeCompare(y.name)),
     totals: {
       agents: agents.length, servers: servers.length, guarded: servers.filter((s) => s.guarded).length,
       not_guarded: servers.filter((s) => s.transport === "stdio" && !s.guarded).length, remote: servers.filter((s) => s.transport !== "stdio").length,
@@ -169,6 +178,19 @@ export function renderInventory(inv: Inventory): string {
   }
   out.push("", `${plural(t.servers, "MCP server")} in ${plural(t.agents, "agent")}: ${t.guarded} guarded, ${t.not_guarded} not guarded, ${t.remote} remote · ${t.no_verdict} with no verdict · ${t.blocked} blocked · ${plural(t.plaintext, "credential")} written in a config · ${plural(t.skills, "skill")}`);
   out.push(`${c.bold("Next:")} ${nextStep(inv)}`);
+  return out.join("\n");
+}
+
+/** `inventory --credentials`: the same machine, turned around. One block per credential name: who is handed it. */
+export function renderReach(inv: Inventory): string {
+  if (!inv.credentials.length) return "No MCP server on this machine is handed a credential by name.";
+  const out: string[] = [];
+  for (const k of inv.credentials) {
+    const open = k.uses.filter((u) => !u.guarded).length;
+    out.push("", `${c.bold(k.name)}  ${c.muted(`${k.class} · ${plural(k.uses.length, "server")}${open ? ` · ${open} outside the guard` : ""}`)}`);
+    for (const u of k.uses) out.push(`  ${pad(u.server, 22)} ${pad(u.agent, 16)} ${u.guarded ? c.verified(pad("guarded", 12)) : c.caution(pad(u.transport === "stdio" ? "not guarded" : "remote", 12))} ${u.plaintext ? c.blocked("written in the config") : c.muted(u.verdict ?? "")}`);
+  }
+  out.push("", c.muted(`${plural(inv.credentials.length, "credential name")} across ${plural(inv.totals.servers, "MCP server")}. If one leaks, the servers listed under it are the ones that could have used it. Names only: values are never read out.`));
   return out.join("\n");
 }
 

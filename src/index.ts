@@ -18,6 +18,7 @@
  *   vet-skills inventory [--project] [--json] per agent: MCP servers (local and remote), guarded or not, verdicts, credential names, skills, and the fix for each finding
  *   vet-skills secrets migrate [--dry-run] [--yes]   move credentials written in agent configs into the guard's store; list | set <key> | rm <key>
   vet-skills prove [--json]                 check that no MCP credential sits in an agent config, a running agent's environment or the guard's files
+  vet-skills inventory --credentials        the same, by credential: for each name, every server that is handed it
   vet-skills inventory [--project] [--json] what your agents can reach: servers, guarded or not, verdicts, credential names
   vet-skills discover [--project] [--json] every MCP server, skill, plugin and hook configured on this machine
  *   vet-skills mcp                        run as an MCP server so agents can check skills themselves
@@ -47,7 +48,7 @@ import { parsePolicyYaml, serializePolicyYaml } from "./policy/index.js";
 import { check, renderCheck, renderOutcome } from "./check.js";
 import { enroll, report, detonate, publish, discoverReport, resolveSkill } from "./api.js";
 import { discoverLocal } from "./discover.js";
-import { buildInventory, componentsForSync, renderInventory } from "./inventory.js";
+import { buildInventory, componentsForSync, renderInventory, renderReach } from "./inventory.js";
 import { fetchTarget, tarDir } from "./try.js";
 import { guard, parseRunArgs } from "./run.js";
 import { serveMcp } from "./mcp.js";
@@ -80,7 +81,7 @@ const { values, positionals } = parseArgs({
   args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", process.argv[3]] : ORG_CMD ? [process.argv[2]] : process.argv.slice(2),
   allowPositionals: true,
   options: {
-    "dry-run": { type: "boolean" }, token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
+    "dry-run": { type: "boolean" }, credentials: { type: "boolean" }, token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
     json: { type: "boolean" }, ci: { type: "boolean" }, email: { type: "string" }, help: { type: "boolean", short: "h" }, project: { type: "boolean" }, quiet: { type: "boolean", short: "q" }, version: { type: "boolean", short: "v" }, agent: { type: "string" }, publisher: { type: "string" }, registry: { type: "string" },
   },
 });
@@ -520,7 +521,7 @@ async function main(): Promise<number> {
       const comps = discoverLocal({ project: values.project ? process.cwd() : undefined });
       const inv = await buildInventory({ components: comps });
       if (values.json) console.log(JSON.stringify(inv, null, 2));
-      else if (!values.quiet) console.log(renderInventory(inv));
+      else if (!values.quiet) console.log(process.argv.includes("--credentials") ? renderReach(inv) : renderInventory(inv));
       if (readOrg()) {
         const r = await discoverReport(componentsForSync(comps));
         if (!values.json && !values.quiet) console.log(r.ok ? `\n${c.verified("✓")} Reported to ${readOrg()!.slug} (names only) · ${API}${r.data.dashboard}` : c.caution(`\nreport failed: ${r.error}`));

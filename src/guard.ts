@@ -28,8 +28,9 @@ import { guard, parseRunArgs, type GuardEvent, type RunOptions } from "./run.js"
 import { SecretStore, isStoreRef, keyOfRef, refFor, resolveStoreRefs } from "./store.js";
 import { HOME, VERSION, clientId, readOrg, readPolicy, telemetryEnabled, type ResolveResponse } from "./state.js";
 import { mint, secretsSpecFor, type Minted } from "./exchange.js";
+import { toolClass } from "./policy/index.js";
 import type { SecretBinding } from "./broker.js";
-import type { ToolRule } from "./policy/index.js";
+import type { ExchangeRule, ToolRule } from "./policy/index.js";
 
 export type GuardClient = "claude-code" | "claude-desktop" | "cursor" | "windsurf" | "gemini" | "codex" | "grok" | "vscode" | "copilot" | "kiro" | "qwen" | "cline" | "zed" | "amp" | "opencode";
 export interface ConfigSpec { path: string; client: GuardClient; format: "mcpServers" | "claude-json" | "vscode" | "codex-toml" | "amp" | "zed" | "opencode"; scope: "user" | "project" }
@@ -405,6 +406,36 @@ export function parseExecArgs(argv: string[]): ExecArgs | { error: string } {
   return { server: server || cmd[0], client, secrets, cmd };
 }
 
+interface Scoped { rule: ExchangeRule; read: Minted; full: Minted | null; /** ids of the write calls in flight */ writers: Set<number | string> }
+const applyValues = (live: SecretBinding[], values: Record<string, string>) => { for (const [k, val] of Object.entries(values)) { const b = live.find((x) => x.name === k); if (b) b.value = val; } };
+/**
+ * Per-tool credentials. The broker's bindings hold the read-only token; when a call classed as a write is about to go
+ * to the server, the write-capable token is minted (once, then reused until it nears expiry) and swapped in, and it is
+ * swapped out again when the last write call in flight has its reply. Reads that overlap a write run with the write
+ * token for that window; the server's own background requests do too.
+ */
+export function perToolHooks(scoped: Scoped[], live: () => SecretBinding[], log: (l: string) => void, emit: (e: Record<string, unknown>) => void, mintFn: typeof mint = mint): Pick<RunOptions, "beforeCall" | "afterCall" | "onTools"> {
+  const annotations = new Map<string, { readOnlyHint?: boolean }>();
+  return {
+    onTools: (tools) => { for (const t of tools) if (t.name && t.annotations) annotations.set(t.name, t.annotations); },
+    beforeCall: async (tool, id) => {
+      for (const x of scoped) {
+        if (toolClass(tool, annotations.get(tool), x.rule) !== "write") continue;
+        if (!x.full || x.full.expiresAt.getTime() - Date.now() < 30_000) {
+          try { x.full = await mintFn(x.rule); } catch (e) { return `it is a write, and a write-capable ${x.rule.kind.replace("_", " ")} credential could not be minted (${(e as Error).message})`; }
+          emit({ kind: "credential_raised", tool, name: x.rule.var, exchange: x.rule.kind, scope: x.full.scope, expires: x.full.expiresAt.toISOString() });
+          log(`${tool} is a write: minted a write-capable ${x.rule.kind.replace("_", " ")} credential for ${x.rule.var} (${x.full.scope}); read-only again when the call returns`);
+        }
+        if (id === undefined) continue; // no reply will come to lower it again, so it is not raised
+        if (!x.writers.size) applyValues(live(), x.full.values);
+        x.writers.add(id);
+      }
+      return null;
+    },
+    afterCall: (_tool, id) => { for (const x of scoped) if (x.writers.delete(id) && !x.writers.size) applyValues(live(), x.read.values); },
+  };
+}
+
 /** Folds tool-call events into a session report: per-tool counts, and per-call decisions for the org's record. Deny and
  *  held are always one row; allow is folded per (tool, minute) with a count unless the org asked for full capture.
  *  Argument key names only. Replies are matched by JSON-RPC id. */
@@ -544,21 +575,25 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   // long-lived value under the broker, and says so.
   const wants = new Set<string>([...(v?.credentials?.env.filter((e) => e.kind === "credential").map((e) => e.name) ?? []), ...(v?.trace_summary?.coverage?.needs ?? []).filter((n) => /^[A-Z][A-Z0-9_]+$/.test(n))]);
   const minted: Minted[] = [];
+  const scoped: Scoped[] = [];
   for (const rule of rt.exchange) {
     const applies = wants.has(rule.var) || !!process.env[rule.var] || (rule.kind === "aws_sts" && (wants.has("AWS_ACCESS_KEY_ID") || !!process.env.AWS_ACCESS_KEY_ID));
     if (!applies) continue;
     try {
-      const m = await mint(rule);
+      // per_tool: the server starts with the read-only variant; a write-capable token is minted when the first call
+      // classed as a write goes through, and is live only while such a call is in flight (see scoped, below).
+      const perTool = rule.scope === "per_tool";
+      const m = await mint(rule, process.env, fetch, perTool ? "read" : "full");
       for (const [k, val] of Object.entries(m.values)) process.env[k] = val;
-      minted.push(m);
+      if (perTool) scoped.push({ rule, read: m, full: null, writers: new Set() }); else minted.push(m);
       const mins = Math.max(1, Math.round((m.expiresAt.getTime() - Date.now()) / 60_000));
-      report.secrets.push({ name: rule.var, host: m.host, refused: false, exchange: { kind: m.kind, scope: m.scope, expires: m.expiresAt.toISOString() } });
-      log(`exchanged ${rule.var} for a ${mins}-minute ${m.kind.replace("_", " ")} credential (${m.scope}); the long-lived value stays on this machine`);
+      report.secrets.push({ name: rule.var, host: m.host, refused: false, exchange: { kind: m.kind, scope: perTool ? `read-only until a write tool is called · ${m.scope}` : m.scope, expires: m.expiresAt.toISOString() } });
+      log(perTool ? `exchanged ${rule.var} for a ${mins}-minute read-only ${m.kind.replace("_", " ")} credential (${m.scope}); a write-capable one is used only while a write tool call is in flight` : `exchanged ${rule.var} for a ${mins}-minute ${m.kind.replace("_", " ")} credential (${m.scope}); the long-lived value stays on this machine`);
     } catch (e) { log(`⚠ ${rule.var}: ${(e as Error).message}; falling back to the long-lived value under the broker`); }
   }
   // Secrets: the variables the verdict names as credentials, present in this environment, bound to the vendor's hosts.
   let secrets = a.secrets;
-  if (minted.length) secrets = [secretsSpecFor(minted), a.secrets].filter(Boolean).join(",");
+  if (minted.length || scoped.length) secrets = [secretsSpecFor([...minted, ...scoped.map((x) => x.read)]), a.secrets].filter(Boolean).join(",");
   if (!secrets && rt.secrets === "broker" && v?.credentials) {
     const own = v.credentials.hosts.filter((h) => h.own).map((h) => registrableDomain(h.host));
     const implied = (v.trace_summary?.egress_hosts ?? []).map((h) => h.implied).filter((x): x is string => !!x);
@@ -581,6 +616,7 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   const opts: RunOptions = {
     deny: [], net: known, observe: !enforce, label: a.server, query, secrets, opaque, ownHosts, toolRules: rules, defaultToolAction: rt.defaultToolAction, approver,
     onBindings: (b) => { live = b; },
+    ...(scoped.length ? perToolHooks(scoped, () => live, log, (e) => appendGuardLog({ ...e, session, server: a.server, pkg: report.pkg, semver })) : {}),
     log,
     onEvent: (e: GuardEvent) => {
       appendGuardLog({ ...e, session, server: a.server, pkg: report.pkg, semver });
@@ -612,6 +648,14 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
         log(`renewed ${rule.var} (${fresh.kind.replace("_", " ")}, expires ${fresh.expiresAt.toISOString().slice(11, 16)} UTC)`);
       } catch (e) { log(`⚠ could not renew ${rule.var}: ${(e as Error).message}; the current token expires ${m.expiresAt.toISOString().slice(11, 16)} UTC`); }
     }
+    // per_tool credentials: the read token is renewed like any other; a write token that is not in use is dropped and
+    // minted again on the next write call.
+    for (const x of scoped) {
+      try {
+        if (x.read.expiresAt.getTime() - Date.now() <= 3 * 60_000) { const old = x.read; x.read = await mint(x.rule, process.env, fetch, "read"); if (!x.writers.size) applyValues(live, x.read.values); await old.revoke?.().catch(() => null); }
+        if (x.full && x.full.expiresAt.getTime() - Date.now() <= 3 * 60_000) { const old = x.full; if (x.writers.size) { x.full = await mint(x.rule); applyValues(live, x.full.values); } else x.full = null; await old.revoke?.().catch(() => null); }
+      } catch (e) { log(`⚠ could not renew ${x.rule.var}: ${(e as Error).message}`); }
+    }
   }, 60_000); renew.unref();
   // Live revocation: the launch check is asked again while the server runs. A version revoked (or confirmed malicious)
   // mid-session is stopped or announced, per policy runtime.revoke_running. One check a minute, three-second budget.
@@ -633,6 +677,7 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   }, watchEvery); watch.unref();
   const code = await guard(parsed.cmd, opts);
   clearInterval(timer); clearInterval(renew); clearInterval(watch);
+  for (const x of scoped) { await x.read.revoke?.().catch(() => null); await x.full?.revoke?.().catch(() => null); }
   for (const m of minted) { await m.revoke?.().catch(() => null); if (m.revoke) log(`revoked the ${m.kind.replace("_", " ")} credential minted for this session`); }
   // Baseline: the hosts this version reached on this machine, so the next session knows what is new.
   const b = readBaseline(); const cur = b[key] ?? { hosts: [], sessions: 0, last: started };

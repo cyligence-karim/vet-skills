@@ -17,7 +17,10 @@ import { createSign, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { ExchangeRule } from "./policy/index.js";
 
+export type Access = "full" | "read";
 export interface Minted {
+  /** read: the read-only variant minted for a per_tool rule. full: what the rule grants. */
+  access?: Access;
   /** Variables to put in the environment the broker reads (then replaced by placeholders for the server). */
   values: Record<string, string>;
   /** Host the minted values are bound to. */
@@ -40,7 +43,7 @@ export function githubAppJwt(appId: string, privateKeyPem: string, now = Math.fl
   return `${header}.${payload}.${b64url(signer.sign(privateKeyPem))}`;
 }
 
-async function mintGithub(rule: ExchangeRule, env: NodeJS.ProcessEnv, fetchFn: typeof fetch): Promise<Minted> {
+async function mintGithub(rule: ExchangeRule, env: NodeJS.ProcessEnv, fetchFn: typeof fetch, access: Access = "full"): Promise<Minted> {
   const appId = rule.appId ?? env.VET_GITHUB_APP_ID;
   const installationId = rule.installationId ?? env.VET_GITHUB_INSTALLATION_ID;
   const keyPem = env.VET_GITHUB_APP_KEY ?? (env.VET_GITHUB_APP_KEY_FILE && existsSync(env.VET_GITHUB_APP_KEY_FILE) ? readFileSync(env.VET_GITHUB_APP_KEY_FILE, "utf8") : null);
@@ -49,43 +52,60 @@ async function mintGithub(rule: ExchangeRule, env: NodeJS.ProcessEnv, fetchFn: t
   const body: Record<string, unknown> = {};
   if (rule.repositories?.length) body.repositories = rule.repositories.map((r) => r.split("/").pop());
   if (rule.permissions && Object.keys(rule.permissions).length) body.permissions = rule.permissions;
+  if (access === "read") {
+    // The read variant: the rule's own read_permissions, or every permission of the full token lowered to read. When the
+    // policy names no permissions we ask GitHub what the installation has (a token minted and revoked at once).
+    let perms = rule.readPermissions ?? rule.permissions ?? null;
+    if (!perms) {
+      const probe = await fetchFn(`https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`, { method: "POST", headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json", "user-agent": "vet-skills-guard", "content-type": "application/json" }, body: JSON.stringify(body) });
+      if (!probe.ok) throw new Error(`GitHub refused the installation token (${probe.status}): ${(await probe.text()).slice(0, 200)}`);
+      const pd = (await probe.json()) as { token: string; permissions?: Record<string, string> };
+      await fetchFn("https://api.github.com/installation/token", { method: "DELETE", headers: { authorization: `token ${pd.token}`, accept: "application/vnd.github+json", "user-agent": "vet-skills-guard" } }).catch(() => null);
+      perms = pd.permissions ?? {};
+    }
+    body.permissions = rule.readPermissions ?? Object.fromEntries(Object.keys(perms).map((k) => [k, "read"]));
+  }
   const res = await fetchFn(`https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`, { method: "POST", headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json", "user-agent": "vet-skills-guard", "content-type": "application/json" }, body: JSON.stringify(body) });
   if (!res.ok) throw new Error(`GitHub refused the installation token (${res.status}): ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as { token: string; expires_at: string; permissions?: Record<string, string>; repository_selection?: string };
   const scope = `${rule.repositories?.length ? `${rule.repositories.length} repo${rule.repositories.length === 1 ? "" : "s"}` : data.repository_selection ?? "installation"}${data.permissions ? ` · ${Object.entries(data.permissions).map(([k, v]) => `${k}:${v}`).join(" ")}` : ""}`;
   const token = data.token;
   return {
-    values: { [rule.var]: token }, host: rule.host ?? DEFAULT_HOST.github_app, expiresAt: new Date(data.expires_at), kind: "github_app", scope,
+    values: { [rule.var]: token }, host: rule.host ?? DEFAULT_HOST.github_app, expiresAt: new Date(data.expires_at), kind: "github_app", scope, access,
     revoke: async () => { await fetchFn("https://api.github.com/installation/token", { method: "DELETE", headers: { authorization: `token ${token}`, accept: "application/vnd.github+json", "user-agent": "vet-skills-guard" } }).catch(() => null); },
   };
 }
 
-function mintAws(rule: ExchangeRule, env: NodeJS.ProcessEnv): Minted {
+function mintAws(rule: ExchangeRule, env: NodeJS.ProcessEnv, access: Access = "full"): Minted {
   if (!rule.roleArn) throw new Error("aws_sts needs role_arn in the policy");
   const duration = Math.min(3600, Math.max(900, rule.durationSeconds ?? 900));
   const args = ["sts", "assume-role", "--role-arn", rule.roleArn, "--role-session-name", `vet-skills-${randomBytes(4).toString("hex")}`, "--duration-seconds", String(duration), "--output", "json"];
   if (rule.sessionPolicy) args.push("--policy", rule.sessionPolicy);
+  // The read variant adds a managed session policy; the session's permissions are the intersection with the role's.
+  const readArns = access === "read" ? (rule.readPolicyArns?.length ? rule.readPolicyArns : ["arn:aws:iam::aws:policy/ReadOnlyAccess"]) : [];
+  if (readArns.length) args.push("--policy-arns", ...readArns.map((a) => `arn=${a}`));
   const r = spawnSync("aws", args, { encoding: "utf8", env, timeout: 20_000 });
   if (r.error || r.status !== 0) throw new Error(`aws sts assume-role failed: ${(r.stderr || r.error?.message || "").trim().slice(0, 300) || "is the AWS CLI installed and a profile configured?"}`);
   const c = (JSON.parse(r.stdout) as { Credentials: { AccessKeyId: string; SecretAccessKey: string; SessionToken: string; Expiration: string } }).Credentials;
-  return { values: { AWS_ACCESS_KEY_ID: c.AccessKeyId, AWS_SECRET_ACCESS_KEY: c.SecretAccessKey, AWS_SESSION_TOKEN: c.SessionToken }, host: rule.host ?? DEFAULT_HOST.aws_sts, expiresAt: new Date(c.Expiration), kind: "aws_sts", scope: `${rule.roleArn.split("/").pop()} · ${duration}s${rule.sessionPolicy ? " · session policy" : ""}` };
+  return { values: { AWS_ACCESS_KEY_ID: c.AccessKeyId, AWS_SECRET_ACCESS_KEY: c.SecretAccessKey, AWS_SESSION_TOKEN: c.SessionToken }, host: rule.host ?? DEFAULT_HOST.aws_sts, expiresAt: new Date(c.Expiration), kind: "aws_sts", access, scope: `${rule.roleArn.split("/").pop()} · ${duration}s${rule.sessionPolicy ? " · session policy" : ""}${access === "read" ? " · read-only" : ""}` };
 }
 
-function mintGcp(rule: ExchangeRule, env: NodeJS.ProcessEnv): Minted {
+function mintGcp(rule: ExchangeRule, env: NodeJS.ProcessEnv, access: Access = "full"): Minted {
   if (!rule.serviceAccount) throw new Error("gcp_impersonate needs service_account in the policy");
   const lifetime = Math.min(3600, Math.max(300, rule.durationSeconds ?? 600));
   const args = ["auth", "print-access-token", `--impersonate-service-account=${rule.serviceAccount}`, `--lifetime=${lifetime}s`];
-  if (rule.scopes?.length) args.push(`--scopes=${rule.scopes.join(",")}`);
+  const scopes = access === "read" ? (rule.readScopes?.length ? rule.readScopes : ["https://www.googleapis.com/auth/cloud-platform.read-only"]) : rule.scopes;
+  if (scopes?.length) args.push(`--scopes=${scopes.join(",")}`);
   const r = spawnSync("gcloud", args, { encoding: "utf8", env, timeout: 20_000 });
   if (r.error || r.status !== 0) throw new Error(`gcloud impersonation failed: ${(r.stderr || r.error?.message || "").trim().slice(0, 300) || "is gcloud installed and logged in?"}`);
-  return { values: { [rule.var]: r.stdout.trim() }, host: rule.host ?? DEFAULT_HOST.gcp_impersonate, expiresAt: new Date(Date.now() + lifetime * 1000), kind: "gcp_impersonate", scope: `${rule.serviceAccount} · ${lifetime}s` };
+  return { values: { [rule.var]: r.stdout.trim() }, host: rule.host ?? DEFAULT_HOST.gcp_impersonate, expiresAt: new Date(Date.now() + lifetime * 1000), kind: "gcp_impersonate", access, scope: `${rule.serviceAccount} · ${lifetime}s${access === "read" ? " · read-only" : ""}` };
 }
 
 /** Mint for one rule. Throws with a one-line reason; the caller decides whether to fall back to the long-lived value. */
-export async function mint(rule: ExchangeRule, env: NodeJS.ProcessEnv = process.env, fetchFn: typeof fetch = fetch): Promise<Minted> {
-  if (rule.kind === "github_app") return mintGithub(rule, env, fetchFn);
-  if (rule.kind === "aws_sts") return mintAws(rule, env);
-  return mintGcp(rule, env);
+export async function mint(rule: ExchangeRule, env: NodeJS.ProcessEnv = process.env, fetchFn: typeof fetch = fetch, access: Access = "full"): Promise<Minted> {
+  if (rule.kind === "github_app") return mintGithub(rule, env, fetchFn, access);
+  if (rule.kind === "aws_sts") return mintAws(rule, env, access);
+  return mintGcp(rule, env, access);
 }
 
 /** `--secrets` spec for the minted values, so the broker binds them like any other credential. */

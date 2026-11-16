@@ -65,6 +65,10 @@ Remote servers (0.12): an entry with a URL and a credential header is rewritten 
 server and adds the header itself, from its own store. Tool rules, change
 detection on the tool list (`runtime.on_change`) and revocation by host apply.
 
+Per-tool scope (0.13): `scope: per_tool` on a `runtime.exchange` rule gives the server
+a read-only GitHub App, AWS STS or GCP token, and swaps in a write-capable one only
+while a tool call classed as a write is in flight.
+
 Limits, stated: remote servers that sign in with OAuth or a browser are not
 wrapped; the store is not isolation from other processes running as you; a client that
 ignores `HTTPS_PROXY` is not seen by the proxy; a client that pins certificates
@@ -244,6 +248,7 @@ judges intent: the rule is the match, and it is printed.
 ```
 vet-skills secrets migrate     # move credentials written in agent configs into the guard's store (asks once; --dry-run to look)
 vet-skills prove               # read-only: no MCP credential left in agent configs, agent environments or guard files
+vet-skills inventory --credentials   # by credential: for each name, every server that is handed it
 vet-skills inventory           # per agent: servers (local and remote), guarded or not, verdicts, credential names, and the fix for each finding
 vet-skills discover            # every MCP server, skill, plugin and hook on this machine, with verdicts
 ```

@@ -26,8 +26,12 @@ export interface RelayOptions {
   approver?: (call: { server: string; tool: string; args: Record<string, unknown>; rule: ToolRule | null }) => Promise<{ allowed: boolean; by: string; id?: string }>;
   /** A per-tool hold decided by the caller (a remote server's new or rewritten tools awaiting approval). Returns the reason, or null. */
   held?: (tool: string) => string | null;
+  /** Called right before a call that passed every rule goes to the server (per-tool credentials are raised here). A returned string refuses the call with that reason. */
+  beforeCall?: (tool: string, id: number | string | undefined) => Promise<string | null>;
+  /** Called when the reply to a passed call arrives, or the relay stops with it pending. */
+  afterCall?: (tool: string, id: number | string) => void;
 }
-export interface RelayIO { toServer: (line: string) => void; toAgent: (line: string) => void; log: (l: string) => void; emit: (e: RelayEvent) => void; /** Called with every tools/list result, after inspection. */ onTools?: (tools: { name?: string; description?: string; inputSchema?: unknown }[]) => void }
+export interface RelayIO { toServer: (line: string) => void; toAgent: (line: string) => void; log: (l: string) => void; emit: (e: RelayEvent) => void; /** Called with every tools/list result, after inspection. */ onTools?: (tools: { name?: string; description?: string; inputSchema?: unknown; annotations?: { readOnlyHint?: boolean } }[]) => void }
 
 const RUNTIME = join(HOME, "runtime");
 export function record(label: string, tool: string, keys: string[], denied: boolean) {
@@ -47,6 +51,16 @@ export function createRelay(opts: RelayOptions, io: RelayIO) {
   let chain: Promise<void> = Promise.resolve();
   const refuse = (id: number | string | undefined, code: number, message: string) => { if (id !== undefined) io.toAgent(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })); };
 
+  // The last gate before the server: the caller may need to do something first (raise a credential) and may refuse.
+  const raise = async (name: string, id: number | string | undefined, keys: string[]): Promise<boolean> => {
+    if (!opts.beforeCall) return false;
+    const why = await opts.beforeCall(name, id).catch((e: Error) => e.message || "could not prepare the call");
+    if (!why) return false;
+    deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: why, id, rule: "exchange" });
+    log(`✕ tools/call ${name} not sent: ${why}`);
+    refuse(id, -32000, `vet-skills guard did not send tools/call ${name}: ${why}`);
+    return true;
+  };
   const handle = async (line: string) => {
     let m: { id?: number | string; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } } | null = null;
     try { m = JSON.parse(line); } catch { /* pass through */ }
@@ -101,12 +115,14 @@ export function createRelay(opts: RelayOptions, io: RelayIO) {
           refuse(m.id, -32601, `Tool "${name}" was not approved (${d.by}).`);
           return;
         }
+        const no = await raise(name, m.id, keys); if (no) return;
         record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "approved", by: d.by, id: m.id, rule: rule?.match ?? "default", approvalId: (d as { id?: string }).id });
         log(`tools/call ${name} approved by ${d.by}`);
         if (m.id !== undefined) pending.set(m.id, name);
         io.toServer(line);
         return;
       }
+      const no = await raise(name, m.id, keys); if (no) return;
       record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "allowed", id: m.id, rule: rule?.match ?? "default" });
       if (m.id !== undefined) pending.set(m.id, name);
     }
@@ -121,7 +137,7 @@ export function createRelay(opts: RelayOptions, io: RelayIO) {
     /** One line from the server, already (or about to be) relayed by the caller. */
     inspect(line: string) {
       if (line.length > 2_000_000 || !line.trim()) return;
-      let m: { id?: number | string; result?: { tools?: { name?: string; description?: string; inputSchema?: unknown }[]; content?: unknown } } | null = null;
+      let m: { id?: number | string; result?: { tools?: { name?: string; description?: string; inputSchema?: unknown; annotations?: { readOnlyHint?: boolean } }[]; content?: unknown } } | null = null;
       try { m = JSON.parse(line); } catch { return; }
       if (!m?.result) return;
       if (Array.isArray(m.result.tools)) {
@@ -133,6 +149,7 @@ export function createRelay(opts: RelayOptions, io: RelayIO) {
         try { io.onTools?.(m.result.tools); } catch { /* never break the relay */ }
       } else if (m.id !== undefined && pending.has(m.id)) {
         const tool = pending.get(m.id)!; pending.delete(m.id);
+        try { opts.afterCall?.(tool, m.id); } catch { /* never break the relay */ }
         emit({ kind: "tool_reply", tool, id: m.id });
         const leak = canariesIn(line, canaryReg);
         if (leak.length && !warned.has(`canary|${tool}`)) { warned.add(`canary|${tool}`); record(opts.label, tool, [], false); emit({ kind: "canary", where: "result", tool }); log(`✕ ${describeCanary(leak[0])} value in the result of ${tool}: the server read a decoy credential file on this machine. Treat ${opts.label} as hostile.`); }
@@ -146,7 +163,7 @@ export function createRelay(opts: RelayOptions, io: RelayIO) {
       if (stopped) return 0;
       stopped = reason;
       const n = pending.size;
-      for (const id of pending.keys()) refuse(id, -32000, `Server stopped by the guard: ${reason}`);
+      for (const [id, tool] of pending) { refuse(id, -32000, `Server stopped by the guard: ${reason}`); try { opts.afterCall?.(tool, id); } catch { /* stopping anyway */ } }
       pending.clear();
       emit({ kind: "stopped", reason, pending: n });
       log(`✕ stopping ${opts.label}: ${reason}${n ? ` · ${n} pending call${n === 1 ? "" : "s"} answered with the reason` : ""}`);

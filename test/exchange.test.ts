@@ -37,3 +37,24 @@ test("exchange: aws_sts without the CLI fails with a reason, never a crash", asy
   await assert.rejects(mint({ var: "AWS_ACCESS_KEY_ID", kind: "aws_sts", roleArn: "arn:aws:iam::1:role/x" }, { PATH: "/nonexistent" }), /aws sts assume-role failed/);
   await assert.rejects(mint({ var: "AWS_ACCESS_KEY_ID", kind: "aws_sts" }, {}), /needs role_arn/);
 });
+
+test("per_tool: the read variant of a GitHub App token lowers every permission to read, asking GitHub what the installation has when the policy names none", async () => {
+  const bodies: Record<string, unknown>[] = []; const deleted: string[] = [];
+  const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).endsWith("/access_tokens")) { const b = JSON.parse(String(init?.body ?? "{}")); bodies.push(b); const n = bodies.length; return new Response(JSON.stringify({ token: `ghs_${n}`, expires_at: new Date(Date.now() + 3600_000).toISOString(), permissions: b.permissions ?? { contents: "write", issues: "write", metadata: "read" } }), { status: 201 }); }
+    deleted.push(String((init?.headers as Record<string, string>).authorization)); return new Response("", { status: 204 });
+  }) as typeof fetch;
+  const env = { VET_GITHUB_APP_KEY: pem } as NodeJS.ProcessEnv;
+  const named = await mint({ var: "GITHUB_TOKEN", kind: "github_app", appId: "1", installationId: "2", permissions: { contents: "write", pull_requests: "write" } }, env, fakeFetch, "read");
+  assert.deepEqual(bodies[0].permissions, { contents: "read", pull_requests: "read" });
+  assert.equal(named.access, "read");
+  bodies.length = 0;
+  const probed = await mint({ var: "GITHUB_TOKEN", kind: "github_app", appId: "1", installationId: "2" }, env, fakeFetch, "read");
+  assert.equal(bodies.length, 2, "one token to learn the permissions, one read-only");
+  assert.deepEqual(bodies[1].permissions, { contents: "read", issues: "read", metadata: "read" });
+  assert.deepEqual(deleted, ["token ghs_1"], "the probe token is revoked at once");
+  assert.equal(probed.values.GITHUB_TOKEN, "ghs_2");
+  bodies.length = 0;
+  await mint({ var: "GITHUB_TOKEN", kind: "github_app", appId: "1", installationId: "2", readPermissions: { issues: "read" } }, env, fakeFetch, "read");
+  assert.deepEqual(bodies[0].permissions, { issues: "read" }, "the policy's own read_permissions win");
+});
