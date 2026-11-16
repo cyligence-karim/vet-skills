@@ -98,10 +98,10 @@ export async function buildInventory(opts: { home?: string; project?: string; co
     const fixes: string[] = [];
     if (verdict?.label === "blocked") fixes.push(`blocked verdict: remove it from ${x.path}; \`vet-skills check ${x.package!.name}\` shows why`);
     if (!remote && !x.guarded) fixes.push(GUARDABLE.has(x.agent) ? "not guarded: run `vet-skills guard install`" : `not guarded: the guard does not wrap ${AGENT_LABEL[x.agent] ?? x.agent} configs yet`);
-    if (remote) fixes.push("remote server: the guard wraps local stdio servers only, so this one runs outside it");
+    if (remote && !x.guarded) fixes.push(names.length ? "remote server outside the guard: run `vet-skills guard install` to bridge it and move its credential header into the guard's store" : "remote server outside the guard: it signs in by itself (OAuth) or takes no credential, which the guard does not wrap");
     if (x.package && !verdict) fixes.push(version ? `no verdict for ${version}: run \`vet-skills try ${spec(x.package, version)}\`` : `no verdict: run \`vet-skills try ${x.package.name}\``);
     if (!x.package && !remote) fixes.push("local command: there is no registry package to look up a verdict for");
-    if (plaintext.length) fixes.push(`credential value written in ${x.path} (${plaintext.join(", ")}): rotate it, then reference an environment variable`);
+    if (plaintext.length) fixes.push(`credential value written in ${x.path} (${plaintext.join(", ")}): run \`vet-skills secrets migrate\``);
     agentOf(x.agent).servers.push({
       name: x.name, file: x.path, scope: x.scope, transport: remote ? (x.remoteKind ?? "http") : "stdio",
       target: x.package ? spec(x.package, x.package.version ?? null) : x.urlHost ?? x.command ?? "",
@@ -152,7 +152,7 @@ export function renderInventory(inv: Inventory): string {
   for (const a of inv.agents) {
     out.push("", `${c.bold(a.label)}${a.version ? c.muted(` ${a.version}`) : ""}  ${c.muted(`${plural(a.servers.length, "MCP server")}${a.skills.length ? `, ${plural(a.skills.length, "skill")}` : ""}`)}`);
     for (const s of a.servers) {
-      const guard = s.transport !== "stdio" ? c.caution(pad("remote", 12)) : s.guarded ? c.verified(pad("guarded", 12)) : c.caution(pad("not guarded", 12));
+      const guard = s.guarded ? c.verified(pad("guarded", 12)) : s.transport !== "stdio" ? c.caution(pad("remote", 12)) : c.caution(pad("not guarded", 12));
       const ver = s.version ? `${s.version}${s.versionSource === "last run" ? " (last run)" : ""}` : s.package ? "unpinned" : "";
       out.push(`  ${pad(s.name, 22)} ${pad(s.transport, 6)} ${guard} ${tone(s.verdict)(pad(verdictCell(s.verdict, !!s.package), 18))} ${c.ink2(s.package ? s.package.name : s.target)}${ver ? c.muted(` ${ver}`) : ""}`);
       if (s.credentials.length) out.push(c.muted(`  ${" ".repeat(22)} passes: ${s.credentials.slice(0, 6).join(", ")}${s.credentials.length > 6 ? ` +${s.credentials.length - 6}` : ""}`));
@@ -178,10 +178,10 @@ export function nextStep(inv: Inventory): string {
   const lure = inv.other_findings.find((o) => o.kind === "installer lure");
   if (lure) return `remove ${lure.file}; it matches a malware delivery pattern.`;
   if (t.blocked) return "remove the server with a blocked verdict (marked above).";
-  if (t.plaintext) return "rotate the credential written in a config file, then reference an environment variable.";
+  if (t.plaintext) return "run `vet-skills secrets migrate` to move the credentials written in config files into the guard's store (and rotate any that were shared or committed).";
   if (t.not_guarded) return `run \`vet-skills guard install\` to put ${plural(t.not_guarded, "local server")} under the guard. It starts by recording; nothing is blocked until a policy says so.`;
   if (t.no_verdict) return "run `vet-skills try <package>` for the servers with no verdict.";
-  if (t.remote) return "review the remote servers: they run outside the guard.";
+  if (inv.agents.some((a) => a.servers.some((s) => s.transport !== "stdio" && !s.guarded))) return "review the remote servers that are not under the guard: `vet-skills guard install` bridges the ones with a credential header.";
   return "nothing to fix. Run `vet-skills guard status` to see what the guarded servers reached this week.";
 }
 

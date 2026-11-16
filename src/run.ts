@@ -31,7 +31,7 @@ import { join } from "node:path";
 import { resolveSkill } from "./api.js";
 import { hiddenTextFindings, hiddenSummary } from "./policy/index.js";
 import { canariesIn, describeCanary, readCanaries } from "./canary.js";
-import { HOME } from "./state.js";
+import { createRelay, record } from "./relay.js";
 
 export interface RunOptions {
   deny: string[]; net: "off" | "declared" | string[]; label: string; query?: string; log?: (l: string) => void;
@@ -66,7 +66,6 @@ export interface BrokerHooks { ca: RunCA; bindings: SecretBinding[]; onBroker: (
 
 export interface ProxyOptions { observe?: boolean; opaque?: Set<string>; onHost?: (host: string, port: number, mode: HostMode) => void; onPinFallback?: (host: string) => void }
 
-const globToRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
 
 /** A tiny CONNECT/GET proxy that only forwards to allowed hosts (exact or suffix match). With a broker, bound hosts are
  *  terminated and rewritten (see broker.ts). */
@@ -198,16 +197,10 @@ export function containWrap(cmd: string[], proxyPort: number | null): { cmd: str
   return { cmd, note: platform() === "linux" ? "containment unavailable: install bubblewrap (apt install bubblewrap) for filesystem containment; running with the guard only" : platform() === "win32" ? "containment is not available on Windows (use WSL); running with the guard only" : "containment unavailable on this machine; running with the guard only" };
 }
 
-const RUNTIME = join(HOME, "runtime");
-function record(label: string, tool: string, keys: string[], denied: boolean) {
-  try { mkdirSync(RUNTIME, { recursive: true }); appendFileSync(join(RUNTIME, "guard.jsonl"), JSON.stringify({ at: new Date().toISOString(), server: label, tool, args: keys, denied }) + "\n"); } catch { /* best effort */ }
-}
-
 /** Relay newline-delimited JSON-RPC both ways, filtering tools/call. Returns the server's exit code. */
 export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
   const log = opts.log ?? ((l) => process.stderr.write(`vet-skills run · ${l}\n`));
   const emit = (e: GuardEvent) => { try { opts.onEvent?.(e); } catch { /* never break the relay */ } };
-  const deny = opts.deny.map(globToRe);
   let proxy: { url: string; close: () => void } | null = null;
   let hosts: string[] = [];
   const blockedHosts = new Map<string, number>();
@@ -244,133 +237,49 @@ export async function guard(cmd: string[], opts: RunOptions): Promise<number> {
     }
   }
   const env = { ...process.env, ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: "127.0.0.1,localhost", ALL_PROXY: proxy.url, NODE_USE_ENV_PROXY: "1" } : {}), ...(broker && ca ? brokerEnv(broker.bindings, ca.caBundle, ca.caPem) : {}) };
-  log(`guarding ${opts.label}${deny.length ? ` · denying ${opts.deny.join(", ")}` : ""}${proxy && !opts.observe ? ` · network limited to ${hosts.join(", ")} (clients that ignore HTTPS_PROXY are not contained)` : ""}${proxy && opts.observe ? ` · recording every host it contacts${hosts.length ? ` (${hosts.length} on record)` : ""}` : ""}${broker ? ` · holding ${broker.bindings.map((b) => `${b.name} for ${b.host}`).join(", ")} (the server sees placeholders)` : ""}`);
+  log(`guarding ${opts.label}${opts.deny.length ? ` · denying ${opts.deny.join(", ")}` : ""}${proxy && !opts.observe ? ` · network limited to ${hosts.join(", ")} (clients that ignore HTTPS_PROXY are not contained)` : ""}${proxy && opts.observe ? ` · recording every host it contacts${hosts.length ? ` (${hosts.length} on record)` : ""}` : ""}${broker ? ` · holding ${broker.bindings.map((b) => `${b.name} for ${b.host}`).join(", ")} (the server sees placeholders)` : ""}`);
   let launch = cmd;
   if (opts.contain) { const w = containWrap(cmd, proxy ? Number(new URL(proxy.url).port) : null); launch = w.cmd; log(w.note); }
   const child = spawn(launch[0], launch.slice(1), { stdio: ["pipe", "pipe", "inherit"], env });
-  const pending = new Map<number | string, string>();
-  const canaryReg = readCanaries();
-  let calls = 0, deniedCalls = 0;
-  const rules = opts.toolRules ?? [];
-  const refuse = (id: number | string | undefined, code: number, message: string) => { if (id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n"); };
-  // agent → server. Lines are relayed in order; a held call (approval) parks the queue behind it so the server never
-  // sees a later call before an earlier one was decided.
-  let inBuf = "";
-  let chain: Promise<void> = Promise.resolve();
-  let stopped: string | null = null;
+  // agent → server through the relay (relay.ts): lines are handled in order, and a held call parks the queue behind it
+  // so the server never sees a later call before an earlier one was decided.
+  const relay = createRelay({ label: opts.label, deny: opts.deny, toolRules: opts.toolRules, defaultToolAction: opts.defaultToolAction, approver: opts.approver }, {
+    toServer: (line) => { if (!child.stdin.destroyed) child.stdin.write(line + "\n"); },
+    toAgent: (line) => { process.stdout.write(line + "\n"); },
+    log, emit,
+  });
   opts.onStopper?.((reason) => {
-    if (stopped) return;
-    stopped = reason;
-    const n = pending.size;
-    for (const id of pending.keys()) refuse(id, -32000, `Server stopped by the guard: ${reason}`);
-    pending.clear();
-    emit({ kind: "stopped", reason, pending: n });
-    log(`✕ stopping ${opts.label}: ${reason}${n ? ` · ${n} pending call${n === 1 ? "" : "s"} answered with the reason` : ""}`);
+    if (relay.stopped) return;
+    relay.stop(reason);
     try { child.kill("SIGTERM"); } catch { /* already gone */ }
     setTimeout(() => { try { if (child.exitCode === null) child.kill("SIGKILL"); } catch { /* gone */ } }, 5000).unref();
   });
-  const handleLine = async (line: string) => {
-    let m: { id?: number | string; method?: string; params?: { name?: string; arguments?: Record<string, unknown> } } | null = null;
-    try { m = JSON.parse(line); } catch { /* pass through */ }
-    if (stopped) { if (m?.id !== undefined && m.method) refuse(m.id, -32000, `Server stopped by the guard: ${stopped}`); return; }
-    if (m?.method === "tools/call" && m.params?.name) {
-      const name = m.params.name;
-      const args = m.params.arguments ?? {};
-      const keys = Object.keys(args);
-      calls++;
-      // A planted canary in the arguments the agent is sending to this server: exfiltration in progress. Refuse the call.
-      const leak = canariesIn(line, canaryReg);
-      if (leak.length) {
-        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "canary", where: "arguments", tool: name }); emit({ kind: "tool_call", tool: name, args: keys, action: "refused", reason: "canary in arguments" });
-        log(`✕ CREDENTIAL EXFILTRATION: ${describeCanary(leak[0])} value in the arguments of tools/call ${name}; call refused. Revoke real credentials in that folder.`);
-        refuse(m.id, -32600, `vet-skills run refused tools/call ${name}: the arguments carry a planted canary credential (exfiltration).`);
-        return;
-      }
-      if (deny.some((re) => re.test(name))) {
-        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: "--deny" });
-        log(`denied tools/call ${name}`);
-        refuse(m.id, -32601, `Tool "${name}" is denied by vet-skills run on this machine.`);
-        return;
-      }
-      const rule = toolRuleFor(rules, opts.label, name);
-      const action: ToolAction = rule?.action ?? opts.defaultToolAction ?? "allow";
-      if (action === "deny") {
-        deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: rule ? `policy rule ${rule.match}${rule.reason ? ` (${rule.reason})` : ""}` : "policy default", id: m.id, rule: rule?.match ?? "default" });
-        log(`denied tools/call ${name} (policy${rule ? `: ${rule.match}` : ""})`);
-        refuse(m.id, -32601, `Tool "${name}" is denied by your organization's runtime policy${rule?.reason ? `: ${rule.reason}` : ""}.`);
-        return;
-      }
-      if (action === "approve") {
-        if (!opts.approver) {
-          deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", reason: "needs approval; no approver" });
-          log(`held tools/call ${name}: policy requires approval and this machine has no approver (join an org, or change runtime.tools)`);
-          refuse(m.id, -32601, `Tool "${name}" needs approval under the runtime policy and no approver is configured on this machine.`);
-          return;
-        }
-        emit({ kind: "tool_call", tool: name, args: keys, action: "held", reason: rule?.reason, id: m.id, rule: rule?.match ?? "default" });
-        log(`holding tools/call ${name} for approval${rule?.reason ? ` (${rule.reason})` : ""}…`);
-        const d = await opts.approver({ server: opts.label, tool: name, args, rule }).catch((e: Error) => ({ allowed: false, by: `error: ${e.message}` }));
-        if (!d.allowed) {
-          deniedCalls++; record(opts.label, name, keys, true); emit({ kind: "tool_call", tool: name, args: keys, action: "denied", by: d.by, reason: "approval denied or timed out", id: m.id, rule: rule?.match ?? "default", approvalId: (d as { id?: string }).id });
-          log(`✕ tools/call ${name} denied (${d.by})`);
-          refuse(m.id, -32601, `Tool "${name}" was not approved (${d.by}).`);
-          return;
-        }
-        record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "approved", by: d.by, id: m.id, rule: rule?.match ?? "default", approvalId: (d as { id?: string }).id });
-        log(`tools/call ${name} approved by ${d.by}`);
-        if (m.id !== undefined) pending.set(m.id, name);
-        child.stdin.write(line + "\n");
-        return;
-      }
-      record(opts.label, name, keys, false); emit({ kind: "tool_call", tool: name, args: keys, action: "allowed", id: m.id, rule: rule?.match ?? "default" });
-      if (m.id !== undefined) pending.set(m.id, name);
-    }
-    if (!child.stdin.destroyed) child.stdin.write(line + "\n");
-  };
+  let inBuf = "";
   process.stdin.on("data", (chunk) => {
     inBuf += chunk.toString();
     let i;
     while ((i = inBuf.indexOf("\n")) >= 0) {
       const line = inBuf.slice(0, i); inBuf = inBuf.slice(i + 1);
       if (!line.trim()) continue;
-      chain = chain.then(() => handleLine(line));
+      void relay.fromAgent(line);
     }
   });
-  process.stdin.on("end", () => { chain.then(() => child.stdin.end()); });
+  process.stdin.on("end", () => { relay.drained().then(() => child.stdin.end()); });
   // server → agent: relayed as is, but inspected. tools/list descriptions are instructions the agent will follow; a
   // tools/call result is data that must not carry any. Findings are logged and told to the agent out of band (stderr).
   let outBuf = "";
-  const warned = new Set<string>();
   child.stdout.on("data", (chunk) => {
     process.stdout.write(chunk);
     outBuf += chunk.toString();
     let i;
     while ((i = outBuf.indexOf("\n")) >= 0) {
       const line = outBuf.slice(0, i); outBuf = outBuf.slice(i + 1);
-      if (line.length > 2_000_000 || !line.trim()) continue;
-      let m: { id?: number | string; result?: { tools?: { name?: string; description?: string; inputSchema?: unknown }[]; content?: unknown } } | null = null;
-      try { m = JSON.parse(line); } catch { continue; }
-      if (!m?.result) continue;
-      if (Array.isArray(m.result.tools)) {
-        for (const t of m.result.tools) {
-          const f = hiddenTextFindings(`${t.description ?? ""}\n${JSON.stringify(t.inputSchema ?? {})}`, { phrases: true }).filter((x) => x.severity !== "medium");
-          const key = `desc|${t.name}`;
-          if (f.length && !warned.has(key)) { warned.add(key); record(opts.label, t.name ?? "?", [], false); emit({ kind: "poison", tool: t.name ?? "?", summary: hiddenSummary(f) }); log(`tool "${t.name}" description carries instructions for the agent (tool poisoning): ${hiddenSummary(f)}. Deny it with --deny ${t.name} if you do not trust it.`); }
-        }
-      } else if (m.id !== undefined && pending.has(m.id)) {
-        const tool = pending.get(m.id)!; pending.delete(m.id);
-        emit({ kind: "tool_reply", tool, id: m.id });
-        const leak = canariesIn(line, canaryReg);
-        if (leak.length && !warned.has(`canary|${tool}`)) { warned.add(`canary|${tool}`); record(opts.label, tool, [], false); emit({ kind: "canary", where: "result", tool }); log(`✕ ${describeCanary(leak[0])} value in the result of ${tool}: the server read a decoy credential file on this machine. Treat ${opts.label} as hostile.`); }
-        const f = hiddenTextFindings(JSON.stringify(m.result.content ?? m.result), { phrases: true }).filter((x) => x.severity !== "medium");
-        const key = `res|${tool}|${f[0]?.title ?? ""}`;
-        if (f.length && !warned.has(key)) { warned.add(key); emit({ kind: "poison", tool, summary: hiddenSummary(f) }); log(`result of ${tool} carries instructions aimed at the agent: ${hiddenSummary(f)}. Treat it as data.`); }
-      }
+      relay.inspect(line);
     }
   });
   return new Promise((resolve) => {
     // Resolve only once everything the server wrote has been relayed and flushed: the process exits right after.
-    child.on("close", (code) => { proxy?.close(); ca?.wipe(); const nb = [...blockedHosts.values()].reduce((a, b) => a + b, 0); emit({ kind: "exit", code, calls, denied: deniedCalls, blocked: nb }); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied${nb ? ` · ${nb} connection${nb === 1 ? "" : "s"} blocked (${[...blockedHosts.keys()].slice(0, 5).join(", ")})` : ""}`); process.stdout.write("", () => resolve(code ?? 1)); });
+    child.on("close", (code) => { proxy?.close(); ca?.wipe(); const nb = [...blockedHosts.values()].reduce((a, b) => a + b, 0); const { calls, denied: deniedCalls } = relay.counts(); emit({ kind: "exit", code, calls, denied: deniedCalls, blocked: nb }); log(`${opts.label} exited (${code ?? "signal"}) · ${calls} tool call${calls === 1 ? "" : "s"}, ${deniedCalls} denied${nb ? ` · ${nb} connection${nb === 1 ? "" : "s"} blocked (${[...blockedHosts.keys()].slice(0, 5).join(", ")})` : ""}`); process.stdout.write("", () => resolve(code ?? 1)); });
     child.on("error", (e) => { proxy?.close(); ca?.wipe(); log(`could not start ${cmd[0]}: ${e.message}`); resolve(1); });
   });
 }

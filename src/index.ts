@@ -16,7 +16,9 @@
  *   vet-skills block <skill> [--reason]   add to the personal block list
  *   vet-skills status                     org, policy version, last report, cache size
  *   vet-skills inventory [--project] [--json] per agent: MCP servers (local and remote), guarded or not, verdicts, credential names, skills, and the fix for each finding
- *   vet-skills inventory [--project] [--json] what your agents can reach: servers, guarded or not, verdicts, credential names
+ *   vet-skills secrets migrate [--dry-run] [--yes]   move credentials written in agent configs into the guard's store; list | set <key> | rm <key>
+  vet-skills prove [--json]                 check that no MCP credential sits in an agent config, a running agent's environment or the guard's files
+  vet-skills inventory [--project] [--json] what your agents can reach: servers, guarded or not, verdicts, credential names
   vet-skills discover [--project] [--json] every MCP server, skill, plugin and hook configured on this machine
  *   vet-skills mcp                        run as an MCP server so agents can check skills themselves
   vet-skills telemetry on|off|status    anonymous usage + field signals (off for enrolled machines; VET_SKILLS_TELEMETRY=0 also works)
@@ -64,18 +66,21 @@ import { guardPosture } from "./sync.js";
 import { funnelGuardInstall } from "./api.js";
 import { homedir } from "node:os";
 import { c } from "./render.js";
+import { approveRemote, execRemote } from "./remote.js";
+import { SecretStore } from "./store.js";
+import { proveCmd, secretsCmd } from "./secrets.js";
 import { approvalsCmd, diffCmd, reviewCmd, threatsCmd } from "./org.js";
 
 // `run` and `guard exec` own everything after them (their own flags, then `--` and the server command); the shared parser never sees them.
 const RUN_AT = process.argv.indexOf("run", 2);
-const GUARD_EXEC = process.argv[2] === "guard" && process.argv[3] === "exec";
+const GUARD_EXEC = process.argv[2] === "guard" && (process.argv[3] === "exec" || process.argv[3] === "remote");
 /** review / approvals / threats take their own flags (--month, --from, --by …); they parse process.argv themselves. */
 const ORG_CMD = ["review", "approvals", "threats", "diff"].includes(process.argv[2] ?? "");
 const { values, positionals } = parseArgs({
-  args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", "exec"] : ORG_CMD ? [process.argv[2]] : process.argv.slice(2),
+  args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", process.argv[3]] : ORG_CMD ? [process.argv[2]] : process.argv.slice(2),
   allowPositionals: true,
   options: {
-    token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
+    "dry-run": { type: "boolean" }, token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
     json: { type: "boolean" }, ci: { type: "boolean" }, email: { type: "string" }, help: { type: "boolean", short: "h" }, project: { type: "boolean" }, quiet: { type: "boolean", short: "q" }, version: { type: "boolean", short: "v" }, agent: { type: "string" }, publisher: { type: "string" }, registry: { type: "string" },
   },
 });
@@ -199,9 +204,11 @@ async function main(): Promise<number> {
         if ("error" in a) { console.error(a.error); return 2; }
         return execGuarded(a);
       }
+      if (sub === "remote") return execRemote(process.argv.slice(4));
       if (sub === "approve") {
-        if (!rest[1]) { console.error("usage: vet-skills guard approve <package>"); return 2; }
-        const r = approvePinned(rest[1]); console.log(r.ok ? `${c.verified("✓")} ${r.message}` : `${c.blocked("✕")} ${r.message}`); return r.ok ? 0 : 1;
+        if (!rest[1]) { console.error("usage: vet-skills guard approve <package or remote server name>"); return 2; }
+        const remote = approveRemote(rest[1]);
+        const r = remote.ok ? remote : approvePinned(rest[1]); console.log(r.ok ? `${c.verified("✓")} ${r.message}` : `${c.blocked("✕")} ${r.message}`); return r.ok ? 0 : 1;
       }
       const project = values.project ? process.cwd() : null;
       if (sub === "install" || sub === undefined) {
@@ -210,10 +217,11 @@ async function main(): Promise<number> {
         if (total && telemetryEnabled() && !existsSync(join(HOME, "guard", "activated"))) { try { mkdirSync(join(HOME, "guard"), { recursive: true }); writeFileSync(join(HOME, "guard", "activated"), new Date().toISOString()); } catch { /* ignore */ } await funnelGuardInstall({ servers: total, clients: [...new Set(touched.filter((t) => t.wrapped.length).map((t) => t.client))], version: VERSION, os: process.platform }).catch(() => null); }
         for (const t of touched) {
           if (t.wrapped.length) console.log(`${c.verified("✓")} ${t.client}: ${t.wrapped.join(", ")} now run under the guard (${t.file})`);
+          if (t.remote?.length) console.log(c.muted(`  remote: ${t.remote.join(", ")} now connect through the guard${t.moved?.length ? `; ${t.moved.length} credential header${t.moved.length === 1 ? "" : "s"} moved from the config into the guard's store (${new SecretStore().preferred()})` : ""}`));
           for (const sk of t.skipped) console.log(c.muted(`  ${t.client}: ${sk.name} skipped — ${sk.why}`));
         }
         if (!touched.length) console.log("No MCP configs found for Claude Code, Claude Desktop, Cursor, Windsurf, Gemini CLI or Codex" + (project ? "" : " (add --project to include this folder's .mcp.json, .cursor/mcp.json, .vscode/mcp.json)") + ".");
-        else if (!total) console.log(c.muted("Every stdio server found was already under the guard."));
+        else if (!total) console.log(c.muted("Every server the guard can wrap was already under the guard."));
         else console.log(`\nRestart the agents to pick the change up. Each server now starts as \`vet-skills guard exec\`: credentials it needs become placeholders, every host it contacts is recorded, and a version with a blocked verdict or a confirmed incident does not launch. \`vet-skills guard status\` shows what happened; \`vet-skills guard uninstall\` puts the original commands back.`);
         return 0;
       }
@@ -505,6 +513,8 @@ async function main(): Promise<number> {
       return 0;
     }
 
+    case "secrets": return secretsCmd(rest, { yes: !!values.yes, json: !!values.json, project: !!values.project, dryRun: process.argv.includes("--dry-run") });
+    case "prove": return proveCmd({ json: !!values.json, project: !!values.project });
     case "inventory": {
       // Read-only: lists what is configured and what to do about it. Nothing is written to any config.
       const comps = discoverLocal({ project: values.project ? process.cwd() : undefined });

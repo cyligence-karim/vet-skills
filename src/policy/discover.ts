@@ -115,17 +115,22 @@ const str = (v: unknown) => (typeof v === "string" ? v : null);
 const keysOf = (v: unknown) => (isObj(v) ? Object.keys(v).filter((k) => /^[\w.-]{1,120}$/.test(k)).slice(0, 50) : []);
 
 const SECRET_NAME = /(TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|AUTH)/i;
-/** Credential-like names whose value is a literal in the file (not ${VAR}, $VAR, env:VAR or an <angle-bracket> placeholder). The value itself is never returned. */
+const SECRET_VALUE = /^(Bearer\s+)?(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|sk-[\w-]{20,}|xox[abpsr]-[\w-]{10,}|AKIA[0-9A-Z]{16}|glpat-[\w-]{16,}|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{5,})/;
+/** Is this env or header value a credential written out in the file? True for a literal under a credential-like name,
+ *  or a value with a well-known token shape under any name. False for ${VAR}, $VAR, env:VAR, an <angle-bracket> or
+ *  obvious dummy placeholder, and a vs-store:// reference to the guard's store. */
+export function isLiteralCredential(name: string, value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const val = value.replace(/^(Bearer|Basic|token)\s+/i, "").trim();
+  if (val.length < 8 || /\$\{|^\$[A-Za-z_][A-Za-z0-9_]*$|^env:|^vs-store:\/\/|^<.*>$|^(your|xxx|changeme|placeholder)/i.test(val) || /^vs-store:\/\//.test(value)) return false;
+  return SECRET_NAME.test(name) || SECRET_VALUE.test(value.trim());
+}
+/** Names of the credentials written as literals in these env/header maps. The values are never returned. */
 function literalCredentialKeys(...maps: unknown[]): string[] {
   const out: string[] = [];
   for (const m of maps) {
     if (!isObj(m)) continue;
-    for (const [k, v] of Object.entries(m)) {
-      if (!/^[\w.-]{1,120}$/.test(k) || !SECRET_NAME.test(k) || typeof v !== "string") continue;
-      const val = v.replace(/^(Bearer|Basic|token)\s+/i, "").trim();
-      if (val.length < 8 || /\$\{|\$[A-Z_][A-Z0-9_]*|^env:|^<.*>$|^(your|xxx|changeme|placeholder)/i.test(val)) continue;
-      out.push(k);
-    }
+    for (const [k, v] of Object.entries(m)) if (/^[\w.-]{1,120}$/.test(k) && isLiteralCredential(k, v)) out.push(k);
   }
   return [...new Set(out)].slice(0, 20);
 }
@@ -146,6 +151,21 @@ export function unwrapGuardCommand(command: string, args: string[]): { command: 
   const i = args.indexOf("--", g);
   if (i < 0 || i === args.length - 1) return null;
   return { command: args[i + 1], args: args.slice(i + 2) };
+}
+
+/** A remote entry `vet-skills guard install` bridged (`vet-skills guard remote --url … --header NAME=…`): the URL and header names, or null. Header values are references or templates and are not returned. */
+export function unwrapGuardRemote(command: string, args: string[]): { url: string; sse: boolean; headerKeys: string[] } | null {
+  if (!/(^|[\\/])(vet-skills|npx)(\.cmd|\.exe)?$/.test(command)) return null;
+  const g = args.indexOf("guard");
+  if (g < 0 || args[g + 1] !== "remote") return null;
+  const rest = args.slice(g + 2); let url = ""; let sse = false; const headerKeys: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--sse") sse = true;
+    else if (rest[i] === "--url" && rest[i + 1]) url = rest[++i];
+    else if (rest[i] === "--header" && rest[i + 1]) { const n = rest[++i].split("=")[0]; if (/^[\w.-]{1,100}$/.test(n)) headerKeys.push(n); }
+    else if (rest[i].startsWith("--")) i++;
+  }
+  return url ? { url, sse, headerKeys } : null;
 }
 
 const EXACT = /^\d+\.\d+\.\d+[\w.+-]*$/;
@@ -194,6 +214,8 @@ function serverComponents(servers: unknown, path: string, scope: Component["scop
     else if (command) {
       // A command written as one string ("npx -y pkg") is split for package detection; only the binary is kept.
       let parts = args.length ? [command, ...args] : command.split(/\s+/);
+      const bridged = unwrapGuardRemote(parts[0], parts.slice(1));
+      if (bridged) { out.push({ kind: "mcp_server", name, path, scope, agent, transport: "http", remoteKind: bridged.sse ? "sse" : "http", urlHost: hostOf(bridged.url), envKeys, headerKeys: bridged.headerKeys, guarded: true }); continue; }
       // An entry the guard wraps is described by the command it wraps, and marked as guarded.
       const inner = unwrapGuardCommand(parts[0], parts.slice(1));
       if (inner) parts = [inner.command, ...inner.args];

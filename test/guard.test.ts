@@ -173,7 +173,7 @@ test("guard status names servers added after install; a dry run changes nothing"
   assert.deepEqual(dry.flatMap((t) => t.wrapped), ["b"]);
   assert.equal(JSON.parse(readFileSync(join(home, ".cursor", "mcp.json"), "utf8")).mcpServers.b.command, "uvx", "dry run did not write");
   const status = guardStatus({ home }).join("\n");
-  assert.match(status, /1 stdio server configured since then and NOT under the guard: b \(cursor\)/);
+  assert.match(status, /1 server configured since then and NOT under the guard: b \(cursor\)/);
   installGuard({ home });
   assert.ok(!/NOT under the guard/.test(guardStatus({ home }).join("\n")));
   delete process.env.VET_SKILLS_BIN;

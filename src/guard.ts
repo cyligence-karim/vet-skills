@@ -25,13 +25,14 @@ import { dirname, join } from "node:path";
 import { coverageMeets } from "./attest.js";
 import { approvalCreate, approvalPoll, behaviorDiff, guardReport, guardSighting, launchCheck, resolveSkill, type GuardSessionReport } from "./api.js";
 import { guard, parseRunArgs, type GuardEvent, type RunOptions } from "./run.js";
+import { SecretStore, isStoreRef, keyOfRef, refFor, resolveStoreRefs } from "./store.js";
 import { HOME, VERSION, clientId, readOrg, readPolicy, telemetryEnabled, type ResolveResponse } from "./state.js";
 import { mint, secretsSpecFor, type Minted } from "./exchange.js";
 import type { SecretBinding } from "./broker.js";
 import type { ToolRule } from "./policy/index.js";
 
 export type GuardClient = "claude-code" | "claude-desktop" | "cursor" | "windsurf" | "gemini" | "codex" | "grok" | "vscode" | "copilot" | "kiro" | "qwen" | "cline" | "zed" | "amp" | "opencode";
-interface ConfigSpec { path: string; client: GuardClient; format: "mcpServers" | "claude-json" | "vscode" | "codex-toml" | "amp" | "zed" | "opencode"; scope: "user" | "project" }
+export interface ConfigSpec { path: string; client: GuardClient; format: "mcpServers" | "claude-json" | "vscode" | "codex-toml" | "amp" | "zed" | "opencode"; scope: "user" | "project" }
 
 const GUARD_DIR = join(HOME, "guard");
 const WRAPPED = join(GUARD_DIR, "wrapped.json");
@@ -94,9 +95,9 @@ export function configSpecs(opts: { home?: string; project?: string | null } = {
   return [...user, ...project].filter((s) => existsSync(s.path));
 }
 
-type Json = Record<string, unknown>;
-const isObj = (v: unknown): v is Json => !!v && typeof v === "object" && !Array.isArray(v);
-interface ServerEntry { command?: string | string[]; args?: string[]; env?: Record<string, string>; url?: string; type?: string; [k: string]: unknown }
+export type Json = Record<string, unknown>;
+export const isObj = (v: unknown): v is Json => !!v && typeof v === "object" && !Array.isArray(v);
+export interface ServerEntry { command?: string | string[]; args?: string[]; env?: Record<string, string>; url?: string; type?: string; [k: string]: unknown }
 
 /** The absolute `vet-skills` to put in configs: GUI clients start with a short PATH. Falls back to `npx -y vet-skills@<version>`. */
 export function guardBinary(): { command: string; prefix: string[] } {
@@ -110,7 +111,7 @@ export function guardBinary(): { command: string; prefix: string[] } {
 export const isWrapped = (e: ServerEntry) => Array.isArray(e.args) && e.args.includes("guard") && e.args.includes("exec") && /vet-skills|npx$/.test(String(e.command ?? ""));
 
 function wrapEntry(name: string, client: GuardClient, e: ServerEntry, bin = guardBinary()): ServerEntry | null {
-  if (!e.command || isWrapped(e) || e.url || (e.type && e.type !== "stdio" && e.type !== "local")) return null;
+  if (!e.command || isWrapped(e) || isWrappedRemote(e) || e.url || (e.type && e.type !== "stdio" && e.type !== "local")) return null;
   if (typeof e.command !== "string" && !Array.isArray(e.command)) return null; // older nested { path, args } shape
   if (Array.isArray(e.command)) {
     // OpenCode keeps the whole command line in one array.
@@ -120,6 +121,79 @@ function wrapEntry(name: string, client: GuardClient, e: ServerEntry, bin = guar
   return { ...e, command: bin.command, args: [...bin.prefix, "guard", "exec", "--server", name, "--client", client, "--", e.command, ...(e.args ?? [])] };
 }
 const isWrappedArray = (cmd: string[]) => cmd.includes("guard") && cmd.includes("exec") && /vet-skills|npx$/.test(cmd[0] ?? "");
+
+/* ---------------------------------------------------------------- remote */
+
+const URL_KEYS = ["url", "serverUrl", "httpUrl"] as const;
+/** Header names that carry a credential. Everything else (a workspace id, a content type) stays in the config as it is. */
+export const isCredentialHeader = (name: string) => /^(authorization|proxy-authorization|cookie)$|token|secret|api[-_]?key|[-_]key$|auth/i.test(name);
+const hasEnvRef = (v: string) => /\$\{[^}]+\}|\$[A-Z_][A-Z0-9_]*|^env:/.test(v);
+const remoteArgs = (cmd: string[]) => { const g = cmd.indexOf("guard"); return g >= 0 && cmd[g + 1] === "remote" && /vet-skills|npx$/.test(cmd[0] ?? "") ? cmd.slice(g + 2) : null; };
+export const isWrappedRemote = (e: ServerEntry) => !!remoteArgs(Array.isArray(e.command) ? (e.command as string[]) : [String(e.command ?? ""), ...(Array.isArray(e.args) ? e.args : [])]);
+
+export interface RemoteSpec { server: string; client: string; url: string; sse: boolean; urlKey: string; entryType: string | null; headers: { name: string; value: string }[] }
+/** Parse the arguments after `guard remote`. Header values are a `vs-store://` reference, a `${VAR}` template, or a non-credential literal. */
+export function parseRemoteArgs(argv: string[]): RemoteSpec | { error: string } {
+  const r: RemoteSpec = { server: "", client: "unknown", url: "", sse: false, urlKey: "url", entryType: null, headers: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]; const v = argv[i + 1];
+    if (a === "--sse") r.sse = true;
+    else if (a === "--server" && v) { r.server = v; i++; } else if (a === "--client" && v) { r.client = v; i++; } else if (a === "--url" && v) { r.url = v; i++; }
+    else if (a === "--url-key" && v) { r.urlKey = v; i++; } else if (a === "--entry-type" && v) { r.entryType = v; i++; }
+    else if (a === "--header" && v) { const eq = v.indexOf("="); if (eq < 1) return { error: `guard remote: --header wants NAME=VALUE, got ${v.slice(0, 20)}` }; r.headers.push({ name: v.slice(0, eq), value: v.slice(eq + 1) }); i++; }
+    else return { error: `guard remote: unknown option ${a}` };
+  }
+  try { const u = new URL(r.url); if (u.protocol !== "https:" && !(u.protocol === "http:" && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname))) return { error: "guard remote: the URL must be https (http is accepted for localhost only)" }; } catch { return { error: "usage: vet-skills guard remote --server <name> --client <agent> --url <https://…> [--sse] [--header NAME=VALUE]…" }; }
+  if (!r.server) r.server = new URL(r.url).hostname;
+  return r;
+}
+
+/** A remote (http/sse) entry rewritten to launch the guard's bridge. Credential header values move to the store; the
+ *  entry keeps names and `vs-store://` references only. Null with a reason when the entry is not one the guard wraps. */
+function wrapRemote(name: string, spec: ConfigSpec, e: ServerEntry, bin: ReturnType<typeof guardBinary>, store: SecretStore | null): { entry: ServerEntry; moved: { key: string; value: string }[] } | { why: string } {
+  const urlKey = URL_KEYS.find((k) => typeof e[k] === "string" && e[k]);
+  if (!urlKey) return { why: "no command" };
+  const url = String(e[urlKey]);
+  let u: URL; try { u = new URL(url); } catch { return { why: "remote server with a URL that does not parse" }; }
+  if (u.protocol !== "https:" && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname)) return { why: "remote server over plain http; not wrapped" };
+  if ([...u.searchParams.keys()].some((k) => /token|key|secret|auth/i.test(k)) || u.username || u.password) return { why: "remote server with a credential in its URL; move it to a header to put it under the guard" };
+  const headers = isObj(e.headers) ? Object.entries(e.headers).filter((kv): kv is [string, string] => typeof kv[1] === "string") : [];
+  const creds = headers.filter(([k, v]) => isCredentialHeader(k) && v.trim());
+  if (!creds.length) return { why: "remote server that signs in by itself (OAuth) or takes no credential: listed, not wrapped" };
+  const moved: { key: string; value: string }[] = [];
+  const flags: string[] = [];
+  for (const [k, v] of headers) {
+    if (!/^[\w.-]{1,100}$/.test(k)) return { why: `remote server with a header name the guard cannot carry (${k.slice(0, 20)})` };
+    if (isCredentialHeader(k) && !hasEnvRef(v) && !isStoreRef(v)) {
+      let key = `${spec.client}/${name}/${k}`;
+      if (store) {
+        const prev = store.get(key);
+        if (prev !== null && prev !== v) key = `${key}#${createHash("sha1").update(spec.path).digest("hex").slice(0, 6)}`;
+        const r = store.set(key, v);
+        if (!r.ok) return { why: `could not store ${k} (${r.error}); left as it was` };
+      }
+      moved.push({ key, value: v });
+      flags.push("--header", `${k}=${refFor(key)}`);
+    } else flags.push("--header", `${k}=${v}`);
+  }
+  const type = typeof e.type === "string" ? e.type : null;
+  const sse = type === "sse" || /\/sse\/?(\?|$)/.test(url);
+  const args = [...bin.prefix, "guard", "remote", "--server", name, "--client", spec.client, "--url", url, ...(sse ? ["--sse"] : []), ...(urlKey !== "url" ? ["--url-key", urlKey] : []), ...(type ? ["--entry-type", type] : []), ...flags];
+  const rest: ServerEntry = { ...e }; for (const k of URL_KEYS) delete rest[k]; delete rest.headers; delete rest.type;
+  if (spec.format === "opencode") return { entry: { ...rest, type: "local", command: [bin.command, ...args] }, moved };
+  return { entry: { ...rest, ...(spec.format === "vscode" ? { type: "stdio" } : {}), command: bin.command, args }, moved };
+}
+
+/** The original remote entry of a bridged one. Stored values go back into the headers they came from. */
+function unwrapRemote(e: ServerEntry, store: SecretStore): ServerEntry | null {
+  const cmd = Array.isArray(e.command) ? (e.command as string[]) : [String(e.command ?? ""), ...(Array.isArray(e.args) ? e.args : [])];
+  const rest0 = remoteArgs(cmd); if (!rest0) return null;
+  const p = parseRemoteArgs(rest0); if ("error" in p) return null;
+  const headers: Record<string, string> = {};
+  for (const h of p.headers) headers[h.name] = isStoreRef(h.value) ? (store.get(keyOfRef(h.value)) ?? h.value) : h.value;
+  const rest: ServerEntry = { ...e }; delete rest.command; delete rest.args; delete rest.type;
+  return { ...rest, ...(p.entryType ? { type: p.entryType } : {}), [p.urlKey]: p.url, ...(Object.keys(headers).length ? { headers } : {}) };
+}
 /** The original command of a wrapped entry, read back from its own args (so uninstall works even without wrapped.json). */
 export function unwrapEntry(e: ServerEntry): ServerEntry | null {
   if (Array.isArray(e.command)) { const cmd = e.command as string[]; if (!isWrappedArray(cmd)) return null; const i = cmd.indexOf("--"); if (i < 0 || i === cmd.length - 1) return null; return { ...e, command: cmd.slice(i + 1) }; }
@@ -129,16 +203,16 @@ export function unwrapEntry(e: ServerEntry): ServerEntry | null {
   return { ...e, command: orig[0], args: orig.slice(1) };
 }
 
-interface Touched { file: string; client: GuardClient; wrapped: string[]; skipped: { name: string; why: string }[] }
+interface Touched { file: string; client: GuardClient; wrapped: string[]; skipped: { name: string; why: string }[]; /** Of `wrapped`: the remote servers now bridged. */ remote?: string[]; /** Credential names moved into the store (names only). */ moved?: string[] }
 
-function readJsonc(text: string): unknown {
+export function readJsonc(text: string): unknown {
   try { return JSON.parse(text); } catch { /* fall through */ }
   const noComments = text.replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, (_m, s1: string | undefined) => s1 ?? "");
   try { return JSON.parse(noComments.replace(/,(\s*[}\]])/g, "$1")); } catch { return null; }
 }
 
 /** Every `mcpServers`-shaped map in a config, with a path label for wrapped.json. */
-function serverMaps(spec: ConfigSpec, root: Json): { label: string; map: Json }[] {
+export function serverMaps(spec: ConfigSpec, root: Json): { label: string; map: Json }[] {
   if (spec.format === "vscode") return isObj(root.servers) ? [{ label: "servers", map: root.servers }] : [];
   if (spec.format === "amp") return isObj(root["amp.mcpServers"]) ? [{ label: "amp.mcpServers", map: root["amp.mcpServers"] as Json }] : [];
   if (spec.format === "zed") return isObj(root.context_servers) ? [{ label: "context_servers", map: root.context_servers }] : [];
@@ -153,27 +227,38 @@ function serverMaps(spec: ConfigSpec, root: Json): { label: string; map: Json }[
   return out;
 }
 
-function rewriteJson(spec: ConfigSpec, mode: "wrap" | "unwrap", bin: ReturnType<typeof guardBinary>, dryRun = false): Touched | null {
+function rewriteJson(spec: ConfigSpec, mode: "wrap" | "unwrap", bin: ReturnType<typeof guardBinary>, dryRun = false, remote = true): Touched | null {
   const text = readFileSync(spec.path, "utf8");
   const root = readJsonc(text);
   if (!isObj(root)) return null;
-  const t: Touched = { file: spec.path, client: spec.client, wrapped: [], skipped: [] };
+  const t: Touched = { file: spec.path, client: spec.client, wrapped: [], skipped: [], remote: [], moved: [] };
   let changed = false;
+  const store = new SecretStore();
+  const redact: { key: string; value: string }[] = [];
   for (const { map } of serverMaps(spec, root)) {
     for (const [name, v] of Object.entries(map)) {
       if (!isObj(v)) continue;
       const e = v as ServerEntry;
       if (mode === "wrap") {
         const w = wrapEntry(name, spec.client, e, bin);
-        if (!w) { if (!isWrapped(e) && !(Array.isArray(e.command) && isWrappedArray(e.command as string[]))) t.skipped.push({ name, why: e.url || (e.type && e.type !== "stdio" && e.type !== "local") ? "remote server (http/sse); the guard wraps stdio servers" : isObj(e.command) ? "older nested command shape; edit it to command/args and re-run" : "no command" }); continue; }
+        if (!w) {
+          if (isWrapped(e) || isWrappedRemote(e) || (Array.isArray(e.command) && isWrappedArray(e.command as string[]))) continue;
+          if (isObj(e.command)) { t.skipped.push({ name, why: "older nested command shape; edit it to command/args and re-run" }); continue; }
+          // A remote server with a credential header is bridged: the guard holds the header value and speaks HTTP for the agent.
+          if (!remote) { t.skipped.push({ name, why: "remote server: bridged when `vet-skills guard install` is run on this machine" }); continue; }
+          const r = wrapRemote(name, spec, e, bin, dryRun ? null : store);
+          if ("why" in r) { t.skipped.push({ name, why: r.why }); continue; }
+          map[name] = r.entry; t.wrapped.push(name); t.remote!.push(name); t.moved!.push(...r.moved.map((m) => m.key)); redact.push(...r.moved); changed = true;
+          continue;
+        }
         map[name] = w; t.wrapped.push(name); changed = true;
       } else {
-        const u = unwrapEntry(e); if (!u) continue;
+        const u = unwrapEntry(e) ?? unwrapRemote(e, store); if (!u) continue;
         map[name] = u; t.wrapped.push(name); changed = true;
       }
     }
   }
-  if (changed && !dryRun) { backup(spec.path, text); writeFileSync(spec.path, JSON.stringify(root, null, 2) + "\n"); }
+  if (changed && !dryRun) { backup(spec.path, text, redact); writeFileSync(spec.path, JSON.stringify(root, null, 2) + "\n"); }
   return t;
 }
 
@@ -213,11 +298,16 @@ export function rewriteCodexToml(text: string, mode: "wrap" | "unwrap", bin: Ret
   return { text: lines.filter((_l, i) => !removed.includes(i)).join("\n"), wrapped };
 }
 
-function backup(path: string, text: string) {
+/** Keeps the previous config. Values that moved to the store are replaced by their reference, so a backup never holds one. */
+export function backup(path: string, text: string, moved: { key: string; value: string }[] = []) {
+  for (const m of moved) text = text.split(JSON.stringify(m.value).slice(1, -1)).join(refFor(m.key)).split(m.value).join(refFor(m.key));
   try { mkdirSync(join(GUARD_DIR, "backup"), { recursive: true, mode: 0o700 }); writeFileSync(join(GUARD_DIR, "backup", `${createHash("sha1").update(path).digest("hex").slice(0, 10)}-${Date.now()}.bak`), text); } catch { /* best effort */ }
 }
 
-export function installGuard(opts: { project?: string | null; home?: string; dryRun?: boolean } = {}): Touched[] {
+/** `remote: false` leaves remote entries alone (the org's automatic re-wrap uses it: bridging a remote server moves a
+ *  credential, which happens when a person or the enrollment script runs `guard install`). VET_SKILLS_GUARD_REMOTE=0 does the same. */
+export function installGuard(opts: { project?: string | null; home?: string; dryRun?: boolean; remote?: boolean } = {}): Touched[] {
+  const remote = opts.remote !== false && process.env.VET_SKILLS_GUARD_REMOTE !== "0";
   const bin = guardBinary();
   const out: Touched[] = [];
   for (const spec of configSpecs(opts)) {
@@ -227,7 +317,7 @@ export function installGuard(opts: { project?: string | null; home?: string; dry
         const r = rewriteCodexToml(text, "wrap", bin, spec.client);
         if (r.wrapped.length && !opts.dryRun) { backup(spec.path, text); writeFileSync(spec.path, r.text); }
         out.push({ file: spec.path, client: spec.client, wrapped: r.wrapped, skipped: [] });
-      } else { const t = rewriteJson(spec, "wrap", bin, opts.dryRun); if (t) out.push(t); }
+      } else { const t = rewriteJson(spec, "wrap", bin, opts.dryRun, remote); if (t) out.push(t); }
     } catch (e) { out.push({ file: spec.path, client: spec.client, wrapped: [], skipped: [{ name: "*", why: (e as Error).message }] }); }
   }
   if (opts.dryRun) return out;
@@ -269,7 +359,12 @@ export function wrappedServers(opts: { project?: string | null; home?: string } 
         continue;
       }
       const root = readJsonc(text); if (!isObj(root)) continue;
-      for (const { map } of serverMaps(spec, root)) for (const [name, v] of Object.entries(map)) { if (isObj(v) && isWrapped(v as ServerEntry)) { const u = unwrapEntry(v as ServerEntry); out.push({ file: spec.path, client: spec.client, name, command: [u?.command, ...(u?.args ?? [])].filter(Boolean).join(" ") }); } }
+      for (const { map } of serverMaps(spec, root)) for (const [name, v] of Object.entries(map)) {
+        if (!isObj(v)) continue;
+        const e = v as ServerEntry;
+        if (isWrappedRemote(e)) { const cmd = Array.isArray(e.command) ? (e.command as string[]) : [String(e.command ?? ""), ...(e.args ?? [])]; const p = parseRemoteArgs(remoteArgs(cmd)!); out.push({ file: spec.path, client: spec.client, name, command: "error" in p ? "(remote)" : `${p.url} (remote, ${p.headers.filter((h) => isStoreRef(h.value)).length} credential${p.headers.filter((h) => isStoreRef(h.value)).length === 1 ? "" : "s"} held)` }); }
+        else if (isWrapped(e) || (Array.isArray(e.command) && isWrappedArray(e.command as string[]))) { const u = unwrapEntry(e); const c = Array.isArray(u?.command) ? (u!.command as string[]) : [u?.command, ...(u?.args ?? [])]; out.push({ file: spec.path, client: spec.client, name, command: c.filter(Boolean).join(" ") }); }
+      }
     } catch { /* skip */ }
   }
   return out;
@@ -310,6 +405,36 @@ export function parseExecArgs(argv: string[]): ExecArgs | { error: string } {
   return { server: server || cmd[0], client, secrets, cmd };
 }
 
+/** Folds tool-call events into a session report: per-tool counts, and per-call decisions for the org's record. Deny and
+ *  held are always one row; allow is folded per (tool, minute) with a count unless the org asked for full capture.
+ *  Argument key names only. Replies are matched by JSON-RPC id. */
+export function decisionRecorder(report: GuardSessionReport) {
+  const toolStats = new Map<string, { tool: string; calls: number; denied: number; approved: number }>();
+  const decisions: NonNullable<GuardSessionReport["decisions"]> = [];
+  const byRpcId = new Map<string, number>();
+  const fullCapture = process.env.VET_SKILLS_FULL_DECISIONS === "1";
+  const record = (e: Extract<GuardEvent, { kind: "tool_call" | "tool_reply" }>) => {
+    if (e.kind === "tool_call") {
+        const t = toolStats.get(e.tool) ?? { tool: e.tool, calls: 0, denied: 0, approved: 0 }; t.calls++; if (e.action === "denied" || e.action === "refused") t.denied++; if (e.action === "approved") t.approved++; toolStats.set(e.tool, t); report.tools = [...toolStats.values()];
+        const now = new Date();
+        const outcome = e.action === "allowed" ? "allow" : e.action === "approved" ? "held" : e.action === "held" ? "held" : "deny";
+        if (e.action === "held") { /* the outcome row is written when the approval resolves (approved/denied event follows) */ }
+        else if (outcome === "allow" && !fullCapture) {
+          const minute = now.toISOString().slice(0, 16);
+          const idx = decisions.findIndex((d) => d.outcome === "allow" && d.tool === e.tool && d.at.slice(0, 16) === minute);
+          if (idx >= 0) { decisions[idx].count++; if (e.id !== undefined) byRpcId.set(String(e.id), idx); }
+          else { decisions.push({ tool: e.tool, outcome: "allow", rule: e.rule ?? "default", at: now.toISOString(), count: 1, reply_observed: null, approval_id: null, disposition: null, arg_keys: e.args.slice(0, 20) }); if (e.id !== undefined) byRpcId.set(String(e.id), decisions.length - 1); }
+        } else {
+          decisions.push({ tool: e.tool, outcome, rule: e.action === "refused" ? "canary" : e.reason === "--deny" ? "--deny" : (e.rule ?? "default"), at: now.toISOString(), count: 1, reply_observed: e.action === "approved" ? false : null, approval_id: e.approvalId ?? null, disposition: e.action === "approved" ? "approved" : e.action === "denied" && e.approvalId ? "denied" : null, arg_keys: e.args.slice(0, 20) });
+          if (e.id !== undefined && e.action !== "denied" && e.action !== "refused") byRpcId.set(String(e.id), decisions.length - 1);
+        }
+        report.decisions = decisions.slice(-2000);
+      }
+      else { const idx = byRpcId.get(String(e.id)); if (idx !== undefined && decisions[idx]) { decisions[idx].reply_observed = true; byRpcId.delete(String(e.id)); } }
+  };
+  return { toolStats, record };
+}
+
 /** Run one MCP server under the guard with the runtime policy applied. Called by the client; stdio is the MCP stream. */
 export async function execGuarded(a: ExecArgs): Promise<number> {
   const log = (l: string) => process.stderr.write(`vet-skills guard · ${l}\n`);
@@ -323,18 +448,18 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   const query = parsed.opts.query ?? a.server;
   const session = randomBytes(6).toString("hex");
   const started = new Date().toISOString();
+  // Credentials `secrets migrate` moved out of the config arrive as vs-store:// references; the values are read here,
+  // in the guard's process, and never written back anywhere.
+  const fromStore = resolveStoreRefs(process.env);
+  if (fromStore.resolved.length) log(`read ${fromStore.resolved.join(", ")} from the guard's store`);
+  if (fromStore.missing.length) log(`⚠ ${fromStore.missing.join(", ")}: referenced in the config but not in the guard's store (vet-skills secrets list); the server starts without ${fromStore.missing.length === 1 ? "it" : "them"}`);
   // What is this package? The verdict decides the launch, the bindings and what counts as an expected host.
   const r = await resolveSkill(query, undefined, "mcp");
   const v: ResolveResponse | null = r.ok ? r.data : null;
   const pkg = v?.skill.name ?? query; const semver = v?.version.semver ?? null; const registry = v?.skill.registry ?? null;
   const key = `${registry ?? "?"}:${pkg}@${semver ?? "?"}`;
   const report: GuardSessionReport = { session, server: a.server, client: a.client, pkg: v ? pkg : null, registry, semver, started, ended: null, final: false, exit_code: null, machine: clientId(), cwd_hash: createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16), hosts: [], tools: [], secrets: [], canary: false, poison: [], launch: "ran", launch_reason: null, guard_version: VERSION, policy_version: org?.policyVersion ?? null };
-  const toolStats = new Map<string, { tool: string; calls: number; denied: number; approved: number }>();
-  // Per-call decisions for the org's record: deny and held always one row; allow folded per (tool, minute) with a count
-  // unless the org asked for full capture. Argument key names only. Replies are matched by JSON-RPC id.
-  const decisions: NonNullable<GuardSessionReport["decisions"]> = [];
-  const byRpcId = new Map<string, number>();
-  const fullCapture = process.env.VET_SKILLS_FULL_DECISIONS === "1";
+  const { toolStats, record: recordDecision } = decisionRecorder(report);
   const flush = async (final: boolean) => {
     report.final = final; report.ended = final ? new Date().toISOString() : null;
     appendGuardLog({ kind: final ? "session" : "progress", session, server: a.server, client: a.client, pkg: report.pkg, semver, hosts: report.hosts.length, tools: [...toolStats.values()].reduce((n, t) => n + t.calls, 0), secrets: report.secrets.length, canary: report.canary, exit: report.exit_code });
@@ -460,23 +585,7 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
     onEvent: (e: GuardEvent) => {
       appendGuardLog({ ...e, session, server: a.server, pkg: report.pkg, semver });
       if (e.kind === "host") { const first = !prior.includes(e.host); sessionHosts.add(e.host); report.hosts.push({ host: e.host, port: e.port, mode: e.mode, expected: e.expected, first_seen_here: first }); if (!e.expected && first && rt.newHost !== "allow" && base[key]?.sessions) log(`⚠ new host for ${pkg}${semver ? `@${semver}` : ""}: ${e.host} — never seen in ${base[key].sessions} earlier session${base[key].sessions === 1 ? "" : "s"} on this machine${v?.skill.page ? ` · https://killerskills.ai${v.skill.page}` : ""}`); }
-      else if (e.kind === "tool_call") {
-        const t = toolStats.get(e.tool) ?? { tool: e.tool, calls: 0, denied: 0, approved: 0 }; t.calls++; if (e.action === "denied" || e.action === "refused") t.denied++; if (e.action === "approved") t.approved++; toolStats.set(e.tool, t); report.tools = [...toolStats.values()];
-        const now = new Date();
-        const outcome = e.action === "allowed" ? "allow" : e.action === "approved" ? "held" : e.action === "held" ? "held" : "deny";
-        if (e.action === "held") { /* the outcome row is written when the approval resolves (approved/denied event follows) */ }
-        else if (outcome === "allow" && !fullCapture) {
-          const minute = now.toISOString().slice(0, 16);
-          const idx = decisions.findIndex((d) => d.outcome === "allow" && d.tool === e.tool && d.at.slice(0, 16) === minute);
-          if (idx >= 0) { decisions[idx].count++; if (e.id !== undefined) byRpcId.set(String(e.id), idx); }
-          else { decisions.push({ tool: e.tool, outcome: "allow", rule: e.rule ?? "default", at: now.toISOString(), count: 1, reply_observed: null, approval_id: null, disposition: null, arg_keys: e.args.slice(0, 20) }); if (e.id !== undefined) byRpcId.set(String(e.id), decisions.length - 1); }
-        } else {
-          decisions.push({ tool: e.tool, outcome, rule: e.action === "refused" ? "canary" : e.reason === "--deny" ? "--deny" : (e.rule ?? "default"), at: now.toISOString(), count: 1, reply_observed: e.action === "approved" ? false : null, approval_id: e.approvalId ?? null, disposition: e.action === "approved" ? "approved" : e.action === "denied" && e.approvalId ? "denied" : null, arg_keys: e.args.slice(0, 20) });
-          if (e.id !== undefined && e.action !== "denied" && e.action !== "refused") byRpcId.set(String(e.id), decisions.length - 1);
-        }
-        report.decisions = decisions.slice(-2000);
-      }
-      else if (e.kind === "tool_reply") { const idx = byRpcId.get(String(e.id)); if (idx !== undefined && decisions[idx]) { decisions[idx].reply_observed = true; byRpcId.delete(String(e.id)); } }
+      else if (e.kind === "tool_call" || e.kind === "tool_reply") recordDecision(e);
       else if (e.kind === "secret") report.secrets.push({ name: e.name, host: e.host, refused: e.refused });
       else if (e.kind === "canary") report.canary = true;
       else if (e.kind === "poison") report.poison.push(`${e.tool}: ${e.summary}`);
@@ -533,7 +642,7 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
 }
 
 /** Enrolled machines: a held tool call becomes an approval request the org decides (dashboard or Slack); the guard polls. */
-function makeApprover(ctx: { server: string; pkg: string | null; semver: string | null; session: string; timeout: number; log: (l: string) => void }): RunOptions["approver"] {
+export function makeApprover(ctx: { server: string; pkg: string | null; semver: string | null; session: string; timeout: number; log: (l: string) => void }): RunOptions["approver"] {
   return async ({ tool, args, rule }) => {
     const preview = Object.entries(args).slice(0, 8).map(([k, val]) => `${k}=${typeof val === "string" ? JSON.stringify(val.slice(0, 60)) : Array.isArray(val) ? `[${val.length}]` : typeof val}`).join(" ");
     const c = await approvalCreate({ server: ctx.server, pkg: ctx.pkg, semver: ctx.semver, tool, arg_keys: Object.keys(args), arg_preview: preview.slice(0, 400), reason: rule?.reason ?? null, session: ctx.session, timeout_seconds: ctx.timeout });
@@ -563,7 +672,7 @@ export function guardStatus(opts: { project?: string | null; home?: string } = {
   for (const s of w) lines.push(`  ${s.name.padEnd(28)} ${s.client.padEnd(14)} ${s.command}`);
   // Servers added to a config since the last install are not wrapped until the next `guard install` (or org sync under a required guard).
   const pending = installGuard({ ...opts, dryRun: true }).flatMap((t) => t.wrapped.map((n) => `${n} (${t.client})`));
-  if (pending.length) lines.push("", `${pending.length} stdio server${pending.length === 1 ? "" : "s"} configured since then and NOT under the guard: ${pending.join(", ")} — run: vet-skills guard install`);
+  if (pending.length) lines.push("", `${pending.length} server${pending.length === 1 ? "" : "s"} configured since then and NOT under the guard: ${pending.join(", ")}. Run: vet-skills guard install`);
   const log = readGuardLog(7);
   const sessions = log.filter((e) => e.kind === "start");
   const hosts = log.filter((e) => e.kind === "host");

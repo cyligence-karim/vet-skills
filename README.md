@@ -45,7 +45,8 @@ talks to the guard; the guard talks to the server. On every launch:
 $ vet-skills guard install
 ✓ claude-code: supabase, github, filesystem now run under the guard (~/.claude.json)
 ✓ cursor: github now run under the guard (~/.cursor/mcp.json)
-  claude-code: notion-remote skipped — remote server (http/sse); the guard wraps stdio servers
+  remote: tracker now connect through the guard; 1 credential header moved from the config into the guard's store (keychain)
+  claude-code: notion skipped — remote server that signs in by itself (OAuth) or takes no credential: listed, not wrapped
 $ vet-skills guard status
 $ vet-skills guard uninstall                 # originals back (also kept in ~/.vet-skills/guard/backup)
 ```
@@ -59,7 +60,13 @@ renews it in long sessions and revokes it at exit where the vendor allows. The
 server holds a placeholder for a credential that is dead within the hour. The
 App key, AWS profile and gcloud login stay on the machine and are only read to mint.
 
-Limits, stated: remote (http/sse) servers are not wrapped; a client that
+Remote servers (0.12): an entry with a URL and a credential header is rewritten to
+`vet-skills guard remote`; the guard speaks Streamable HTTP or HTTP+SSE to the
+server and adds the header itself, from its own store. Tool rules, change
+detection on the tool list (`runtime.on_change`) and revocation by host apply.
+
+Limits, stated: remote servers that sign in with OAuth or a browser are not
+wrapped; the store is not isolation from other processes running as you; a client that
 ignores `HTTPS_PROXY` is not seen by the proxy; a client that pins certificates
 is tunnelled opaquely after its first refused handshake, so placeholders sent to
 that host cannot be inspected. The guard says so on stderr when either happens.
@@ -235,6 +242,8 @@ judges intent: the rule is the match, and it is printed.
 ## See what is already configured
 
 ```
+vet-skills secrets migrate     # move credentials written in agent configs into the guard's store (asks once; --dry-run to look)
+vet-skills prove               # read-only: no MCP credential left in agent configs, agent environments or guard files
 vet-skills inventory           # per agent: servers (local and remote), guarded or not, verdicts, credential names, and the fix for each finding
 vet-skills discover            # every MCP server, skill, plugin and hook on this machine, with verdicts
 ```
@@ -341,6 +350,8 @@ prompts, environment variables, or file contents. `vet-skills leave` reverts.
 | `policy show` / `policy set <file>` | Personal policy. |
 | `block <skill> [--reason]` | Personal block list. |
 | `status` | Org, policy version, cache, pending approvals; syncs policy. |
+| `secrets migrate [--dry-run] [--yes]` · `secrets list` · `secrets set <key>` · `secrets rm <key>` | The guard's credential store: keychain (macOS), Secret Service (Linux), DPAPI (Windows), encrypted file otherwise. |
+| `prove [--json]` | Read-only check that no MCP credential sits in an agent config, a running agent's environment or the guard's files. |
 | `inventory [--project] [--json]` | Per agent: every MCP server, guarded or not, verdict for the version in use, credential names, Claude skills, fix lines. Read-only. |
 | `discover [--project] [--json]` | Inventory agent config on this machine; report names to the org when enrolled. |
 | `mcp` | Run as an MCP server over stdio (`check_skill`, `search_skills`). |

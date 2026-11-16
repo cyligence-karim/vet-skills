@@ -62,7 +62,7 @@ test("inventory lists every server of every agent with its transport and guarded
   assert.deepEqual(by.linear.plaintext, ["Authorization"], "a literal bearer header counts even when no pattern knows the token");
   assert.deepEqual(inv.totals, { agents: 3, servers: 6, guarded: 2, not_guarded: 2, remote: 2, no_verdict: 1, blocked: 0, plaintext: 2, skills: 1 });
   assert.equal(inv.agents[0].skills[0].name, "pdf-tools");
-  assert.match(nextStep(inv), /rotate the credential/);
+  assert.match(nextStep(inv), /vet-skills secrets migrate/);
   assert.equal(readFileSync(join(home, ".claude.json"), "utf8"), before, "read-only: the config is untouched");
 });
 
