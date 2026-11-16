@@ -151,7 +151,8 @@ export function scrubGuardFiles(store = new SecretStore()): number {
 export interface Finding { where: "config" | "process" | "guard files"; location: string; server?: string; name: string; detail: string; fix: string }
 export interface Proof { pass: boolean; checked: { configs: number; servers: number; processes: number; guard_files: number; stored: number }; not_checked: string[]; findings: Finding[] }
 
-const AGENT_PROC = /(^|[\\/\s])(claude|cursor|Cursor|codex|gemini|windsurf|Windsurf|code|Code|zed|Zed|kiro|qwen|grok|copilot|amp|opencode)(\s|$|\.exe|\s--| Helper)/;
+/** An agent process: a desktop app bundle (macOS reports the full path, and VS Code's binary is called Electron), or a CLI by its binary name. */
+export const isAgentProcess = (comm: string) => /(Claude|Cursor|Windsurf|Visual Studio Code|Code - Insiders|Zed|Kiro)\.app\//.test(comm) || /^(claude|cursor|codex|gemini|windsurf|code|zed|kiro|qwen|grok|copilot|amp|opencode)(\.exe)?$/i.test(comm.split(/[\\/]/).pop()!.trim());
 /** Running agent processes of this user, with their environment where the OS lets the same user read it. */
 function agentProcesses(): { ok: boolean; why?: string; procs: { pid: number; name: string; env: string }[] } {
   const os = platform();
@@ -163,11 +164,11 @@ function agentProcesses(): { ok: boolean; why?: string; procs: { pid: number; na
   for (const line of ps.stdout.split("\n")) {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); if (!m) continue;
     const pid = Number(m[1]); if (Number(m[2]) !== uid || pid === process.pid || pid === process.ppid) continue;
-    const comm = m[3]; if (!AGENT_PROC.test(comm) || /vet-skills/.test(comm)) continue;
+    const comm = m[3]; if (!isAgentProcess(comm) || /vet-skills/.test(comm)) continue;
     let env = "";
     if (os === "linux") { try { env = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").join("\n"); } catch { unreadable++; continue; } }
     else { const r = spawnSync("ps", ["eww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 }); if (r.status !== 0) { unreadable++; continue; } env = r.stdout.replace(/ (?=[A-Za-z_][A-Za-z0-9_]*=)/g, "\n"); }
-    procs.push({ pid, name: comm.split(/[\\/]/).pop()!.slice(0, 40), env });
+    procs.push({ pid, name: (comm.match(/([^/]+)\.app\//)?.[1] ?? comm.split(/[\\/]/).pop()!).slice(0, 40), env });
   }
   return { ok: true, why: unreadable ? `${unreadable} agent process${unreadable === 1 ? "" : "es"} whose environment the OS would not show` : undefined, procs };
 }

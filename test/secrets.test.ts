@@ -11,7 +11,7 @@ process.env.VET_SKILLS_HOME = vsHome;
 process.env.VET_SKILLS_BIN = "/opt/vet-skills/bin/vet-skills";
 process.env.VET_SKILLS_STORE = "file";
 const { SecretStore, resolveStoreRefs } = await import("../src/store.ts");
-const { planMigration, applyMigration, prove, rewriteTomlEnv } = await import("../src/secrets.ts");
+const { planMigration, applyMigration, prove, rewriteTomlEnv, isAgentProcess } = await import("../src/secrets.ts");
 const { uninstallGuard } = await import("../src/guard.ts");
 const { buildInventory } = await import("../src/inventory.ts");
 
@@ -135,4 +135,9 @@ test("toml env rewrite handles inline tables and env sub-tables and leaves every
   const out = rewriteTomlEnv(text, (server, name) => { seen.push(`${server}.${name}`); return /KEY|TOKEN/.test(name) ? `ref:${server}` : null; });
   assert.deepEqual(seen, ["a.API_KEY", "a.MODE", "b.TOKEN", "b.REGION"]);
   assert.equal(out, `[mcp_servers.a]\ncommand = "npx"\nenv = { API_KEY = "ref:a", MODE = "x" }\n\n[mcp_servers.b.env]\nTOKEN = "ref:b"\nREGION = "us"\n\n[profile]\nAPI_KEY = "untouched1234"\n`);
+});
+
+test("agent processes are recognized by app bundle on macOS and by binary name elsewhere", () => {
+  for (const c of ["/Applications/Claude.app/Contents/MacOS/Claude", "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper", "/Applications/Visual Studio Code.app/Contents/MacOS/Electron", "/Applications/Cursor.app/Contents/MacOS/Cursor", "claude", "/usr/local/bin/codex", "gemini", "C:\\Users\\k\\cursor.exe"]) assert.ok(isAgentProcess(c), c);
+  for (const c of ["node", "/usr/bin/security", "/Applications/Slack.app/Contents/MacOS/Slack", "/usr/sbin/coreaudiod", "encoder"]) assert.ok(!isAgentProcess(c), c);
 });
