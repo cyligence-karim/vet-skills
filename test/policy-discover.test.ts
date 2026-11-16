@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseAgentConfig, isAgentConfigPath, stdioPackage, blastRadius, classifyCredential } from "../src/policy/index.ts";
+import { parseAgentConfig, isAgentConfigPath, stdioPackage, blastRadius, classifyCredential, skillAgent } from "../src/policy/index.ts";
 
 test("finds agent config files in a repo tree", () => {
   for (const p of [".mcp.json", "svc/.cursor/mcp.json", ".claude/settings.json", ".claude/skills/pdf/SKILL.md", "CLAUDE.md", "apps/x/AGENTS.md", ".vscode/mcp.json", ".github/copilot-instructions.md", ".codex/config.toml"]) assert.ok(isAgentConfigPath(p), p);
@@ -95,8 +95,8 @@ test("an entry the guard wraps is described by the command it wraps", () => {
   assert.ok(!JSON.stringify(comps).includes("abcd1234efgh5678"));
 });
 
-test("skills are attributed to the agent whose directory they sit in", async () => {
-  const { skillAgent, isAgentConfigPath, parseAgentConfig: parse } = await import("../src/discover.ts");
+test("skills are attributed to the agent whose directory they sit in", () => {
+  const parse = parseAgentConfig;
   const cases: [string, string][] = [
     [".claude/skills/pdf/SKILL.md", "claude_code"], [".agents/skills/review/SKILL.md", "any"], [".config/agents/skills/review/SKILL.md", "amp"],
     [".cursor/skills/x/SKILL.md", "cursor"], [".gemini/skills/x/SKILL.md", "gemini_cli"], [".copilot/skills/x/SKILL.md", "copilot"],
