@@ -23,10 +23,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } fr
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { coverageMeets } from "./attest.js";
-import { approvalCreate, approvalPoll, behaviorDiff, guardReport, guardSighting, launchCheck, resolveSkill, type GuardSessionReport } from "./api.js";
+import { approvalCreate, approvalPoll, behaviorDiff, funnelFirstSession, guardReport, guardSighting, launchCheck, resolveSkill, type GuardSessionReport } from "./api.js";
 import { guard, parseRunArgs, type GuardEvent, type RunOptions } from "./run.js";
 import { SecretStore, isStoreRef, keyOfRef, refFor, resolveStoreRefs } from "./store.js";
-import { HOME, VERSION, clientId, readOrg, readPolicy, telemetryEnabled, type ResolveResponse } from "./state.js";
+import { HOME, VERSION, clientId, readOrg, readPolicy, telemetryEnabled, firstGuardedSessionMinutes, type ResolveResponse } from "./state.js";
 import { mint, secretsSpecFor, type Minted } from "./exchange.js";
 import { toolClass } from "./policy/index.js";
 import type { SecretBinding } from "./broker.js";
@@ -466,6 +466,12 @@ export function decisionRecorder(report: GuardSessionReport) {
   return { toolStats, record };
 }
 
+/** Setup timing: the first guarded session on a fresh, unenrolled install reports the minutes since the first command, once. */
+export function reportFirstSession(enrolled: boolean) {
+  const mins = firstGuardedSessionMinutes();
+  if (mins !== null && !enrolled && telemetryEnabled()) void funnelFirstSession({ minutes: mins, os: platform(), version: VERSION }).catch(() => false);
+}
+
 /** Run one MCP server under the guard with the runtime policy applied. Called by the client; stdio is the MCP stream. */
 export async function execGuarded(a: ExecArgs): Promise<number> {
   const log = (l: string) => process.stderr.write(`vet-skills guard · ${l}\n`);
@@ -483,6 +489,7 @@ export async function execGuarded(a: ExecArgs): Promise<number> {
   // in the guard's process, and never written back anywhere.
   const fromStore = resolveStoreRefs(process.env);
   if (fromStore.resolved.length) log(`read ${fromStore.resolved.join(", ")} from the guard's store`);
+  reportFirstSession(!!org);
   if (fromStore.missing.length) log(`⚠ ${fromStore.missing.join(", ")}: referenced in the config but not in the guard's store (vet-skills secrets list); the server starts without ${fromStore.missing.length === 1 ? "it" : "them"}`);
   // What is this package? The verdict decides the launch, the bindings and what counts as an expected host.
   const r = await resolveSkill(query, undefined, "mcp");

@@ -7,13 +7,13 @@
  *   agent.token  org-mode agent token (0600)
  *   log.jsonl    last 30 days of decisions, for `vet-skills why`
  */
-import { mkdirSync, readFileSync, writeFileSync, existsSync, appendFileSync, chmodSync, unlinkSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, appendFileSync, chmodSync, unlinkSync, statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_POLICY, SOLO_POLICY, parsePolicyYaml, serializePolicyYaml, type Policy } from "./policy/index.js";
 
-export const VERSION = "0.15.0";
+export const VERSION = "0.16.0";
 export const HOME = process.env.VET_SKILLS_HOME ?? join(homedir(), ".vet-skills");
 export const API = (process.env.KILLERSKILLS_API ?? "https://killerskills.ai").replace(/\/$/, "");
 
@@ -170,6 +170,33 @@ export function telemetryNoticePending(): boolean {
   if (existsSync(p)) return false;
   writeFileSync(p, new Date().toISOString() + "\n", { mode: 0o600 });
   return true;
+}
+
+/**
+ * Setup timing. The first command ever run on a machine writes the time; the first guarded session reports how many
+ * minutes passed since, once. Only a fresh install is timed (a home directory that already had state is marked and
+ * never reports), and nothing is recorded for enrolled machines or with telemetry off.
+ */
+const FIRST_RUN = () => join(HOME, "first-run");
+export function markFirstRun(): { fresh: boolean; first: boolean } {
+  if (existsSync(FIRST_RUN())) return { fresh: false, first: false };
+  let fresh = true;
+  try { fresh = !existsSync(HOME) || readdirSync(HOME).length === 0; } catch { fresh = false; }
+  ensureHome();
+  try { writeFileSync(FIRST_RUN(), JSON.stringify({ at: new Date().toISOString(), fresh }) + "\n", { mode: 0o600 }); } catch { return { fresh: false, first: false }; }
+  return { fresh, first: true };
+}
+/** Minutes from the first command to now, for a fresh install whose first guarded session this is; null otherwise. Marks it reported. */
+export function firstGuardedSessionMinutes(now = Date.now()): number | null {
+  const stamp = join(HOME, "guard", "first-session");
+  if (existsSync(stamp)) return null;
+  try { mkdirSync(join(HOME, "guard"), { recursive: true, mode: 0o700 }); writeFileSync(stamp, new Date(now).toISOString() + "\n"); } catch { return null; }
+  try {
+    const f = JSON.parse(readFileSync(FIRST_RUN(), "utf8")) as { at: string; fresh: boolean };
+    if (!f.fresh) return null;
+    const mins = Math.round((now - new Date(f.at).getTime()) / 60_000);
+    return Number.isFinite(mins) && mins >= 0 ? Math.min(mins, 20_160) : null;
+  } catch { return null; }
 }
 
 /** Rate-limit a hint to once per UTC day (key = hint name). */

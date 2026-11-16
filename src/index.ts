@@ -57,7 +57,7 @@ import { buildInventory, componentsForSync, renderInventory, renderReach } from 
 import { fetchTarget, tarDir } from "./try.js";
 import { guard, parseRunArgs } from "./run.js";
 import { serveMcp } from "./mcp.js";
-import { VERSION, API, HOME, readLog, readOrg, readPolicy, readToken, stateSummary, writeOrg, writePolicy, writeToken, appendLog, setTelemetry, telemetryEnabled } from "./state.js";
+import { VERSION, API, HOME, readLog, readOrg, readPolicy, readToken, stateSummary, writeOrg, writePolicy, writeToken, appendLog, setTelemetry, telemetryEnabled, markFirstRun } from "./state.js";
 import { hookEval, installClaudeCodeHook, installCodexHook, installCursorHook } from "./hook.js";
 import { cursorHook } from "./cursor.js";
 import { renderEvidence } from "./evidence.js";
@@ -156,6 +156,9 @@ async function askTelemetry(): Promise<boolean | null> {
 
 async function main(): Promise<number> {
   if (values.version) { console.log(VERSION); return 0; }
+  // The first command on a fresh install starts the setup clock, and says so once (stderr, so piped output stays clean).
+  const fr = markFirstRun();
+  if (fr.first && fr.fresh && telemetryEnabled() && !readOrg()) process.stderr.write(c.muted("vet-skills measures one thing about setup, anonymously: the minutes from this first command to your first guarded session, with your OS and the CLI version. No machine id, no names. Opt out: vet-skills telemetry off (or VET_SKILLS_TELEMETRY=0).") + "\n");
   if (values.help || !cmd) { usage(); return cmd ? 0 : 1; }
 
   switch (cmd) {
@@ -216,6 +219,10 @@ async function main(): Promise<number> {
       if (sub === "remote") return execRemote(process.argv.slice(4));
       if (sub === "approve") {
         if (!rest[1]) { console.error("usage: vet-skills guard approve <package or remote server name>"); return 2; }
+        // A hold is for a person to release. An agent with a shell reads the same hint the developer does, so this
+        // command wants a terminal. It is a guard rail against an agent approving its own held change, not a boundary:
+        // anything running as you can still do what you can. Separation needs an org approver on another device.
+        if (!process.stdin.isTTY && process.env.VET_SKILLS_APPROVE_NONINTERACTIVE !== "1") { console.error(`${c.blocked("✕")} vet-skills guard approve needs an interactive terminal: a held change is released by a person, not by the agent it was held from. Run it yourself in a terminal.`); return 1; }
         const remote = approveRemote(rest[1]);
         const r = remote.ok ? remote : approvePinned(rest[1]); console.log(r.ok ? `${c.verified("✓")} ${r.message}` : `${c.blocked("✕")} ${r.message}`); return r.ok ? 0 : 1;
       }
@@ -431,7 +438,7 @@ async function main(): Promise<number> {
     case "telemetry": {
       const sub = rest[0] ?? "status";
       if (sub === "on" || sub === "off") { setTelemetry(sub === "on"); console.log(`${c.verified("✓")} telemetry ${sub}`); return 0; }
-      console.log(`telemetry ${telemetryEnabled() ? "on" : "off"} ${c.muted(readOrg() ? "(enrolled: decisions report to the org, not here)" : "(anonymous: skill, version, decision, agent type; never code, prompts or paths)")}`);
+      console.log(`telemetry ${telemetryEnabled() ? "on" : "off"} ${c.muted(readOrg() ? "(enrolled: decisions report to the org, not here)" : "(anonymous: skill, version, decision, agent type, and once the minutes from first command to first guarded session; never code, prompts or paths)")}`);
       return 0;
     }
 

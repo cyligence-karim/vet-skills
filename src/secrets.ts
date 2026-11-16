@@ -13,7 +13,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { platform } from "node:os";
+import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { isLiteralCredential } from "./policy/index.js";
@@ -148,8 +148,52 @@ export function scrubGuardFiles(store = new SecretStore()): number {
 
 /* ------------------------------------------------------------------ prove */
 
-export interface Finding { where: "config" | "process" | "guard files"; location: string; server?: string; name: string; detail: string; fix: string }
-export interface Proof { pass: boolean; checked: { configs: number; servers: number; processes: number; guard_files: number; stored: number }; not_checked: string[]; findings: Finding[] }
+export interface Finding { where: "config" | "process" | "guard files" | "agent logs"; location: string; server?: string; name: string; detail: string; fix: string }
+export interface Proof { pass: boolean; checked: { configs: number; servers: number; processes: number; guard_files: number; agent_files: number; stored: number }; not_checked: string[]; findings: Finding[] }
+
+/**
+ * Where agents write things down: session transcripts, history and memory files. A credential an agent echoed, or was
+ * pasted, ends up here in the clear and stays. Newest files first, bounded so the check stays quick.
+ */
+const AGENT_LOG_DIRS: { dir: string; agent: string; match: RegExp }[] = [
+  { dir: ".claude/projects", agent: "Claude Code", match: /\.(jsonl|md)$/ },
+  { dir: ".claude", agent: "Claude Code", match: /^(history\.jsonl|MEMORY\.md|CLAUDE\.md)$/ },
+  { dir: ".codex/sessions", agent: "Codex CLI", match: /\.jsonl?$/ },
+  { dir: ".codex", agent: "Codex CLI", match: /^(history\.jsonl|AGENTS\.md)$/ },
+  { dir: ".codex/log", agent: "Codex CLI", match: /\.log$/ },
+  { dir: ".gemini/tmp", agent: "Gemini CLI", match: /\.(json|jsonl|md)$/ },
+  { dir: ".gemini", agent: "Gemini CLI", match: /^GEMINI\.md$/ },
+  { dir: ".qwen/tmp", agent: "Qwen Code", match: /\.(json|jsonl)$/ },
+  { dir: ".grok/sessions", agent: "Grok CLI", match: /\.jsonl?$/ },
+  { dir: ".copilot/session-state", agent: "Copilot CLI", match: /\.jsonl?$/ },
+  { dir: ".copilot/history-session-state", agent: "Copilot CLI", match: /\.jsonl?$/ },
+];
+/** Token shapes that are a credential wherever they appear. JWTs are left out: logs are full of ones that are not secrets. */
+const TOKEN_SHAPES: { kind: string; re: RegExp }[] = [
+  { kind: "GitHub token", re: /\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b/ },
+  { kind: "AWS access key id", re: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/ },
+  { kind: "Slack token", re: /\bxox[abpsr]-[A-Za-z0-9-]{20,}\b/ },
+  { kind: "GitLab token", re: /\bglpat-[A-Za-z0-9_-]{20,}\b/ },
+  { kind: "API key (sk-…)", re: /\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{32,}\b/ },
+];
+const MAX_AGENT_FILES = 400, MAX_AGENT_FILE_BYTES = 25_000_000, MAX_AGENT_TOTAL = 300_000_000;
+export function agentLogFiles(home: string, project?: string | null): { files: { path: string; agent: string; size: number; mtime: number }[]; skipped: number } {
+  const all: { path: string; agent: string; size: number; mtime: number }[] = [];
+  const rec = (dir: string, agent: string, match: RegExp, depth: number) => {
+    let names: string[]; try { names = readdirSync(dir); } catch { return; }
+    for (const n of names) {
+      const p = join(dir, n); let st; try { st = statSync(p); } catch { continue; }
+      if (st.isDirectory()) { if (depth < 4 && n !== "node_modules" && !n.startsWith(".git")) rec(p, agent, match, depth + 1); }
+      else if (st.isFile() && match.test(n)) all.push({ path: p, agent, size: st.size, mtime: st.mtimeMs });
+    }
+  };
+  for (const d of AGENT_LOG_DIRS) rec(join(home, d.dir), d.agent, d.match, /projects|sessions|tmp|state|log$/.test(d.dir) ? 0 : 4);
+  if (project) for (const n of ["CLAUDE.md", "AGENTS.md", "GEMINI.md", ".claude/MEMORY.md"]) { try { const st = statSync(join(project, n)); if (st.isFile()) all.push({ path: join(project, n), agent: "project memory", size: st.size, mtime: st.mtimeMs }); } catch { /* absent */ } }
+  const uniq = [...new Map(all.map((f) => [f.path, f])).values()].sort((a, b) => b.mtime - a.mtime);
+  const files: typeof all = []; let total = 0;
+  for (const f of uniq) { if (files.length >= MAX_AGENT_FILES || f.size > MAX_AGENT_FILE_BYTES || total + f.size > MAX_AGENT_TOTAL) continue; files.push(f); total += f.size; }
+  return { files, skipped: uniq.length - files.length };
+}
 
 /** An agent process: a desktop app bundle (macOS reports the full path, and VS Code's binary is called Electron), or a CLI by its binary name. */
 export const isAgentProcess = (comm: string) => /(Claude|Cursor|Windsurf|Visual Studio Code|Code - Insiders|Zed|Kiro)\.app\//.test(comm) || /^(claude|cursor|codex|gemini|windsurf|code|zed|kiro|qwen|grok|copilot|amp|opencode)(\.exe)?$/i.test(comm.split(/[\\/]/).pop()!.trim());
@@ -218,10 +262,18 @@ export function prove(opts: Opts & { processes?: { pid: number; name: string; en
     for (const v of stored) if (text.includes(v.value)) findings.push({ where: "guard files", location: f, name: v.key.split("/").pop()!, detail: `holds the value stored as ${v.key}`, fix: "run `vet-skills secrets migrate` (it scrubs the guard's backups and logs)" });
     if (/\.bak$/.test(f)) { const root = readJsonc(text); const seen = new Set<string>(); const scan = (o: unknown, depth: number) => { if (!isObj(o) || depth > 8) return; for (const [k, v] of Object.entries(o)) { if ((k === "env" || k === "environment" || k === "headers") && isObj(v)) { for (const [n, val] of Object.entries(v)) if (isLiteralCredential(k === "headers" ? n.replace(/-/g, "_") : n, val) && !seen.has(n)) { seen.add(n); findings.push({ where: "guard files", location: f, name: n, detail: "an old config backup with a credential value in it", fix: "delete this backup file once the config it came from works" }); } } else scan(v, depth + 1); } }; scan(root, 0); }
   }
+  // What agents wrote down: transcripts, history, memory files. A value the guard holds, or a well-known token shape.
+  const logs = agentLogFiles(opts.home ?? homedir(), opts.project);
+  for (const f of logs.files) {
+    let text: string; try { text = readFileSync(f.path, "utf8"); } catch { continue; }
+    for (const v of stored) if (text.includes(v.value)) findings.push({ where: "agent logs", location: f.path, name: v.key.split("/").pop()!, detail: `${f.agent} wrote the value the guard holds as ${v.key} into this file`, fix: "rotate that credential, then delete the session or the line; the file is the agent's own record" });
+    for (const t of TOKEN_SHAPES) { const m = text.match(new RegExp(t.re.source, "g")); if (!m) continue; const distinct = new Set(m.filter((x) => !stored.some((v) => v.value.includes(x)))).size; if (distinct) findings.push({ where: "agent logs", location: f.path, name: t.kind, detail: `${distinct} ${t.kind}${distinct === 1 ? "" : "s"} written in the clear by ${f.agent}`, fix: "check whether it is live; if so rotate it, then delete the session or the line" }); }
+  }
+  if (logs.skipped) not.push(`${logs.skipped} older or very large agent log file${logs.skipped === 1 ? "" : "s"} (the newest ${MAX_AGENT_FILES} are read)`);
   if (!existsSync(join(HOME, "guard"))) not.push("the guard's files (the guard has not been installed on this machine)");
-  not.push("credentials read from files by a server (~/.aws, ~/.config/gh and similar)", "your shell profile and other files outside agent configs", "servers that sign in with OAuth (the agent holds that session)");
+  not.push("credentials read from files by a server (~/.aws, ~/.config/gh and similar)", "your shell profile and other files outside agent configs", "agent logs kept in a database or outside your home (Cursor, Windsurf, VS Code, Claude Desktop)", "credentials in an agent log that have no well-known token shape and are not held by the guard", "servers that sign in with OAuth (the agent holds that session)");
   const dedup = [...new Map(findings.map((f) => [`${f.where}|${f.location}|${f.server ?? ""}|${f.name}|${f.detail}`, f])).values()];
-  return { pass: dedup.length === 0, checked: { configs, servers, processes, guard_files: files.length, stored: stored.length }, not_checked: not, findings: dedup };
+  return { pass: dedup.length === 0, checked: { configs, servers, processes, guard_files: files.length, agent_files: logs.files.length, stored: stored.length }, not_checked: not, findings: dedup };
 }
 
 /* ------------------------------------------------------------------ cli */
@@ -308,7 +360,7 @@ export function proveCmd(flags: { json?: boolean; project?: boolean }): number {
   const p = prove({ project: flags.project ? process.cwd() : null });
   if (flags.json) { console.log(JSON.stringify(p, null, 2)); return p.pass ? 0 : 1; }
   const c = p.checked;
-  const scope = `${c.configs} agent config${c.configs === 1 ? "" : "s"} (${c.servers} server${c.servers === 1 ? "" : "s"}), ${c.processes} running agent process${c.processes === 1 ? "" : "es"}, ${c.guard_files} of the guard's own files`;
+  const scope = `${c.configs} agent config${c.configs === 1 ? "" : "s"} (${c.servers} server${c.servers === 1 ? "" : "s"}), ${c.processes} running agent process${c.processes === 1 ? "" : "es"}, ${c.agent_files} agent log and memory file${c.agent_files === 1 ? "" : "s"}, ${c.guard_files} of the guard's own files`;
   if (p.pass) console.log(`PASS  No credential for an MCP server was found in ${scope}.${c.stored ? ` The guard holds ${c.stored}.` : ""}`);
   else {
     console.log(`FAIL  ${p.findings.length} place${p.findings.length === 1 ? "" : "s"} where a credential still lives (checked ${scope}):\n`);

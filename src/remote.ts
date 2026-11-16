@@ -21,7 +21,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { approvalCreate, approvalPoll, guardReport, launchCheck, type GuardSessionReport } from "./api.js";
-import { appendGuardLog, decisionRecorder, makeApprover, parseRemoteArgs, type RemoteSpec } from "./guard.js";
+import { appendGuardLog, decisionRecorder, makeApprover, parseRemoteArgs, reportFirstSession, type RemoteSpec } from "./guard.js";
 import { createRelay, type RelayEvent } from "./relay.js";
 import { SecretStore, isStoreRef, keyOfRef } from "./store.js";
 import { HOME, VERSION, clientId, readOrg, readPolicy, telemetryEnabled } from "./state.js";
@@ -230,6 +230,7 @@ export async function execRemote(argv: string[], io: { stdin?: NodeJS.ReadableSt
   const resolved = resolveHeaders(spec, new SecretStore(), process.env);
   if (resolved.missing.length) { const why = `cannot build the request headers for ${spec.server}: ${resolved.missing.join("; ")}`; log(`✕ ${why}`); return refuseLaunch(why); }
   for (const name of resolved.held) report.secrets.push({ name, host, refused: false });
+  reportFirstSession(!!org);
   report.hosts.push({ host, port: Number(u.port) || (u.protocol === "https:" ? 443 : 80), mode: "brokered", expected: true, first_seen_here: false });
 
   // What changed since the tools this server listed last time on this machine.

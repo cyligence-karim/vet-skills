@@ -275,7 +275,7 @@ rl.on("close", () => process.exit(0));`);
     assert.match(held.err, /holding postmark: .*Policy runtime\.on_change: hold — to accept it: vet-skills guard approve postmark-mcp/);
     assert.equal(held.out, "", "nothing was relayed from a held server"); assert.equal(pins()["npm:postmark-mcp"].semver, "1.0.16");
     // Approve on a personal machine, then it launches and the baseline moves.
-    const ap = await new Promise<string>((r) => { const c = spawn("node", [cli, "guard", "approve", "postmark-mcp"], { env }); let o = ""; c.stdout.on("data", (d) => (o += d)); c.on("close", () => r(o)); });
+    const ap = await new Promise<string>((r) => { const c = spawn("node", [cli, "guard", "approve", "postmark-mcp"], { env: { ...env, VET_SKILLS_APPROVE_NONINTERACTIVE: "1" } }); let o = ""; c.stdout.on("data", (d) => (o += d)); c.on("close", () => r(o)); });
     assert.match(ap, /next version of postmark-mcp to launch will be accepted/);
     const after = await launch(); assert.equal(after.code, 0, after.err); assert.match(after.err, /1\.0\.16 → 1\.0\.17 accepted/); assert.equal(pins()["npm:postmark-mcp"].semver, "1.0.17");
     // Hold with an update that reaches for nothing new: runs without asking anyone.

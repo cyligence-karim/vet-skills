@@ -69,6 +69,11 @@ Per-tool scope (0.13): `scope: per_tool` on a `runtime.exchange` rule gives the 
 a read-only GitHub App, AWS STS or GCP token, and swaps in a write-capable one only
 while a tool call classed as a write is in flight.
 
+Setup timing (0.16): a fresh install that is not in an org sends one number, once: the
+minutes from the first command to the first guarded session, with the OS and CLI
+version and no client id. The first command says so. `vet-skills telemetry off`,
+`VET_SKILLS_TELEMETRY=0` or `DO_NOT_TRACK=1` turns it off.
+
 Limits, stated: remote servers that sign in with OAuth or a browser are not
 wrapped; the store is not isolation from other processes running as you; a client that
 ignores `HTTPS_PROXY` is not seen by the proxy; a client that pins certificates
@@ -361,7 +366,7 @@ prompts, environment variables, or file contents. `vet-skills leave` reverts.
 | `block <skill> [--reason]` | Personal block list. |
 | `status` | Org, policy version, cache, pending approvals; syncs policy. |
 | `secrets migrate [--dry-run] [--yes]` · `secrets list` · `secrets set <key>` · `secrets rm <key>` | The guard's credential store: keychain (macOS), Secret Service (Linux), DPAPI (Windows), encrypted file otherwise. |
-| `prove [--json]` | Read-only check that no MCP credential sits in an agent config, a running agent's environment or the guard's files. |
+| `prove [--json]` | Read-only check that no MCP credential sits in an agent config, a running agent's environment, an agent's transcripts and memory files, or the guard's files. |
 | `inventory [--project] [--json]` | Per agent: every MCP server, guarded or not, verdict for the version in use, credential names, installed skills (Claude Code and the agents that read `.agents/skills` or their own skills directory), fix lines. Read-only without `--fix`. |
 | `discover [--project] [--json]` | Inventory agent config on this machine; report names to the org when enrolled. |
 | `mcp` | Run as an MCP server over stdio (`check_skill`, `search_skills`). |

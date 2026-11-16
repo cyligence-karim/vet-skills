@@ -162,3 +162,27 @@ test("inventory --fix: one plan, one question, both fixes; without a terminal it
   for (const v of all) assert.ok(!yes.stdout.includes(v) && !noTty.stdout.includes(v), "a value is never printed");
   assert.match(run("inventory", "--fix", "--yes").stdout, /Nothing here that `--fix` can fix by itself/);
 });
+
+test("prove reads what agents wrote down: a held value or a token shape in a transcript or memory file is a finding, by file and kind", () => {
+  const h = mkdtempSync(join(tmpdir(), "vs-logs-home-"));
+  const store = new SecretStore({ dir: join(h, "store"), backend: "file" });
+  const HELD = "tracker-secret-" + "q9".repeat(10);
+  store.set("cursor/tracker/Authorization", HELD);
+  const AWS = "AKIA" + "ABCDEFGH12345678"; const GHP = "ghp_" + "Ab1".repeat(12);
+  mkdirSync(join(h, ".claude/projects/-Users-k-app"), { recursive: true }); mkdirSync(join(h, ".codex/sessions/2026/11"), { recursive: true });
+  writeFileSync(join(h, ".claude/projects/-Users-k-app/s1.jsonl"), JSON.stringify({ role: "assistant", text: `I ran the request with Authorization: ${HELD}` }) + "\n" + JSON.stringify({ role: "user", text: `use ${GHP} for now` }) + "\n");
+  writeFileSync(join(h, ".claude/projects/-Users-k-app/s2.jsonl"), JSON.stringify({ role: "user", text: "nothing secret here, token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefgh12345" }) + "\n");
+  writeFileSync(join(h, ".codex/sessions/2026/11/r.jsonl"), `{"msg":"export AWS_ACCESS_KEY_ID=${AWS}"}\n{"msg":"again ${AWS}"}\n`);
+  writeFileSync(join(h, ".claude/MEMORY.md"), "# memory\nprefers pnpm\n");
+  const p = prove({ home: h, store, processes: [] });
+  assert.equal(p.pass, false);
+  assert.equal(p.checked.agent_files, 4);
+  assert.deepEqual(p.findings.map((f) => [f.where, f.location.replace(h, "~"), f.name, f.detail]).sort(), [
+    ["agent logs", "~/.claude/projects/-Users-k-app/s1.jsonl", "Authorization", "Claude Code wrote the value the guard holds as cursor/tracker/Authorization into this file"],
+    ["agent logs", "~/.claude/projects/-Users-k-app/s1.jsonl", "GitHub token", "1 GitHub token written in the clear by Claude Code"],
+    ["agent logs", "~/.codex/sessions/2026/11/r.jsonl", "AWS access key id", "1 AWS access key id written in the clear by Codex CLI"],
+  ]);
+  const json = JSON.stringify(p);
+  for (const v of [HELD, AWS, GHP]) assert.ok(!json.includes(v), "a finding never carries the value");
+  assert.ok(p.not_checked.some((n) => /kept in a database/.test(n)) && p.not_checked.some((n) => /no well-known token shape/.test(n)));
+});

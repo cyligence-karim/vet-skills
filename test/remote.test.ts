@@ -149,7 +149,10 @@ test("a changed tool list follows runtime.on_change: warn says so, hold refuses 
   assert.match(held.lines.find((l) => l.id === 4)?.error?.message ?? "", /held by the guard/);
   assert.equal(held.lines.find((l) => l.id === 5)?.result?.content?.[0].text, "ok get_issue", "unchanged tools keep working");
   assert.match(held.err, /holding 2 tools of tracker: .* To accept: vet-skills guard approve tracker/);
-  const ap = await new Promise<string>((r) => { const c = spawn("node", [cli, "guard", "approve", "tracker"], { env: env() }); let o = ""; c.stdout.on("data", (d) => (o += d)); c.on("close", () => r(o)); });
+  // Without a terminal the approval is refused: the agent the change was held from reads the same hint the developer does.
+  const noTty = await new Promise<{ code: number | null; err: string }>((r) => { const c = spawn("node", [cli, "guard", "approve", "tracker"], { env: env(), stdio: ["ignore", "pipe", "pipe"] }); let e = ""; c.stderr.on("data", (d) => (e += d)); c.on("close", (code) => r({ code, err: e })); });
+  assert.equal(noTty.code, 1); assert.match(noTty.err, /needs an interactive terminal: a held change is released by a person/);
+  const ap = await new Promise<string>((r) => { const c = spawn("node", [cli, "guard", "approve", "tracker"], { env: env({ VET_SKILLS_APPROVE_NONINTERACTIVE: "1" }) }); let o = ""; c.stdout.on("data", (d) => (o += d)); c.on("close", () => r(o)); });
   assert.match(ap, /The tools tracker lists next will be accepted/);
   const ok = await session(args, [init, inited, list, call(3, "export_all")]);
   assert.equal(ok.lines.find((l) => l.id === 3)?.result?.content?.[0].text, "ok export_all");

@@ -109,6 +109,11 @@ export function approvalPoll(id: string) {
   return call<{ status: "pending" | "approved" | "denied" | "expired"; by: string | null }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/tool-approvals/${id}`, { headers: orgHeaders() }, 6000);
 }
 
+/** Setup timing, once per fresh install: minutes from the first command to the first guarded session, the OS and the CLI version. No client id is sent with it. Telemetry opt-out applies. */
+export async function funnelFirstSession(body: { minutes: number; os: string; version: string }): Promise<boolean> {
+  try { const res = await fetch(`${API}/api/v1/funnel`, { method: "POST", headers: { "content-type": "application/json", "user-agent": `vet-skills/${VERSION}` }, body: JSON.stringify({ kind: "first_guarded_session", ...body }), signal: AbortSignal.timeout(4000) }); return res.ok; } catch { return false; }
+}
+
 /** One-time activation signal when the guard is installed on a machine: counts and client names, nothing else. Telemetry opt-out applies. */
 export function funnelGuardInstall(body: { servers: number; clients: string[]; version: string; os: string }) {
   return call<{ ok: true }>(`/api/v1/funnel`, { method: "POST", body: JSON.stringify({ kind: "guard_install", ...body }) }, 4000);
