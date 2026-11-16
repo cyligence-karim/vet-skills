@@ -19,6 +19,7 @@ export type RelayEvent =
   | { kind: "tool_reply"; tool: string; id: number | string }
   | { kind: "canary"; where: string; tool: string }
   | { kind: "poison"; tool: string; summary: string }
+  | { kind: "tools"; tools: { name: string; ro?: boolean }[] }
   | { kind: "stopped"; reason: string; pending: number };
 
 export interface RelayOptions {
@@ -47,7 +48,7 @@ export function createRelay(opts: RelayOptions, io: RelayIO) {
   const canaryReg = readCanaries();
   const warned = new Set<string>();
   let calls = 0, deniedCalls = 0;
-  let stopped: string | null = null;
+  let stopped: string | null = null; let lastListed = "";
   let chain: Promise<void> = Promise.resolve();
   const refuse = (id: number | string | undefined, code: number, message: string) => { if (id !== undefined) io.toAgent(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })); };
 
@@ -146,6 +147,11 @@ export function createRelay(opts: RelayOptions, io: RelayIO) {
           const key = `desc|${t.name}`;
           if (f.length && !warned.has(key)) { warned.add(key); record(opts.label, t.name ?? "?", [], false); emit({ kind: "poison", tool: t.name ?? "?", summary: hiddenSummary(f) }); log(`tool "${t.name}" description carries instructions for the agent (tool poisoning): ${hiddenSummary(f)}. Deny it with --deny ${t.name} if you do not trust it.`); }
         }
+        // The tool list as the server declared it, written down once per distinct list: `policy suggest` reads it to see
+        // which tools exist but were never called.
+        const listed = m.result.tools.filter((t) => typeof t.name === "string" && t.name).slice(0, 500).map((t) => ({ name: t.name!, ...(typeof t.annotations?.readOnlyHint === "boolean" ? { ro: t.annotations.readOnlyHint } : {}) }));
+        const sig = listed.map((t) => `${t.name}:${t.ro ?? ""}`).join(",");
+        if (listed.length && sig !== lastListed) { lastListed = sig; emit({ kind: "tools", tools: listed }); }
         try { io.onTools?.(m.result.tools); } catch { /* never break the relay */ }
       } else if (m.id !== undefined && pending.has(m.id)) {
         const tool = pending.get(m.id)!; pending.delete(m.id);

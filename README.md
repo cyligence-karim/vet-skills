@@ -248,6 +248,8 @@ judges intent: the rule is the match, and it is printed.
 ```
 vet-skills secrets migrate     # move credentials written in agent configs into the guard's store (asks once; --dry-run to look)
 vet-skills prove               # read-only: no MCP credential left in agent configs, agent environments or guard files
+vet-skills policy test strict.yaml   # replay recorded tool calls against a proposed policy; changes nothing
+vet-skills policy suggest            # a starting policy from observed use, each rule with its evidence
 vet-skills inventory --credentials   # by credential: for each name, every server that is handed it
 vet-skills inventory           # per agent: servers (local and remote), guarded or not, verdicts, credential names, and the fix for each finding
 vet-skills discover            # every MCP server, skill, plugin and hook on this machine, with verdicts

@@ -17,6 +17,8 @@
  *   vet-skills status                     org, policy version, last report, cache size
  *   vet-skills inventory [--project] [--json] per agent: MCP servers (local and remote), guarded or not, verdicts, credential names, skills, and the fix for each finding
  *   vet-skills secrets migrate [--dry-run] [--yes]   move credentials written in agent configs into the guard's store; list | set <key> | rm <key>
+  vet-skills policy test <file> [--since 30d] [--org-wide]   replay recorded activity against a proposed policy; changes nothing
+  vet-skills policy suggest [--since 30d] [--out file]      a starting policy from observed use, each rule with its evidence
   vet-skills prove [--json]                 check that no MCP credential sits in an agent config, a running agent's environment or the guard's files
   vet-skills inventory --credentials        the same, by credential: for each name, every server that is handed it
   vet-skills inventory [--project] [--json] what your agents can reach: servers, guarded or not, verdicts, credential names
@@ -70,6 +72,7 @@ import { c } from "./render.js";
 import { approveRemote, execRemote } from "./remote.js";
 import { SecretStore } from "./store.js";
 import { proveCmd, secretsCmd } from "./secrets.js";
+import { policySuggestCmd, policyTestCmd } from "./policytest.js";
 import { approvalsCmd, diffCmd, reviewCmd, threatsCmd } from "./org.js";
 
 // `run` and `guard exec` own everything after them (their own flags, then `--` and the server command); the shared parser never sees them.
@@ -81,7 +84,7 @@ const { values, positionals } = parseArgs({
   args: RUN_AT === 2 ? ["run"] : GUARD_EXEC ? ["guard", process.argv[3]] : ORG_CMD ? [process.argv[2]] : process.argv.slice(2),
   allowPositionals: true,
   options: {
-    "dry-run": { type: "boolean" }, credentials: { type: "boolean" }, token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
+    "dry-run": { type: "boolean" }, since: { type: "string" }, out: { type: "string" }, "org-wide": { type: "boolean" }, credentials: { type: "boolean" }, token: { type: "string" }, reason: { type: "string" }, org: { type: "string" }, yes: { type: "boolean", short: "y" }, lock: { type: "boolean" },
     json: { type: "boolean" }, ci: { type: "boolean" }, email: { type: "string" }, help: { type: "boolean", short: "h" }, project: { type: "boolean" }, quiet: { type: "boolean", short: "q" }, version: { type: "boolean", short: "v" }, agent: { type: "string" }, publisher: { type: "string" }, registry: { type: "string" },
   },
 });
@@ -392,6 +395,8 @@ async function main(): Promise<number> {
         console.log(`${c.verified("✓")} Personal policy updated.`);
         return 0;
       }
+      if (sub === "test") return policyTestCmd(rest[1], { since: values.since, json: !!values.json, orgWide: !!values["org-wide"] });
+      if (sub === "suggest") return policySuggestCmd({ since: values.since, out: values.out, json: !!values.json });
       usage(); return 1;
     }
 

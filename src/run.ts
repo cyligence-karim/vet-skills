@@ -61,6 +61,7 @@ export type GuardEvent =
   | { kind: "canary"; where: string; tool: string }
   | { kind: "poison"; tool: string; summary: string }
   | { kind: "pin_fallback"; host: string }
+  | { kind: "tools"; tools: { name: string; ro?: boolean }[] }
   | { kind: "stopped"; reason: string; pending: number }
   | { kind: "exit"; code: number | null; calls: number; denied: number; blocked: number };
 

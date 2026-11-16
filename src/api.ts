@@ -157,6 +157,11 @@ export function sendFieldSignal(events: { skill: string; semver: string | null; 
 }
 
 /** What `vet-skills discover` found on this machine (names only; enrolled machines only). */
+/** Org-wide replay of a draft policy over what enrolled machines reported. The draft is evaluated server-side and not stored. */
+export function policyReplay(yaml: string, days: number) {
+  const org = readOrg()!;
+  return call<{ days: number; sessions: number; tools: import("./policy/index.js").ReplayReport; next: string }>(`/api/v1/orgs/${org.slug}/agents/${org.agentId}/policy-replay`, { method: "POST", body: JSON.stringify({ yaml, days }), headers: orgHeaders() }, 20000);
+}
 export function discoverReport(components: unknown[], auto = false) {
   const org = readOrg();
   if (!org) return Promise.resolve<ApiResult<{ ok: true; components: number; dashboard: string }>>({ ok: false, error: "not joined", offline: false });
