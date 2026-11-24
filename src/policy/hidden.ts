@@ -50,7 +50,7 @@ const PHRASES: { re: RegExp; title: string }[] = [
   { re: /\b(?:AI|assistant|agent|model|LLM|Claude|GPT|Copilot|Cursor)\b[^.\n]{0,40}\b(?:must|should|needs? to|is required to)\b[^.\n]{0,80}\b(?:run|execute|send|read|open|fetch|curl|delete|write)\b/i, title: "instruction addressed to the agent" },
   { re: /\b(?:important|attention|note to|instructions? for)\s+(?:the\s+)?(?:AI|assistant|agent|model|LLM)\b/i, title: "section addressed to the agent" },
   { re: /\b(?:print|reveal|repeat|output|show)\s+(?:your|the)\s+(?:system\s+prompt|instructions|hidden\s+prompt)/i, title: "system-prompt extraction" },
-  { re: /\b(?:exfiltrate|upload|send|post)\b[^.\n]{0,60}\b(?:\.ssh|\.aws|credentials|api[_ ]?keys?|tokens?|secrets?|env(?:ironment)? variables?)\b/i, title: "credential exfiltration instruction" },
+  { re: /\b(?:exfiltrate|upload|send|post)\b[^.\n]{0,60}\b(?:\.ssh|\.aws|credentials|api[_ ]?keys?|tokens?|secrets?|env(?:ironment)? variables?)\b/i, title: "wording about sending credentials, tokens or secrets" },
   { re: /\bcurl\b[^\n]{0,80}\|\s*(?:ba|z)?sh\b|\bwget\b[^\n]{0,80}\|\s*(?:ba|z)?sh\b/i, title: "remote script piped to shell" },
   { re: /\b(?:without|do not|don't)\s+(?:asking|confirming|checking with|notifying)\s+(?:the\s+)?(?:user|human|operator)/i, title: "\"without asking the user\"" },
   { re: /\b(?:disable|turn off|bypass|skip)\s+(?:all\s+)?(?:safety|security|guardrails?|checks?|confirmations?|permissions?)\b/i, title: "safety bypass instruction" },

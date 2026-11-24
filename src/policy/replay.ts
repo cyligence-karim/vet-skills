@@ -59,7 +59,9 @@ export interface ListedTool { server: string; tool: string; readOnlyHint?: boole
 export interface SuggestedRule extends ToolRule { evidence: string }
 export interface Suggestion { rules: SuggestedRule[]; onChange: "hold"; notes: string[] }
 
-const DESTRUCTIVE = /^(delete|remove|drop|destroy|purge|wipe|truncate|erase|reset|revoke|force|kill|terminate|uninstall|rm)([_\-A-Z]|$)/;
+/** A tool whose name says it deletes or destroys. */
+export const IRREVERSIBLE_TOOL = /^(delete|remove|drop|destroy|purge|wipe|truncate|erase|reset|revoke|force|kill|terminate|uninstall|rm)([_\-A-Z]|$)/;
+const DESTRUCTIVE = IRREVERSIBLE_TOOL;
 
 /**
  * A starting policy from observed use, by fixed rules:

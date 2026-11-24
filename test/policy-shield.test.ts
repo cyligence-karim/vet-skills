@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseAgentConfig } from "../src/policy/discover.js";
-import { buildRuleShield, compileShield, leverWords, leversOf, narrows, parseShield, pinLaunch, renderShieldSnippet, serializeShield, shieldCommand, type ShieldEvidence, type SnippetFormat } from "../src/policy/shield.js";
+import { buildRuleShield, compileShield, shieldCaution, leverWords, leversOf, narrows, parseShield, pinLaunch, renderShieldSnippet, serializeShield, shieldCommand, type ShieldEvidence, type SnippetFormat } from "../src/policy/shield.js";
 
 const ev = (o: Partial<ShieldEvidence> = {}): ShieldEvidence => ({
   package: { registry: "npm", name: "@acme/mcp-files", semver: "2.4.1", artifact_hash: "sha256:aaa" }, verdictId: "vd_1", engineVersion: "1.9.2", coverage: "full", ranAt: "2026-11-24T00:00:00.000Z",
@@ -29,20 +29,20 @@ test("each rule follows from the evidence", () => {
   const closed = buildRuleShield(ev({ egress: [{ host: "x.io", declared: false }], surfaceHosts: [] }))!;
   assert.equal(closed.rules.net?.mode, "closed");
   // The CLI reads "--net off" as no limit, so a closed network must never compile to it.
-  { const a = compileShield(closed).runArgs; assert.equal(a[a.indexOf("--net") + 1], "localhost"); }
-  assert.match(closed.not_enforced[0], /closes the network/);
+  { const a = compileShield(closed).runArgs; assert.equal(a[a.indexOf("--net") + 1], "registry.npmjs.org"); assert.ok(shieldCaution(closed)); assert.equal(shieldCaution(buildRuleShield(ev())!), null); }
+  assert.match(closed.not_enforced[0], /only the package registry/);
   // Nothing recorded that calls for a rule: no shield.
   assert.equal(buildRuleShield(ev({ egress: [{ host: "api.acme.dev", declared: true }], credentialFiles: [], tools: ["read_file", "write_file"], drift: null })), null);
 });
 
 test("compiles onto flags the guard has, and pins the launch command", () => {
   const s = buildRuleShield(ev())!;
-  assert.deepEqual(compileShield(s).runArgs, ["--contain", "--net", "api.acme.dev", "--deny", "delete_file,drop_table", "--secrets", "ACME_TOKEN=api.acme.dev"]);
+  assert.deepEqual(compileShield(s).runArgs, ["--contain", "--net", "registry.npmjs.org,api.acme.dev", "--deny", "delete_file,drop_table", "--secrets", "ACME_TOKEN=api.acme.dev"]);
   assert.deepEqual(compileShield(s).pin, { semver: "2.4.0", artifact_hash: "sha256:bbb" });
   assert.deepEqual(pinLaunch(["npx", "-y", "@acme/mcp-files@latest", "--root", "."], s), ["npx", "-y", "@acme/mcp-files@2.4.0", "--root", "."]);
   assert.deepEqual(pinLaunch(["uvx", "@acme/mcp-files"], s), ["uvx", "@acme/mcp-files==2.4.0"]);
   assert.deepEqual(pinLaunch(["node", "server.js"], s), ["node", "server.js"]);
-  assert.equal(shieldCommand(["npx", "-y", "@acme/mcp-files"], s), "npx -y vet-skills run --contain --net api.acme.dev --deny delete_file,drop_table --secrets ACME_TOKEN=api.acme.dev -- npx -y @acme/mcp-files@2.4.0");
+  assert.equal(shieldCommand(["npx", "-y", "@acme/mcp-files"], s), "npx -y vet-skills run --contain --net registry.npmjs.org,api.acme.dev --deny delete_file,drop_table --secrets ACME_TOKEN=api.acme.dev -- npx -y @acme/mcp-files@2.4.0");
 });
 
 test("narrows: a built shield passes, and any widening is caught", () => {
@@ -89,4 +89,17 @@ test("lever words name no host, tool or package", () => {
   const words = leverWords(buildRuleShield(ev())!).join(" ");
   assert.ok(!/acme|delete_file|drop_table|api\./.test(words), words);
   assert.equal(leverWords(buildRuleShield(ev())!).length, 6);
+});
+
+test("a tool list alone never makes a shield, an expected launch keeps its registry, and deploy or send tools are held, not denied", () => {
+  assert.equal(buildRuleShield(ev({ egress: [{ host: "api.acme.dev", declared: true }], credentialFiles: [], drift: null })), null);
+  // The registry the launcher downloads from is never the "one declared host" and never counts as undeclared.
+  assert.equal(buildRuleShield(ev({ egress: [{ host: "registry.npmjs.org", declared: false }], surfaceHosts: [], credentialFiles: [], drift: null })), null);
+  const reg = buildRuleShield(ev({ egress: [{ host: "registry.npmjs.org", declared: true }, { host: "t.other.io", declared: false }], surfaceHosts: [], credentialFiles: [], drift: null }))!;
+  assert.equal(reg.rules.net?.mode, "closed");
+  const s = buildRuleShield(ev({ tools: ["deploy_folder", "send_email", "delete_site", "list_sites"] }))!;
+  assert.deepEqual(s.rules.tools?.map((t) => `${t.match}:${t.action}`), ["delete_site:deny", "deploy_folder:approve", "send_email:approve"]);
+  assert.ok(narrows(s, ev({ tools: ["deploy_folder", "send_email", "delete_site", "list_sites"] })).ok);
+  const py = buildRuleShield(ev({ package: { registry: "pypi", name: "acme-mcp", semver: "1.0.0", artifact_hash: "sha256:ccc" }, drift: null }))!;
+  assert.ok(compileShield(py).runArgs.includes("pypi.org,files.pythonhosted.org,api.acme.dev"));
 });

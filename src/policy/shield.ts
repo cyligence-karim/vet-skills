@@ -8,6 +8,7 @@
  * and rules the guard already has.
  */
 import { DESTRUCTIVE_TOOL_GLOBS, toolClass, type ToolRule } from "./index.js";
+import { IRREVERSIBLE_TOOL } from "./replay.js";
 
 export const SHIELD_SCHEMA = "killerskills.shield/v1";
 export const SHIELD_PAYLOAD_TYPE = "application/vnd.killerskills.shield.v1+yaml";
@@ -59,8 +60,15 @@ const bare = (t: string) => (t.includes("/") ? t.slice(t.lastIndexOf("/") + 1) :
 const uniq = (xs: string[]) => [...new Set(xs)].sort();
 const HOST = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:\d+)?$/i;
 
-/** The host list that stands for a closed network under the guard. */
-export const CLOSED_NET = "localhost";
+/** Which builder rules wrote a shield. A stored shield from older rules is rebuilt, never served. */
+export const SHIELD_RULES = "rules.2";
+/**
+ * The registry a launcher downloads the package from. It stays reachable under every network rule, because the
+ * shielded command starts the server through npx or uvx and a refused download would stop it before it starts.
+ */
+export const REGISTRY_HOSTS: Record<string, string[]> = { npm: ["registry.npmjs.org"], pypi: ["pypi.org", "files.pythonhosted.org"] };
+const registryHosts = (registry: string) => REGISTRY_HOSTS[registry] ?? [];
+const isRegistryHost = (h: string) => Object.values(REGISTRY_HOSTS).some((l) => l.includes(h));
 
 export const SHIELD_CAVEATS = [
   "The network limit applies to clients that honor proxies.",
@@ -73,19 +81,22 @@ export const SHIELD_CAVEATS = [
 export function buildRuleShield(e: ShieldEvidence, createdAt = e.ranAt): Shield | null {
   const rules: Shield["rules"] = {};
   const notEnforced = [...SHIELD_CAVEATS];
-  const declared = uniq([...e.egress.filter((h) => h.declared).map((h) => h.host), ...e.surfaceHosts].filter((h) => HOST.test(h)));
-  const undeclared = uniq(e.egress.filter((h) => !h.declared).map((h) => h.host));
+  const declared = uniq([...e.egress.filter((h) => h.declared).map((h) => h.host), ...e.surfaceHosts].filter((h) => HOST.test(h) && !isRegistryHost(h)));
+  const undeclared = uniq(e.egress.filter((h) => !h.declared && !isRegistryHost(h.host)).map((h) => h.host));
 
   if (e.credentialFiles.length) rules.contain = { enabled: true, reason: `read ${uniq(e.credentialFiles).slice(0, 3).join(", ")} in our sandbox`, evidence: "traces.files_read" };
   if (undeclared.length) {
     if (declared.length) rules.net = { mode: "hosts", hosts: declared, reason: `contacted ${undeclared.length === 1 ? "a host" : `${undeclared.length} hosts`} it does not declare; only the hosts it declares stay reachable`, evidence: "traces.egress_hosts declared=true" };
-    else { rules.net = { mode: "closed", hosts: [], reason: "contacted a host it does not declare, and no declared host is on record", evidence: "traces.egress_hosts" }; notEnforced.unshift("No declared host is on record for this package, so this shield closes the network. A tool that needs the network will stop working under it."); }
+    else { rules.net = { mode: "closed", hosts: [], reason: "contacted a host it does not declare, and no declared host is on record", evidence: "traces.egress_hosts" }; notEnforced.unshift("No declared host is on record for this package, so this shield leaves it only the package registry. A tool that needs the network for its work stops working under it until you add the hosts you use to the list."); }
   }
   if (e.tools?.length) {
     const t: NonNullable<Shield["rules"]["tools"]> = [];
     for (const name of uniq(e.tools.map(bare))) {
       if (toolClass(name) !== "write") continue;
-      if (DESTRUCTIVE.some((re) => re.test(name))) t.push({ match: name, action: "deny", reason: "destructive by name", evidence: "DESTRUCTIVE_TOOL_GLOBS" });
+      // Deny only a name that says it deletes or destroys. A tool that sends, deploys or pays is often the reason the
+      // server is installed, so it is held for approval, the same as the default policy does.
+      if (IRREVERSIBLE_TOOL.test(name)) t.push({ match: name, action: "deny", reason: "deletes or destroys by name", evidence: "IRREVERSIBLE_TOOL" });
+      else if (DESTRUCTIVE.some((re) => re.test(name))) t.push({ match: name, action: "approve", reason: "changes state outside this machine by name", evidence: "DESTRUCTIVE_TOOL_GLOBS" });
       else t.push({ match: name, action: "approve", reason: "changes state", evidence: "toolClass" });
     }
     if (t.length) rules.tools = t;
@@ -94,11 +105,18 @@ export function buildRuleShield(e: ShieldEvidence, createdAt = e.ranAt): Shield 
   if (brokered.length) rules.secrets = brokered;
   if (e.drift?.eligible) rules.pin = { semver: e.drift.fromSemver, artifact_hash: e.drift.fromArtifactHash, reason: `${e.package.semver} ${e.drift.summary.replace(/^\S+\s/, "").replace(/\.$/, "")}; ${e.drift.fromSemver} did not`, evidence: `drift ${e.drift.id}` };
 
-  // Approve-only tool rules and brokering are refinements. On their own they are not a response to anything the run recorded.
-  const substantive = !!rules.contain || !!rules.net || !!rules.pin || (rules.tools ?? []).some((t) => t.action === "deny");
+  // Tool rules and brokering are refinements. A tool list is not something the run recorded the server doing, so on
+  // their own they never make a shield.
+  const substantive = !!rules.contain || !!rules.net || !!rules.pin;
   if (!substantive) return null;
   if (rules.tools?.some((t) => t.action === "approve")) notEnforced.push("Approval for write tools applies only when the guard is installed (vet-skills guard install). The one-line command denies the destructive tools and leaves the rest as they are.");
-  return { schema: SHIELD_SCHEMA, package: e.package, finding_refs: [...(e.findingRefs ?? [])].sort((a, b) => `${a.kind}${a.ref}`.localeCompare(`${b.kind}${b.ref}`)), evidence: { verdict_id: e.verdictId, engine_version: e.engineVersion, coverage: e.coverage, ran_at: e.ranAt }, rules, not_enforced: notEnforced, drafted_by: "rules", min_cli: SHIELD_MIN_CLI, created_at: createdAt };
+  return { schema: SHIELD_SCHEMA, package: e.package, finding_refs: [...(e.findingRefs ?? [])].sort((a, b) => `${a.kind}${a.ref}`.localeCompare(`${b.kind}${b.ref}`)), evidence: { verdict_id: e.verdictId, engine_version: e.engineVersion, coverage: e.coverage, ran_at: e.ranAt }, rules, not_enforced: notEnforced, drafted_by: SHIELD_RULES, min_cli: SHIELD_MIN_CLI, created_at: createdAt };
+}
+
+/** What a person must read before using this shield. Shown next to the rules, never folded away. Null when there is nothing. */
+export function shieldCaution(s: Shield): string | null {
+  if (s.rules.net?.mode === "closed") return "We have no declared host on record for this package, so this shield leaves it the package registry and nothing else. If the tool needs the network for its work, add the hosts you use to the --net list. Every host you do not list is refused, including the one our run saw.";
+  return null;
 }
 
 export function leversOf(s: Shield): ShieldLever[] {
@@ -109,10 +127,10 @@ export function leversOf(s: Shield): ShieldLever[] {
 export function leverWords(s: Shield): string[] {
   const out: string[] = [];
   if (s.rules.pin) out.push("Pins the last version we saw without this behavior.");
-  if (s.rules.net) out.push(s.rules.net.mode === "closed" ? "Closes the network for this tool, apart from this machine itself." : `Limits the network to the ${s.rules.net.hosts.length === 1 ? "one host" : `${s.rules.net.hosts.length} hosts`} the tool declares.`);
+  if (s.rules.net) out.push(s.rules.net.mode === "closed" ? "Closes the network for this tool, apart from the package registry it installs from." : `Limits the network to the ${s.rules.net.hosts.length === 1 ? "one host" : `${s.rules.net.hosts.length} hosts`} the tool declares, and the package registry it installs from.`);
   if (s.rules.contain) out.push("Keeps credential files outside the project out of reach.");
   const deny = (s.rules.tools ?? []).filter((t) => t.action === "deny").length, approve = (s.rules.tools ?? []).filter((t) => t.action === "approve").length;
-  if (deny) out.push(`Denies ${deny === 1 ? "one destructive tool" : `${deny} destructive tools`}.`);
+  if (deny) out.push(`Denies ${deny === 1 ? "one tool that deletes or destroys by name" : `${deny} tools that delete or destroy by name`}.`);
   if (approve) out.push(`Holds ${approve === 1 ? "one write tool" : `${approve} write tools`} for approval when the guard is installed.`);
   if (s.rules.secrets?.length) out.push("Hands the server a placeholder in place of each credential, swapped for the real value only on the way to its own host.");
   return out;
@@ -128,10 +146,10 @@ export function narrows(s: Shield, e: ShieldEvidence): { ok: boolean; why: strin
     for (const h of s.rules.net.hosts) if (!allowed.has(h)) why.push(`The network rule adds a host the run never saw as declared: ${h}.`);
     if (s.rules.net.mode === "closed" && s.rules.net.hosts.length) why.push("A closed network lists hosts.");
     if (s.rules.net.mode === "hosts" && !s.rules.net.hosts.length) why.push("A host list with no hosts would leave the network open.");
-  } else if (e.egress.some((h) => !h.declared)) why.push("The run contacted an undeclared host and the shield has no network rule.");
+  } else if (e.egress.some((h) => !h.declared && !isRegistryHost(h.host))) why.push("The run contacted an undeclared host and the shield has no network rule.");
   if (e.credentialFiles.length && !s.rules.contain) why.push("The run read a credential file and the shield does not contain it.");
   for (const t of s.rules.tools ?? []) if ((t.action as string) !== "deny" && (t.action as string) !== "approve") why.push(`A tool rule may only deny or hold for approval: ${t.match}.`);
-  const mustDeny = (e.tools ?? []).map(bare).filter((n) => toolClass(n) === "write" && DESTRUCTIVE.some((re) => re.test(n)));
+  const mustDeny = (e.tools ?? []).map(bare).filter((n) => toolClass(n) === "write" && IRREVERSIBLE_TOOL.test(n));
   for (const n of uniq(mustDeny)) if (!(s.rules.tools ?? []).some((t) => t.action === "deny" && glob(t.match).test(n))) why.push(`A destructive tool is not denied: ${n}.`);
   for (const b of s.rules.secrets ?? []) if (!e.credentialEnv.some((c) => c.name === b.name && c.host === b.host)) why.push(`A brokered credential is sent somewhere the code does not show: ${b.name}.`);
   if (s.rules.pin && (!e.drift?.eligible || s.rules.pin.semver !== e.drift.fromSemver || s.rules.pin.artifact_hash !== e.drift.fromArtifactHash)) why.push("The pin is not the version before a published change.");
@@ -146,14 +164,14 @@ export interface CompiledShield { runArgs: string[]; pin: { semver: string; arti
 export function compileShield(s: Shield): CompiledShield {
   const runArgs: string[] = [], notes: string[] = [];
   if (s.rules.contain) runArgs.push("--contain");
-  // In the CLI, "--net off" means no network limit at all. A closed network is a host list holding only this machine,
-  // so the guard's proxy answers every other host with a refusal.
-  if (s.rules.net) runArgs.push("--net", s.rules.net.mode === "closed" ? CLOSED_NET : s.rules.net.hosts.join(","));
+  // In the CLI, "--net off" means no network limit at all, so a closed network is never written that way. Every
+  // network rule is a host list: the registry the launcher downloads from, then the declared hosts if there are any.
+  if (s.rules.net) { const reg = registryHosts(s.package.registry); runArgs.push("--net", [...reg, ...(s.rules.net.mode === "closed" ? [] : s.rules.net.hosts)].join(",") || "localhost"); }
   const deny = (s.rules.tools ?? []).filter((t) => t.action === "deny").map((t) => t.match);
   if (deny.length) runArgs.push("--deny", deny.join(","));
   if (s.rules.secrets?.length) runArgs.push("--secrets", s.rules.secrets.map((b) => `${b.name}=${b.host}`).join(","));
   if ((s.rules.tools ?? []).some((t) => t.action === "approve")) notes.push("Write tools are held for approval only under the installed guard.");
-  if (s.rules.net?.mode === "closed") notes.push("The network is closed for this tool: only this machine itself stays reachable.");
+  if (s.rules.net?.mode === "closed") notes.push("The network is closed for this tool: only the package registry stays reachable.");
   return { runArgs, pin: s.rules.pin ? { semver: s.rules.pin.semver, artifact_hash: s.rules.pin.artifact_hash } : null, toolRules: (s.rules.tools ?? []).map((t) => ({ match: t.match, action: t.action, reason: t.reason })), notes };
 }
 
