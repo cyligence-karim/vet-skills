@@ -61,7 +61,7 @@ const uniq = (xs: string[]) => [...new Set(xs)].sort();
 const HOST = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:\d+)?$/i;
 
 /** Which builder rules wrote a shield. A stored shield from older rules is rebuilt, never served. */
-export const SHIELD_RULES = "rules.2";
+export const SHIELD_RULES = "rules.3";
 /**
  * The registry a launcher downloads the package from. It stays reachable under every network rule, because the
  * shielded command starts the server through npx or uvx and a refused download would stop it before it starts.
@@ -86,8 +86,11 @@ export function buildRuleShield(e: ShieldEvidence, createdAt = e.ranAt): Shield 
 
   if (e.credentialFiles.length) rules.contain = { enabled: true, reason: `read ${uniq(e.credentialFiles).slice(0, 3).join(", ")} in our sandbox`, evidence: "traces.files_read" };
   if (undeclared.length) {
-    if (declared.length) rules.net = { mode: "hosts", hosts: declared, reason: `contacted ${undeclared.length === 1 ? "a host" : `${undeclared.length} hosts`} it does not declare; only the hosts it declares stay reachable`, evidence: "traces.egress_hosts declared=true" };
-    else { rules.net = { mode: "closed", hosts: [], reason: "contacted a host it does not declare, and no declared host is on record", evidence: "traces.egress_hosts" }; notEnforced.unshift("No declared host is on record for this package, so this shield leaves it only the package registry. A tool that needs the network for its work stops working under it until you add the hosts you use to the list."); }
+    if (declared.length) rules.net = { mode: "hosts", hosts: declared, reason: `contacted ${undeclared.length === 1 ? "a host" : `${undeclared.length} hosts`} it does not declare; only the hosts it declares or names in its code stay reachable`, evidence: "traces.egress_hosts declared=true, verdicts.credential_surface" };
+    // With a pin, the command runs the earlier version, which the run did not flag. Closing its network on top of
+    // that would stop the tool for nothing, so the pin is the whole response when there is no host list to keep.
+    else if (e.drift?.eligible) notEnforced.unshift("No network rule: the pinned version is the one our run did not flag, and no host list is on record to limit it to.");
+    else { rules.net = { mode: "closed", hosts: [], reason: "contacted a host it does not declare, and no other host is on record for it", evidence: "traces.egress_hosts" }; notEnforced.unshift("No host is on record for this package beyond the one our run flagged, so this shield leaves it only the package registry. A tool that needs the network for its work stops working under it until you add the hosts you use to the list."); }
   }
   if (e.tools?.length) {
     const t: NonNullable<Shield["rules"]["tools"]> = [];
@@ -115,7 +118,8 @@ export function buildRuleShield(e: ShieldEvidence, createdAt = e.ranAt): Shield 
 
 /** What a person must read before using this shield. Shown next to the rules, never folded away. Null when there is nothing. */
 export function shieldCaution(s: Shield): string | null {
-  if (s.rules.net?.mode === "closed") return "We have no declared host on record for this package, so this shield leaves it the package registry and nothing else. If the tool needs the network for its work, add the hosts you use to the --net list. Every host you do not list is refused, including the one our run saw.";
+  if (s.rules.net?.mode === "closed") return "We have no host on record for this package beyond the one our run flagged, so this shield leaves it the package registry and nothing else. If the tool needs the network for its work, add the hosts you use to the --net list. Every host you do not list is refused, including the one our run saw.";
+  if (s.rules.net) return "The host list is what this package declares or names in its code. We have not run the tool under this shield yet. If it stops reaching something it needs, add that host to the --net list.";
   return null;
 }
 
@@ -127,7 +131,7 @@ export function leversOf(s: Shield): ShieldLever[] {
 export function leverWords(s: Shield): string[] {
   const out: string[] = [];
   if (s.rules.pin) out.push("Pins the last version we saw without this behavior.");
-  if (s.rules.net) out.push(s.rules.net.mode === "closed" ? "Closes the network for this tool, apart from the package registry it installs from." : `Limits the network to the ${s.rules.net.hosts.length === 1 ? "one host" : `${s.rules.net.hosts.length} hosts`} the tool declares, and the package registry it installs from.`);
+  if (s.rules.net) out.push(s.rules.net.mode === "closed" ? "Closes the network for this tool, apart from the package registry it installs from." : `Limits the network to the ${s.rules.net.hosts.length === 1 ? "one host" : `${s.rules.net.hosts.length} hosts`} the tool declares or names in its code, and the package registry it installs from.`);
   if (s.rules.contain) out.push("Keeps credential files outside the project out of reach.");
   const deny = (s.rules.tools ?? []).filter((t) => t.action === "deny").length, approve = (s.rules.tools ?? []).filter((t) => t.action === "approve").length;
   if (deny) out.push(`Denies ${deny === 1 ? "one tool that deletes or destroys by name" : `${deny} tools that delete or destroy by name`}.`);
@@ -143,10 +147,12 @@ export function narrows(s: Shield, e: ShieldEvidence): { ok: boolean; why: strin
   const allowed = new Set([...e.egress.filter((h) => h.declared).map((h) => h.host), ...e.surfaceHosts]);
   if (s.package.artifact_hash !== e.package.artifact_hash || s.package.name !== e.package.name || s.package.semver !== e.package.semver) why.push("The shield is for a different package version than the evidence.");
   if (s.rules.net) {
+    // The guard lets subdomains of a listed host through, so a listed host must not cover one the run flagged.
+    for (const h of s.rules.net.hosts) for (const u of e.egress.filter((x) => !x.declared && !isRegistryHost(x.host))) if (u.host === h || u.host.endsWith(`.${h}`)) why.push(`The network rule keeps a host the run flagged reachable: ${u.host}.`);
     for (const h of s.rules.net.hosts) if (!allowed.has(h)) why.push(`The network rule adds a host the run never saw as declared: ${h}.`);
     if (s.rules.net.mode === "closed" && s.rules.net.hosts.length) why.push("A closed network lists hosts.");
     if (s.rules.net.mode === "hosts" && !s.rules.net.hosts.length) why.push("A host list with no hosts would leave the network open.");
-  } else if (e.egress.some((h) => !h.declared && !isRegistryHost(h.host))) why.push("The run contacted an undeclared host and the shield has no network rule.");
+  } else if ((!s.rules.pin || [...allowed].some((h) => !isRegistryHost(h))) && e.egress.some((h) => !h.declared && !isRegistryHost(h.host))) why.push("The run contacted an undeclared host and the shield has no network rule.");
   if (e.credentialFiles.length && !s.rules.contain) why.push("The run read a credential file and the shield does not contain it.");
   for (const t of s.rules.tools ?? []) if ((t.action as string) !== "deny" && (t.action as string) !== "approve") why.push(`A tool rule may only deny or hold for approval: ${t.match}.`);
   const mustDeny = (e.tools ?? []).map(bare).filter((n) => toolClass(n) === "write" && IRREVERSIBLE_TOOL.test(n));

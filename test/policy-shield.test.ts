@@ -20,16 +20,16 @@ test("the same evidence gives the same bytes, and the bytes read back to the sam
 
 test("each rule follows from the evidence", () => {
   const s = buildRuleShield(ev())!;
-  assert.deepEqual(s.rules.net, { mode: "hosts", hosts: ["api.acme.dev"], reason: "contacted a host it does not declare; only the hosts it declares stay reachable", evidence: "traces.egress_hosts declared=true" });
+  assert.deepEqual(s.rules.net, { mode: "hosts", hosts: ["api.acme.dev"], reason: "contacted a host it does not declare; only the hosts it declares or names in its code stay reachable", evidence: "traces.egress_hosts declared=true, verdicts.credential_surface" });
   assert.equal(s.rules.contain?.enabled, true);
   assert.deepEqual(s.rules.tools?.map((t) => `${t.match}:${t.action}`), ["delete_file:deny", "drop_table:deny", "write_file:approve"]);
   assert.deepEqual(s.rules.secrets, [{ name: "ACME_TOKEN", host: "api.acme.dev", evidence: "verdicts.credential_surface" }]);
   assert.equal(s.rules.pin?.semver, "2.4.0");
   // No declared host on record: the network is closed and the shield says so. It is never left open silently.
-  const closed = buildRuleShield(ev({ egress: [{ host: "x.io", declared: false }], surfaceHosts: [] }))!;
+  const closed = buildRuleShield(ev({ egress: [{ host: "x.io", declared: false }], surfaceHosts: [], drift: null }))!;
   assert.equal(closed.rules.net?.mode, "closed");
   // The CLI reads "--net off" as no limit, so a closed network must never compile to it.
-  { const a = compileShield(closed).runArgs; assert.equal(a[a.indexOf("--net") + 1], "registry.npmjs.org"); assert.ok(shieldCaution(closed)); assert.equal(shieldCaution(buildRuleShield(ev())!), null); }
+  { const a = compileShield(closed).runArgs; assert.equal(a[a.indexOf("--net") + 1], "registry.npmjs.org"); assert.match(shieldCaution(closed)!, /nothing else/); assert.match(shieldCaution(buildRuleShield(ev())!)!, /names in its code/); assert.equal(shieldCaution(buildRuleShield(ev({ egress: [], surfaceHosts: [] }))!), null); }
   assert.match(closed.not_enforced[0], /only the package registry/);
   // Nothing recorded that calls for a rule: no shield.
   assert.equal(buildRuleShield(ev({ egress: [{ host: "api.acme.dev", declared: true }], credentialFiles: [], tools: ["read_file", "write_file"], drift: null })), null);
@@ -102,4 +102,18 @@ test("a tool list alone never makes a shield, an expected launch keeps its regis
   assert.ok(narrows(s, ev({ tools: ["deploy_folder", "send_email", "delete_site", "list_sites"] })).ok);
   const py = buildRuleShield(ev({ package: { registry: "pypi", name: "acme-mcp", semver: "1.0.0", artifact_hash: "sha256:ccc" }, drift: null }))!;
   assert.ok(compileShield(py).runArgs.includes("pypi.org,files.pythonhosted.org,api.acme.dev"));
+});
+
+test("narrows: a kept host may not cover a host the run flagged", () => {
+  const e = ev({ egress: [{ host: "t.acme.dev", declared: false }], surfaceHosts: ["acme.dev"], credentialFiles: [], drift: null });
+  const s = buildRuleShield(e)!;
+  assert.equal(narrows(s, e).ok, false);
+});
+
+test("a pin with no host list to keep is the whole response: the earlier version keeps its network", () => {
+  const e = ev({ egress: [{ host: "t.other.io", declared: false }], surfaceHosts: [], credentialFiles: [], tools: null, credentialEnv: [] });
+  const s = buildRuleShield(e)!;
+  assert.deepEqual(leversOf(s), ["pin"]);
+  assert.ok(narrows(s, e).ok);
+  assert.equal(shieldCommand(["npx", "-y", "@acme/mcp-files"], s), "npx -y vet-skills run -- npx -y @acme/mcp-files@2.4.0");
 });
